@@ -95,9 +95,19 @@ Lorsqu'un clip est coupé, Pro Tools génère des sous-clips virtuels.
 |---|---|---|
 | `0x2630` | 1 | Racine stockant la liste des géométries de fondus. Commence par un UInt32 LE (compteur). |
 | `0x262f` | 2 | Géométrie d'un fondu. Payload de 22 octets. Offset 8 (UInt16 LE) = longueur (samples). Offset 11 (Byte) = courbe (`0x01` = Equal Power). |
-| `0x2077` | 18 | Cache de fondus de piste. Requis pour le rendu visuel et audio. |
 
-**Structure du Cache `0x2077` :**
+**Note Historique :** Auparavant, un bloc `0x2077` était suspecté d'être un "cache de fondu visuel de piste". Il s'agissait en réalité du cache de rendu de la règle de Marqueurs (Marker Ruler), et non des pistes audio. Les fondus n'ont pas besoin de `0x2077` pour être calculés par le moteur de Pro Tools, qui regénère les caches visuels à la volée.
+
+---
+
+## 6. Marqueurs (Markers)
+
+| Content Type | `block_type` | Description |
+|---|---|---|
+| `0x2030` | Variable | S'il est positionné en début de fichier, ce conteneur représente la Règle des Marqueurs (Marker Ruler). |
+| `0x2077` | 18 | Données spécifiques d'un marqueur (Nom, Timecode absolu, Index). |
+
+**Structure d'un Marqueur `0x2077` :**
 - Payload principal (ex: 148 octets).
 - Sous-blocs obligatoires imbriqués : `0x2506`, `0x4826` (×2), `0x4827`.
 - Padding de fin (typiquement 8 octets).

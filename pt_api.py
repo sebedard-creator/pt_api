@@ -1162,52 +1162,7 @@ class ProToolsSession:
         old_count = struct.unpack_from("<I", hdr, count_offset)[0]
         struct.pack_into("<I", hdr, count_offset, old_count + 1)
         b1052.items[0] = bytearray(hdr)
-        
-        # 4. Fade Cache 0x2077
-        self._ensure_fade_cache(track_name)
-
-    
-    def _ensure_fade_cache(self, track_name):
-        b2030 = None
-        b1054 = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x1054), None)
-        track_idx = -1
-        for i, track in enumerate([b for b in b1054.items if isinstance(b, PTBlock) and b.content_type == 0x1052]):
-            hdr = track.items[0]
-            nlen = struct.unpack_from("<I", hdr, 0)[0]
-            if 4 + nlen <= len(hdr):
-                tname = hdr[4:4+nlen].decode('ascii', 'ignore').strip('\x00')
-                if tname == track_name:
-                    track_idx = i
-                    break
-                    
-        if track_idx != -1:
-            tracks_2030 = [r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x2030]
-            if track_idx < len(tracks_2030):
-                b2030 = tracks_2030[track_idx]
                 
-        if b2030:
-            has_2077 = any(isinstance(c, PTBlock) and c.content_type == 0x2077 for c in b2030.items)
-            if not has_2077:
-                # We need to inject a blank fade cache
-                import binascii
-                pl2077 = binascii.unhexlify("0100030900000c0000004d41524b45525f414c504841a059650a00000000a059650a00000000000000000000f0bfffffffffffffffffffffffffffbfffffffffffffffbf00000000000000400000000000000040ffffffff01000000000100000000000000000000000000000000ffffffff000000000000000000000000ffffffff0000000000000000000000001500010000005a03000a0000000625ffffffff00000000000000000000000000000000000000000000000000ffffb2056497c372490ba13368d4d04e64cfffffffffffffffffffffffff5a010009000000264801003f009a00ff5a0100090000002648000000000000005a01001e00000027480000000000000000000000000000000000000000000000000000000000000000000000000000")
-                # ^^^ Extra "0000" at end: the parser eats 2 trailing bytes, so we add 2 more to ensure 8-byte padding
-                block2077 = PTBlock(18, 0x2077, 0)
-                
-                # The payload actually contains ZMARKs! So we must parse it!
-                temp_sess = ProToolsSession.__new__(ProToolsSession)
-                # Wrap it in a dummy block header so _parse_block can parse it (size = 295 = 0x0127)
-                dummy_header = binascii.unhexlify("5a1200270100007720") 
-                temp_sess.data = dummy_header + pl2077
-                temp_sess.is_bigendian = False
-                block2077, _ = temp_sess._parse_block(0, len(temp_sess.data))
-                
-                trailing = b2030.items[-1]
-                if isinstance(trailing, bytearray) and len(trailing) == 8 and all(b == 0 for b in trailing):
-                    b2030.items.insert(len(b2030.items) - 1, block2077)
-                else:
-                    b2030.items.append(block2077)
-    
     def add_fade(self, track_name, clip_name, target_hh, target_mm, target_ss, target_ff, fade_type="in", duration_hh=0, duration_mm=0, duration_ss=0, duration_ff=0, fade_shape="power"):
         import copy
         import struct
@@ -1332,7 +1287,6 @@ class ProToolsSession:
         struct.pack_into("<I", hdr, count_offset, old_count + 1)
         b1052.items[0] = bytearray(hdr)
 
-        self._ensure_fade_cache(track_name)
     def set_clip_gain(self, clip_name, float_gain_db):
         import struct
         
