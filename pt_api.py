@@ -820,50 +820,8 @@ class ProToolsSession:
         target_b1052.items[0] = header
         
         print(f"Duplicated clip '{clip_name}' to {hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}, mute={mute}")
-        import struct
-        # 1. We need to find 0x2629 (clips) and 0x262b (clip groups) blocks
-        def find_blocks(item, ctype):
-            found = []
-            if isinstance(item, PTBlock):
-                if item.content_type == ctype:
-                    found.append(item)
-                for child in item.items:
-                    found.extend(find_blocks(child, ctype))
-            return found
-
-        all_regions = []
-        for r in self.root_items:
-            all_regions.extend(find_blocks(r, 0x2629))
-            all_regions.extend(find_blocks(r, 0x262b))
-
-        renamed_count = 0
-        for r_def in all_regions:
-            for b2628 in find_blocks(r_def, 0x2628):
-                if len(b2628.items) > 0 and isinstance(b2628.items[0], bytearray):
-                    payload = b2628.items[0]
-                    if len(payload) >= 4:
-                        name_len = struct.unpack_from("<I", payload, 0)[0]
-                        if 4 + name_len <= len(payload):
-                            try:
-                                name = payload[4:4+name_len].decode('ascii').strip('\x00')
-                                if name == old_name:
-                                    # We found it! We must replace the pascal string bytes.
-                                    # payload is a bytearray, so we can slice it
-                                    new_name_bytes = new_name.encode('ascii')
-                                    new_len = len(new_name_bytes)
-
-                                    # Create new header part
-                                    new_part = bytearray(struct.pack("<I", new_len))
-                                    new_part.extend(new_name_bytes)
-
-                                    # Replace the old length + old string with new length + new string
-                                    payload[0:4+name_len] = new_part
-                                    renamed_count += 1
-                            except:
-                                pass
-
-        return renamed_count
-
+        
+        return clip_id
 
     
     def split_clip(self, track_name, clip_name, cut_hh, cut_mm, cut_ss, cut_ff):
@@ -1168,7 +1126,10 @@ class ProToolsSession:
                         b1052 = track
                         break
                         
-        # Find insertion point (between ev_01 and ev_02)
+        if not b1052:
+            raise ValueError(f"Track '{track_name}' not found.")
+                        
+        # Find insertion point (just before ev_02)
         ev_idx = -1
         for i, ev in enumerate(b1052.items):
             if isinstance(ev, PTBlock) and ev.content_type == 0x1050:
@@ -1192,7 +1153,8 @@ class ProToolsSession:
         new_1050 = PTBlock(3, 0x1050, 0)
         new_1050.items = [new_104f, b"\x01\x01\x01"]
         
-        b1052.items.insert(ev_idx + (1 if insert_after else 0), new_1050)
+        # Insert exactly at ev_02's index, pushing ev_02 down
+        b1052.items.insert(ev_idx, new_1050)
         
         hdr = bytearray(b1052.items[0])
         nlen = struct.unpack_from("<I", hdr, 0)[0]
