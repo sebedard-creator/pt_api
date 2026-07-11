@@ -1,4 +1,7 @@
 import struct
+import copy
+import os
+import struct
 def gen_xor_delta(xor_value: int, mul: int, negative: bool) -> int:
     for i in range(256):
         if ((i * mul) & 0xff) == xor_value:
@@ -168,7 +171,6 @@ class PTBlock:
         self.original_offset = 0
 
     def to_bytes(self, is_bigendian=False, base_offset=0):
-        import struct
         payload = bytearray()
         mapping = {}
 
@@ -206,27 +208,6 @@ class PTBlock:
 
         return header + payload, mapping
 
-    def serialize(self, is_bigendian):
-        payload = bytearray()
-        for item in self.items:
-            if isinstance(item, PTBlock):
-                payload.extend(item.serialize(is_bigendian))
-            else:
-                payload.extend(item)
-
-        size = len(payload) + 2 # +2 for content_type
-
-        fmt_type = ">H" if is_bigendian else "<H"
-        fmt_size = ">I" if is_bigendian else "<I"
-        fmt_ctype = ">H" if is_bigendian else "<H"
-
-        header = bytearray()
-        header.append(ZMARK)
-        header.extend(struct.pack(fmt_type, self.block_type))
-        header.extend(struct.pack(fmt_size, size))
-        header.extend(struct.pack(fmt_ctype, self.content_type))
-
-        return header + payload
 
     def get_all_blocks(self, content_type=None):
         res = []
@@ -390,7 +371,6 @@ class ProToolsSession:
 
     def delete_clip_group(self, group_name):
         """Removes a clip group from the session (both from the clip list and the timeline)."""
-        import struct
         
         # 1. Find the 0x262b block in the clip group list (0x262c)
         b262c = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x262c), None)
@@ -505,10 +485,14 @@ class ProToolsSession:
 
         return block, 7 + block_size
 
-    def add_marker(self, name, tc_samples, index=1):
+    def add_marker(self, name, tc_samples, index=None):
         from binascii import unhexlify
-        import struct
-        import os
+        if index is None:
+            existing = self.get_markers()
+            if existing:
+                index = max(m['index'] for m in existing) + 1
+            else:
+                index = 1
         template_bytes = unhexlify("5a05003c0100003020010000005a12002701000077200100030900000c0000004d41524b45525f414c504841a059650a00000000a059650a00000000000000000000f0bfffffffffffffffffffffffffffbfffffffffffffffbf00000000000000400000000000000040ffffffff01000000000100000000000000000000000000000000ffffffff000000000000000000000000ffffffff0000000000000000000000001500010000005a03000a0000000625ffffffff00000000000000000000000000000000000000000000000000ffffb2056497c372490ba13368d4d04e64cfffffffffffffffffffffffff5a010009000000264801003f009a00ff5a0100090000002648000000000000005a01001e000000274800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")
 
         temp_sess = ProToolsSession.__new__(ProToolsSession)
@@ -534,7 +518,6 @@ class ProToolsSession:
         header.extend(rest)
         b2077.items[0] = header
 
-        import os
         # The second payload part contains a 16-byte UUID starting at offset 20
         payload2 = bytearray(b2077.items[2])
         random_uuid = os.urandom(16)
@@ -571,7 +554,6 @@ class ProToolsSession:
         self.sample_rate = 48000
         self.frame_rate_enum = 0x01 # 24 by default
 
-        import struct
         for item in self.root_items:
             if isinstance(item, PTBlock):
                 if item.content_type == 0x1028:
@@ -585,7 +567,6 @@ class ProToolsSession:
                         self.frame_rate_enum = item.items[0][0]
 
     def mute_clip(self, clip_name, mute=True):
-        import struct
         # 1. Find Region ID from clip name
         region_id = None
 
@@ -612,19 +593,10 @@ class ProToolsSession:
         if region_id == -1:
             raise ValueError(f"Clip '{clip_name}' not found in session.")
 
-        def find_blocks(item, ctype):
-            found = []
-            if isinstance(item, PTBlock):
-                if item.content_type == ctype:
-                    found.append(item)
-                for child in item.items:
-                    found.extend(find_blocks(child, ctype))
-            return found
-
         # 2. Find placement in 0x1050 -> 0x104f
         all_104f = []
         for r in self.root_items:
-            all_104f.extend(find_blocks(r, 0x104f))
+            all_104f.extend(r.get_all_blocks(0x104f) if isinstance(r, PTBlock) else [])
 
         muted_count = 0
         for b104f in all_104f:
@@ -639,7 +611,6 @@ class ProToolsSession:
         return muted_count
 
     def move_clip(self, clip_name, hh, mm, ss, ff):
-        import struct
         # 1. Calculate target samples using TimecodeEngine
         engine = TimecodeEngine(self.sample_rate, self.frame_rate_enum)
         target_samples = engine.timecode_to_samples(hh, mm, ss, ff)
@@ -679,7 +650,7 @@ class ProToolsSession:
                     found.extend(find_blocks(child, ctype))
             return found
             
-        for b104f in sum((find_blocks(r, 0x104f) for r in self.root_items), []):
+        for b104f in sum((r.get_all_blocks(0x104f) if isinstance(r, PTBlock) else [] for r in self.root_items), []):
             if len(b104f.items) > 0 and isinstance(b104f.items[0], bytearray) and len(b104f.items[0]) >= 15:
                 payload = b104f.items[0]
                 placed_id = struct.unpack_from("<I", payload, 2)[0]
@@ -691,7 +662,6 @@ class ProToolsSession:
         return moved_count
 
     def rename_clip(self, old_name, new_name):
-        import struct
         renamed_count = 0
         b262a = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x262a), None)
         if b262a:
@@ -717,8 +687,6 @@ class ProToolsSession:
 
     def duplicate_clip(self, clip_name, hh, mm, ss, ff, mute=False):
         """Duplicates an existing clip on the timeline and places it at the specified timecode."""
-        import copy
-        import struct
         
         target_event = None
         target_b1052 = None
@@ -907,9 +875,8 @@ class ProToolsSession:
         pl_01.append(relative_cut_samples & 0xFF)
         pl_01.append((relative_cut_samples >> 8) & 0xFF)
         pl_01.append((relative_cut_samples >> 16) & 0xFF)
-        pl_01.append(0x00) # padding byte for the 4-byte slot in -01? Wait, -01 length is 4 bytes!
-        # Ah, looking at my notes, -01 length is 4 bytes (a0 fe 15 00)
-        pl_01[-1] = (relative_cut_samples >> 24) & 0xFF 
+        pl_01.append(0x00)
+        pl_01[-1] = (relative_cut_samples >> 24) & 0xFF
         pl_01.extend(struct.pack("<I", orig_ts1))
         pl_01.extend(struct.pack("<I", orig_ts1 | 0xFF000000))
         pl_01.extend(b"\xff\xff\xff\xff\xff\xff\xff\xfe") # 8 bytes padding
@@ -952,10 +919,6 @@ class ProToolsSession:
         
         # 32-bit TS1 and TS2 — these are TIMELINE ABSOLUTE timestamps,
         # NOT internal clip offsets. Must use orig_abs_ts (from 0x104f) + relative_cut_samples.
-        # We don't have orig_abs_ts here yet; it's computed later in the timeline section.
-        # So we store a placeholder and will patch it after timeline lookup.
-        # Actually, we need to restructure: find orig_abs_ts FIRST.
-        # For now, store relative_cut_samples offset — we'll fix this at the end.
         pl_02.extend(b"\x00" * 8)  # placeholder for ts1/ts2, will be patched below
         pl_02.extend(b"\xff\xff\xff\xff\xff\xff\xff\xff")  # 8 bytes ff padding
         # Build the correct rest with zeroed metadata
@@ -1157,8 +1120,6 @@ class ProToolsSession:
         b1052.items[0] = bytearray(hdr)
                 
     def add_fade(self, track_name, clip_name, target_hh, target_mm, target_ss, target_ff, fade_type="in", duration_hh=0, duration_mm=0, duration_ss=0, duration_ff=0, fade_shape="power"):
-        import copy
-        import struct
 
         # 1. Convert duration to samples
         engine = TimecodeEngine(self.sample_rate, self.frame_rate_enum)
@@ -1173,15 +1134,6 @@ class ProToolsSession:
         shape_byte = 0x01 if fade_shape == "power" else 0x02
             
         target_samples = engine.timecode_to_samples(target_hh, target_mm, target_ss, target_ff)
-
-        def find_blocks(item, ctype):
-            found = []
-            if isinstance(item, PTBlock):
-                if item.content_type == ctype:
-                    found.append(item)
-                for child in item.items:
-                    found.extend(find_blocks(child, ctype))
-            return found
 
         # We no longer need to find the parent clip ID. 
         # The ID in a fade event (bt=10) is ACTUALLY the index of the fade geometry in 0x2630!
@@ -1281,7 +1233,6 @@ class ProToolsSession:
         b1052.items[0] = bytearray(hdr)
 
     def set_clip_gain(self, clip_name, float_gain_db):
-        import struct
         
         # Resolve the clip_id (0-based index of the 2629 block inside the 262a block)
         b262a = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x262a), None)
@@ -1339,29 +1290,18 @@ class ProToolsSession:
         # The index is ALWAYS stored as a signed 32-bit int at the very end of the 2628 payload (offset -6 from end).
         # -1 (0xffffffff) means no clip gain.
         clip_payload = bytearray(target_b2628.items[0])
-        import struct
         struct.pack_into('<i', clip_payload, len(clip_payload)-6, automation_index)
         target_b2628.items[0] = clip_payload
             
         print(f"Applied Clip Gain of {val} dB to clip '{clip_name}'. Mapped to automation index {automation_index}.")
 
     def add_volume_node(self, track_name, hh, mm, ss, ff, db_value):
-        import struct
         engine = TimecodeEngine(self.sample_rate, self.frame_rate_enum)
         target_samples = engine.timecode_to_samples(hh, mm, ss, ff)
 
         target_val = int(round(db_value * 10))
         # Ensure it fits in signed 16-bit
         target_val = max(-32768, min(32767, target_val))
-
-        def find_blocks(item, ctype):
-            found = []
-            if isinstance(item, PTBlock):
-                if item.content_type == ctype:
-                    found.append(item)
-                for child in item.items:
-                    found.extend(find_blocks(child, ctype))
-            return found
 
         all_261c = []
         for r in self.root_items:
@@ -1383,7 +1323,7 @@ class ProToolsSession:
                                 if name == track_name:
                                     matched = True
                                     break
-                            except:
+                            except (UnicodeDecodeError, struct.error):
                                 pass
 
             if matched:
@@ -1498,7 +1438,6 @@ class ProToolsSession:
         pointing at whatever now lives at that stale offset -> "Magic ID
         does not match" in Pro Tools. Must run BEFORE _rebuild_0002().
         """
-        import struct
         if not removed_offsets:
             return 0
         fmt = ">I" if is_bigendian else "<I"
@@ -1563,7 +1502,6 @@ class ProToolsSession:
         replace b0002.items with a single bytearray so to_bytes() serializes it
         correctly without duplication.
         """
-        import struct
         fmt = ">I" if is_bigendian else "<I"
         fmt_type = ">H" if is_bigendian else "<H"
         fmt_size = ">I" if is_bigendian else "<I"
@@ -1600,7 +1538,6 @@ class ProToolsSession:
         return patched_count
 
     def save(self, out_path):
-        import struct
 
         # Pass 1: Compute new absolute offsets for every block.
         # to_bytes() builds a mapping of {old_original_offset -> new_computed_offset}
