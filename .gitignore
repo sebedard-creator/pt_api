@@ -1,0 +1,18 @@
+# Ignorer les environnements virtuels
+venv/
+.env
+
+# Ignorer les caches Python
+__pycache__/
+*.pyc
+
+# Ignorer les dossiers d'IDE
+.vscode/
+.idea/
+
+# Ignorer le dossier de référence (clone git)
+reference_ptformat/
+
+# Ignorer les fichiers temporaires et logs
+*.log
+*.tmp

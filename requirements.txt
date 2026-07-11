@@ -1,0 +1,5 @@
+# Fichier des dépendances du projet
+# Les packages requis pour le parsing binaire et l'export JSON
+
+# Pour l'instant, la librairie standard de Python suffit (struct, json, os, etc.).
+# Ce fichier sera mis à jour dès qu'une dépendance externe (ex: construct, numpy) sera nécessaire.
