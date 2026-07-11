@@ -590,7 +590,29 @@ class ProToolsSession:
         # 1. Find Region ID from clip name
         region_id = None
 
-        # We need to find 0x2629 and 0x262b blocks
+        b262a = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x262a), None)
+        if not b262a:
+            raise ValueError("No clips found in session.")
+            
+        region_id = -1
+        current_idx = 0
+        for child in b262a.items:
+            if isinstance(child, PTBlock) and child.content_type == 0x2629:
+                b2628 = next((c for c in child.items if isinstance(c, PTBlock) and c.content_type == 0x2628), None)
+                if b2628:
+                    payload = getattr(b2628, 'items', [b""])[0]
+                    if isinstance(payload, (bytes, bytearray)) and len(payload) >= 4:
+                        nlen = struct.unpack_from("<I", payload, 0)[0]
+                        if 4 + nlen <= len(payload):
+                            name = payload[4:4+nlen].decode('ascii', 'ignore').strip('\x00')
+                            if name == clip_name:
+                                region_id = current_idx
+                                break
+                current_idx += 1
+
+        if region_id == -1:
+            raise ValueError(f"Clip '{clip_name}' not found in session.")
+
         def find_blocks(item, ctype):
             found = []
             if isinstance(item, PTBlock):
@@ -599,36 +621,6 @@ class ProToolsSession:
                 for child in item.items:
                     found.extend(find_blocks(child, ctype))
             return found
-
-        all_regions = []
-        for r in self.root_items:
-            all_regions.extend(find_blocks(r, 0x2629))
-            all_regions.extend(find_blocks(r, 0x262b))
-
-        for r_def in all_regions:
-            b2628s = find_blocks(r_def, 0x2628)
-            for b2628 in b2628s:
-                if len(b2628.items) > 0 and isinstance(b2628.items[0], (bytes, bytearray)):
-                    payload = b2628.items[0]
-                    # Parse pascal string: 4-byte length + string
-                    if len(payload) >= 4:
-                        name_len = struct.unpack_from("<I", payload, 0)[0]
-                        if 4 + name_len <= len(payload):
-                            try:
-                                name = payload[4:4+name_len].decode('ascii').strip('\x00')
-                                if name == clip_name:
-                                    # Found the clip! Region ID is in the first bytearray of the definition block
-                                    p_def = next((i for i in r_def.items if isinstance(i, bytearray)), None)
-                                    if p_def:
-                                        region_id = struct.unpack_from("<I", p_def, 0)[0]
-                                        break
-                            except:
-                                pass
-            if region_id is not None:
-                break
-
-        if region_id is None:
-            raise ValueError(f"Clip '{clip_name}' not found in session.")
 
         # 2. Find placement in 0x1050 -> 0x104f
         all_104f = []
@@ -654,7 +646,31 @@ class ProToolsSession:
         target_samples = engine.timecode_to_samples(hh, mm, ss, ff)
 
         # 2. Find Region ID
-        region_id = None
+        region_id = -1
+        b262a = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x262a), None)
+        if not b262a:
+            raise ValueError("No clips found in session.")
+            
+        current_idx = 0
+        for child in b262a.items:
+            if isinstance(child, PTBlock) and child.content_type == 0x2629:
+                b2628 = next((c for c in child.items if isinstance(c, PTBlock) and c.content_type == 0x2628), None)
+                if b2628:
+                    payload = getattr(b2628, 'items', [b""])[0]
+                    if isinstance(payload, (bytes, bytearray)) and len(payload) >= 4:
+                        nlen = struct.unpack_from("<I", payload, 0)[0]
+                        if 4 + nlen <= len(payload):
+                            name = payload[4:4+nlen].decode('ascii', 'ignore').strip('\x00')
+                            if name == clip_name:
+                                region_id = current_idx
+                                break
+                current_idx += 1
+
+        if region_id == -1:
+            raise ValueError(f"Clip '{clip_name}' not found in session.")
+
+        # 3. Update timestamp in 0x104f
+        moved_count = 0
         def find_blocks(item, ctype):
             found = []
             if isinstance(item, PTBlock):
@@ -663,36 +679,7 @@ class ProToolsSession:
                 for child in item.items:
                     found.extend(find_blocks(child, ctype))
             return found
-
-        all_regions = []
-        for r in self.root_items:
-            all_regions.extend(find_blocks(r, 0x2629))
-            all_regions.extend(find_blocks(r, 0x262b))
-
-        for r_def in all_regions:
-            for b2628 in find_blocks(r_def, 0x2628):
-                if len(b2628.items) > 0 and isinstance(b2628.items[0], bytearray):
-                    payload = b2628.items[0]
-                    if len(payload) >= 4:
-                        name_len = struct.unpack_from("<I", payload, 0)[0]
-                        if 4 + name_len <= len(payload):
-                            try:
-                                name = payload[4:4+name_len].decode('ascii').strip('\x00')
-                                if name == clip_name:
-                                    p_def = next((i for i in r_def.items if isinstance(i, bytearray)), None)
-                                    if p_def:
-                                        region_id = struct.unpack_from("<I", p_def, 0)[0]
-                                        break
-                            except:
-                                pass
-            if region_id is not None:
-                break
-
-        if region_id is None:
-            raise ValueError(f"Clip '{clip_name}' not found in session.")
-
-        # 3. Update timestamp in 0x104f
-        moved_count = 0
+            
         for b104f in sum((find_blocks(r, 0x104f) for r in self.root_items), []):
             if len(b104f.items) > 0 and isinstance(b104f.items[0], bytearray) and len(b104f.items[0]) >= 15:
                 payload = b104f.items[0]
