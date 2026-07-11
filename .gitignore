@@ -16,3 +16,6 @@ reference_ptformat/
 # Ignorer les fichiers temporaires et logs
 *.log
 *.tmp
+
+# Ignorer les notes de passation internes
+handoff.md
