@@ -37,6 +37,12 @@ The `ProToolsSession` class in `pt_api.py` exposes a high-level API to manipulat
 - **Trimming:** Native `trim_clip_start` and `trim_clip_end` functions are planned but not yet implemented.
 - **Unsupported Features:** The API currently focuses on Audio clips and Volume/Clip Gain automation. Editing MIDI data, Inserts, Sends, and other automation playlists (Pan, Mute, etc.) is not yet supported and remains to be reverse-engineered.
 
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](file:///Y:/pt_api/LICENSE) file for details.
+
+If you use this project or significant portions of its code, keeping the original copyright notice is required by the license. Attribution in your documentation or acknowledgments is appreciated.
+
 ---
 
 Conçu par Sébastien Bédard
