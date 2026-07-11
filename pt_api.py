@@ -1089,10 +1089,17 @@ class ProToolsSession:
         
         geom_pl = bytearray(36)
         geom_pl[0:7] = b"\x00\x00\x00\x00\x00\x33\x00"
-        struct.pack_into("<I", geom_pl, 8, half_fade)
-        geom_pl[11] = 0 # override top byte to keep it 24-bit
-        struct.pack_into("<I", geom_pl, 11, fade_samples)
-        geom_pl[14] = 0 # override top byte
+        
+        # Write 24-bit pre-roll at offset 8 (3 bytes)
+        geom_pl[8] = half_fade & 0xFF
+        geom_pl[9] = (half_fade >> 8) & 0xFF
+        geom_pl[10] = (half_fade >> 16) & 0xFF
+        
+        # Write 24-bit duration at offset 11 (3 bytes)
+        geom_pl[11] = fade_samples & 0xFF
+        geom_pl[12] = (fade_samples >> 8) & 0xFF
+        geom_pl[13] = (fade_samples >> 16) & 0xFF
+        
         geom_pl[14] = 0x01
         geom_pl[15] = 0x01 # Standard Equal Power
         
