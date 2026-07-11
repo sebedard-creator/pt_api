@@ -298,7 +298,7 @@ class ProToolsSession:
                     hdr = track.items[0]
                     nlen = struct.unpack_from("<I", hdr, 0)[0]
                     if 4 + nlen <= len(hdr):
-                        tname = hdr[4:4+nlen].decode('ascii', 'ignore').strip('\x00')
+                        tname = hdr[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
                         tracks.append(tname)
         return tracks
 
@@ -316,7 +316,7 @@ class ProToolsSession:
                     payload = child.items[0]
                     m_idx = struct.unpack_from("<H", payload, 0)[0]
                     nlen = struct.unpack_from("<I", payload, 6)[0]
-                    name = payload[10:10+nlen].decode('ascii', 'ignore').strip('\x00')
+                    name = payload[10:10+nlen].decode('utf-8', 'ignore').strip('\x00')
                     tc_samples = struct.unpack_from("<q", payload, 10+nlen)[0]
                     markers.append({'index': m_idx, 'name': name, 'timecode': engine.samples_to_timecode(tc_samples)})
         return markers
@@ -342,7 +342,7 @@ class ProToolsSession:
                         nlen = struct.unpack_from("<I", payload, 0)[0]
                         if 4 + nlen > len(payload):
                             continue
-                        name = payload[4:4+nlen].decode('ascii', 'ignore').strip('\x00')
+                        name = payload[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
                         flags = struct.unpack_from("<H", payload, 4+nlen)[0]
                         ctype = "parent" if flags == 0x0000 else "virtual"
                         if flags in (0x0000, 0x0001):
@@ -375,7 +375,7 @@ class ProToolsSession:
                         nlen = struct.unpack_from("<I", payload, 0)[0]
                         if 4 + nlen > len(payload):
                             continue
-                        name = payload[4:4+nlen].decode('ascii', 'ignore').strip('\x00')
+                        name = payload[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
                         ctype = "group"
                         length = 0
                         if 4+nlen+9 <= len(payload):
@@ -409,7 +409,7 @@ class ProToolsSession:
                     payload = getattr(b2628, 'items', [b""])[0]
                     if isinstance(payload, (bytes, bytearray)) and len(payload) >= 4:
                         nlen = struct.unpack_from("<I", payload, 0)[0]
-                        name = payload[4:4+nlen].decode('ascii', 'ignore').strip('\x00')
+                        name = payload[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
                         if name == group_name:
                             group_id = clip_index
                             group_block = child
@@ -520,7 +520,7 @@ class ProToolsSession:
 
         b2077 = block.items[1]
 
-        new_name_bytes = name.encode('ascii')
+        new_name_bytes = name.encode('utf-8')
         new_len = len(new_name_bytes)
 
         header = bytearray(struct.pack("<H", index))
@@ -603,7 +603,7 @@ class ProToolsSession:
                     if isinstance(payload, (bytes, bytearray)) and len(payload) >= 4:
                         nlen = struct.unpack_from("<I", payload, 0)[0]
                         if 4 + nlen <= len(payload):
-                            name = payload[4:4+nlen].decode('ascii', 'ignore').strip('\x00')
+                            name = payload[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
                             if name == clip_name:
                                 region_id = current_idx
                                 break
@@ -659,7 +659,7 @@ class ProToolsSession:
                     if isinstance(payload, (bytes, bytearray)) and len(payload) >= 4:
                         nlen = struct.unpack_from("<I", payload, 0)[0]
                         if 4 + nlen <= len(payload):
-                            name = payload[4:4+nlen].decode('ascii', 'ignore').strip('\x00')
+                            name = payload[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
                             if name == clip_name:
                                 region_id = current_idx
                                 break
@@ -703,9 +703,9 @@ class ProToolsSession:
                         if isinstance(payload, (bytes, bytearray)) and len(payload) >= 4:
                             nlen = struct.unpack_from("<I", payload, 0)[0]
                             if 4 + nlen <= len(payload):
-                                name = payload[4:4+nlen].decode('ascii', 'ignore').strip('\x00')
+                                name = payload[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
                                 if name == old_name:
-                                    name_bytes = new_name.encode('ascii') + b'\x00'
+                                    name_bytes = new_name.encode('utf-8') + b'\x00'
                                     new_len = len(name_bytes)
                                     new_payload = bytearray(4 + new_len + (len(payload) - (4 + nlen)))
                                     struct.pack_into("<I", new_payload, 0, new_len)
@@ -739,7 +739,7 @@ class ProToolsSession:
                     if isinstance(payload, (bytes, bytearray)) and len(payload) >= 4:
                         nlen = struct.unpack_from("<I", payload, 0)[0]
                         if 4 + nlen <= len(payload):
-                            name = payload[4:4+nlen].decode('ascii', 'ignore').strip('\x00')
+                            name = payload[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
                             if name == clip_name:
                                 clip_id = current_idx
                                 break
@@ -828,7 +828,7 @@ class ProToolsSession:
             if b2628:
                 pl = b2628.items[0]
                 nlen = struct.unpack_from("<I", pl, 0)[0]
-                name = pl[4:4+nlen].decode('ascii', 'ignore').strip('\x00')
+                name = pl[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
                 if name == clip_name:
                     orig_2629 = c
                     orig_clip_id = i
@@ -898,7 +898,7 @@ class ProToolsSession:
                 clip_01.items[i] = bytes(new_ba)
         # Fix 0x2628
         b2628_01 = next(x for x in clip_01.items if isinstance(x, PTBlock) and x.content_type == 0x2628)
-        new_name_01 = (clip_name + "-01").encode('ascii')
+        new_name_01 = (clip_name + "-01").encode('utf-8')
         pl_01 = bytearray()
         pl_01.extend(struct.pack("<I", len(new_name_01)))
         pl_01.extend(new_name_01)
@@ -933,7 +933,7 @@ class ProToolsSession:
                 clip_02.items[i] = bytes(new_ba)
         
         b2628_02 = next(x for x in clip_02.items if isinstance(x, PTBlock) and x.content_type == 0x2628)
-        new_name_02 = (clip_name + "-02").encode('ascii')
+        new_name_02 = (clip_name + "-02").encode('utf-8')
         pl_02 = bytearray()
         pl_02.extend(struct.pack("<I", len(new_name_02)))
         pl_02.extend(new_name_02)
@@ -1001,7 +1001,7 @@ class ProToolsSession:
                 hdr = track.items[0]
                 nlen = struct.unpack_from("<I", hdr, 0)[0]
                 if 4 + nlen <= len(hdr):
-                    tname = hdr[4:4+nlen].decode('ascii', 'ignore').strip('\x00')
+                    tname = hdr[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
                     if tname == track_name:
                         b1052 = track
                         break
@@ -1114,7 +1114,7 @@ class ProToolsSession:
                 hdr = track.items[0]
                 nlen = struct.unpack_from("<I", hdr, 0)[0]
                 if 4 + nlen <= len(hdr):
-                    tname = hdr[4:4+nlen].decode('ascii', 'ignore').strip('\x00')
+                    tname = hdr[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
                     if tname == track_name:
                         b1052 = track
                         break
@@ -1199,7 +1199,7 @@ class ProToolsSession:
                 hdr = b.items[0]
                 nlen = struct.unpack_from("<I", hdr, 0)[0]
                 if 4 + nlen <= len(hdr):
-                    tname = hdr[4:4+nlen].decode('ascii', 'ignore').strip('\x00')
+                    tname = hdr[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
                     if tname == track_name:
                         b1052 = b
                         break
@@ -1298,7 +1298,7 @@ class ProToolsSession:
                     if isinstance(payload, (bytes, bytearray)) and len(payload) >= 4:
                         nlen = struct.unpack_from("<I", payload, 0)[0]
                         if 4 + nlen <= len(payload):
-                            name = payload[4:4+nlen].decode('ascii', 'ignore').strip('\x00')
+                            name = payload[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
                             if name == clip_name:
                                 target_b2628 = b2628
                                 break
@@ -1379,7 +1379,7 @@ class ProToolsSession:
                         name_len = struct.unpack_from("<I", payload, 0)[0]
                         if 4 + name_len <= len(payload):
                             try:
-                                name = payload[4:4+name_len].decode('ascii').strip('\x00')
+                                name = payload[4:4+name_len].decode('utf-8', 'ignore').strip('\x00')
                                 if name == track_name:
                                     matched = True
                                     break
