@@ -83,8 +83,7 @@ class TimecodeEngine:
         elif self.frame_rate_enum == 0x05:
             return 30000 / 1001, True
         else:
-            # default fallback
-            return 24.0, False
+            raise ValueError(f"Unsupported frame rate enum: {hex(self.frame_rate_enum)}. The API cannot accurately calculate timecodes for this frame rate yet.")
 
     def samples_to_timecode(self, samples):
         actual_fps, is_df = self.get_frame_rate()
