@@ -844,9 +844,9 @@ class ProToolsSession:
         nlen = struct.unpack_from("<I", pl_orig, 0)[0]
         offset = 4 + nlen
         
-        # Ensure it is a 32-bit root clip format (00 00 30 44 00)
+        # Ensure it is a 32-bit root clip format (00 00 or 01 00 followed by 30 44 00)
         hdr = pl_orig[offset:offset+5]
-        if hdr != b"\x00\x00\x30\x44\x00":
+        if hdr not in (b"\x00\x00\x30\x44\x00", b"\x01\x00\x30\x44\x00"):
             raise ValueError("Clip is already a split or has unsupported format (needs 32-bit root format).")
             
         orig_length = struct.unpack_from("<I", pl_orig, offset+5)[0]
