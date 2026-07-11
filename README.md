@@ -40,3 +40,5 @@ The `ProToolsSession` class in `pt_api.py` exposes a high-level API to manipulat
 ---
 
 Conçu par Sébastien Bédard
+
+*Legal Disclaimer: This tool is the result of independent reverse engineering. No official technical documentation, proprietary source code, or confidential information from Avid Technology or any other third party was used or referenced in the creation of this project. It is an independent endeavor created solely for educational and interoperability purposes.*
