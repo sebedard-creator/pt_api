@@ -145,7 +145,29 @@ Pour lier un clip à son point d'automation, Pro Tools lit un index de 4 octets 
 
 ---
 
-## 7. Groupes de Clips (Clip Groups)
+## 7. Structure de Piste et Automation de Volume
+
+| Content Type | `block_type` | Description |
+|---|---|---|
+| `0x261c` | Variable | Racine de la définition d'une piste. Contient les métadonnées de piste (nom, type) et ses listes d'automation. |
+| `0x2619` | 4 | Nom de la piste. Le payload commence par la longueur du nom (UInt32 LE) suivie du nom en UTF-8. |
+| `0x260d` | 3 | Conteneur racine des listes d'automation (playlists) de la piste. |
+| `0x260a` | Variable | Playlist d'automation individuelle. La *première* occurrence dans `0x260d` correspond systématiquement à l'automation de **Volume de Piste**. |
+
+### Structure du Payload `0x260a` (Nœuds de Volume)
+L'automation de volume est stockée sous forme de liste de nœuds interpolables.
+- **En-tête (22 octets)** :
+  - `0-3` : Magic / Type identifier.
+  - `10-13` : **Compteur de nœuds** (UInt32 LE). Indique combien de points d'automation sont présents.
+  - `14-21` : Flags de métadonnées de la playlist.
+- **Nœuds (6 octets chacun)** :
+  - `+0` : **Timestamp** (UInt32 LE) exprimé en samples.
+  - `+4` : **Valeur d'amplitude** (Int16 LE). La valeur en décibels est stockée en déci-dB (ex: `+6.0 dB` = `60`, `-10.5 dB` = `-105`).
+- **Injection** : Ajouter un point nécessite d'insérer un nœud de 6 octets, trié par timestamp, et d'incrémenter le compteur de l'en-tête.
+
+---
+
+## 8. Groupes de Clips (Clip Groups)
 
 | Content Type | `block_type` | Description |
 |---|---|---|
@@ -158,7 +180,7 @@ Pour lier un clip à son point d'automation, Pro Tools lit un index de 4 octets 
 
 ---
 
-## 8. Fonctionnalités Non Explorées (Limites de l'API)
+## 9. Fonctionnalités Non Explorées (Limites de l'API)
 
 Les éléments suivants n'ont pas encore été rétro-ingénieriés et ne sont pas supportés par l'API actuelle :
 - **Données MIDI** : Les régions MIDI et les contrôleurs continus.
@@ -168,7 +190,7 @@ Les éléments suivants n'ont pas encore été rétro-ingénieriés et ne sont p
 
 ---
 
-## 9. Codes d'Erreur Pro Tools
+## 10. Codes d'Erreur Pro Tools
 
 | Erreur Observée | Explication Technique | Solution de Réparation |
 |---|---|---|
