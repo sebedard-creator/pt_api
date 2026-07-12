@@ -25,7 +25,7 @@ The `ProToolsSession` class in `pt_api.py` exposes a high-level API to manipulat
 | | `move_clip(clip_name, timecode)` | Moves a clip to a new absolute timestamp on the timeline. |
 | | `duplicate_clip(name, timecode)`| Clones a timeline event to create a duplicate clip at a new location. |
 | | `split_clip(name, timecode)` | Splits a clip into two virtual sub-clips (`-01`, `-02`), managing 24-bit internal trimming offsets. |
-| **Fades & Crossfades** | `add_fade(clip_name, type, len)` | Injects a native Equal Power Fade In or Fade Out. Generates fade geometries and track caches. |
+| **Fades & Crossfades** | `add_fade(clip_name, type, len)` | Injects a native Equal Power Fade In or Fade Out. Generates fade geometries. |
 | | `add_crossfade(c1, c2, len)` | Injects a native Equal Power Crossfade between two adjacent clips. |
 | **Automation** | `set_clip_gain(clip_name, dB)` | Applies static Clip Gain (Float32). Supports precise dB values (e.g., `6.0`, `-10.0`) and `-inf`. |
 | | `add_volume_node(track, tc, val)`| Adds volume automation nodes (deci-dB) to a track's playlist. |
@@ -34,6 +34,7 @@ The `ProToolsSession` class in `pt_api.py` exposes a high-level API to manipulat
 ## Current Limitations
 - **Split Clip Duration Limit:** The `split_clip` logic currently relies on Pro Tools' standard 24-bit internal source offset flag (`01 30`). This mathematically limits splitting to clips that are shorter than ~5.8 minutes at 48kHz (16,777,215 samples). Support for 32-bit or 64-bit flagged long-clip trimming is not yet reverse-engineered.
 - **Clip Group Creation:** While the API can safely read and *delete* Clip Groups, *creating* them from scratch is disabled pending further reverse-engineering of the internal pointer link between `0x2428` and `0x2501` blocks.
+- **Fade Cache Generation:** Fades created by `add_fade` or `add_crossfade` do not generate track-level visualization caches (`0x2077`). Pro Tools will automatically regenerate these caches perfectly upon opening the session file, but third-party tools inspecting the raw file immediately after modification will not see them.
 - **Trimming:** Native `trim_clip_start` and `trim_clip_end` functions are planned but not yet implemented.
 - **Unsupported Features:** The API currently focuses on Audio clips and Volume/Clip Gain automation. Editing MIDI data, Inserts, Sends, and other automation playlists (Pan, Mute, etc.) is not yet supported and remains to be reverse-engineered.
 
