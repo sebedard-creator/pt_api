@@ -45,7 +45,7 @@ Le bloc `0x0002` est une suite d'enregistrements structurés de taille variable.
 
 | Content Type | `block_type` | Description |
 |---|---|---|
-| `0x2030` | Variable | Bloc racine d'une piste. Contient les blocs de timeline (`0x1054`), cache de fondus (`0x2077`) et padding. |
+| `0x2030` | Variable | Conteneur générique. Lorsqu'il est à la racine, il contient la liste des Marqueurs (`0x2077`). Apparaît aussi vide ou pour d'autres usages internes dans les pistes. |
 | `0x1054` | 2 | Map d'événements de la piste. Contient le conteneur `0x1052`. |
 | `0x1052` | 3 | Playlist de la piste. Header : `[name_len 4B][name][count 4B LE]`. Contient `count` événements `0x1050`. |
 | `0x1050` | 3 | Conteneur d'un événement sur la timeline. Contient `0x104f` + payload secondaire (3 octets). |
