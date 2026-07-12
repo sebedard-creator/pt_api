@@ -52,7 +52,7 @@ def xor_session(data: bytearray, out_path: str):
     elif xor_type == 0x05:
         xor_delta = gen_xor_delta(xor_value, 11, True)
     else:
-        raise Exception(f"Unknown encryption type")
+        raise Exception("Unknown encryption type")
         
     xxor = bytearray(256)
     for i in range(256):
@@ -811,37 +811,48 @@ class ProToolsSession:
         orig_ts1 = struct.unpack_from("<I", pl_orig, offset+9)[0]
         orig_ts2 = struct.unpack_from("<I", pl_orig, offset+13)[0]
         
-        # 3. Find the event on the timeline that spans this absolute cut_samples
-        target_event = None
-        target_b1052 = None
-        ev_idx = -1
-        event_start_samples = 0
-        
+        # 3. Find the track and event on the timeline
         b1054 = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x1054), None)
         if not b1054:
             raise ValueError("No track map (0x1054) found.")
             
-        for child in b1054.items:
-            if isinstance(child, PTBlock) and child.content_type == 0x1052:
-                for i, ev in enumerate(child.items):
-                    if isinstance(ev, PTBlock) and ev.content_type == 0x1050:
-                        b104f = next((c for c in ev.items if isinstance(c, PTBlock) and c.content_type == 0x104f), None)
-                        if b104f:
-                            payload = bytearray(b104f.items[0])
-                            if len(payload) >= 15:
-                                ev_clip_id = struct.unpack_from("<I", payload, 2)[0]
-                                if ev_clip_id == orig_clip_id:
-                                    ts = struct.unpack_from("<Q", payload, 7)[0]
-                                    if ts < cut_samples < ts + orig_length:
-                                        target_event = ev
-                                        target_b1052 = child
-                                        ev_idx = i
-                                        event_start_samples = ts
-                                        break
-                if target_event: break
+        b1052 = None
+        for track in [b for b in b1054.items if isinstance(b, PTBlock) and b.content_type == 0x1052]:
+            if len(track.items) > 0 and isinstance(track.items[0], (bytes, bytearray)):
+                hdr = track.items[0]
+                nlen = struct.unpack_from("<I", hdr, 0)[0]
+                if 4 + nlen <= len(hdr):
+                    tname = hdr[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
+                    if tname == track_name:
+                        b1052 = track
+                        break
+                        
+        if not b1052:
+            raise ValueError(f"Track '{track_name}' not found.")
             
-        if not target_event:
-            raise ValueError(f"Could not find an instance of clip '{clip_name}' on the timeline that spans the requested cut timecode.")
+        orig_1050 = None
+        orig_1050_idx = -1
+        event_start_samples = 0
+        orig_abs_ts = -1
+        
+        for i, ev in enumerate(b1052.items):
+            if isinstance(ev, PTBlock) and ev.content_type == 0x1050:
+                b104f = next((c for c in ev.items if isinstance(c, PTBlock) and c.content_type == 0x104f), None)
+                if b104f:
+                    payload = bytearray(b104f.items[0])
+                    if len(payload) >= 15:
+                        ev_clip_id = struct.unpack_from("<I", payload, 2)[0]
+                        if ev_clip_id == orig_clip_id:
+                            ts = struct.unpack_from("<Q", payload, 7)[0]
+                            if ts < cut_samples < ts + orig_length:
+                                orig_1050 = ev
+                                orig_1050_idx = i
+                                event_start_samples = ts
+                                orig_abs_ts = ts
+                                break
+                                
+        if not orig_1050:
+            raise ValueError(f"Could not find an instance of clip '{clip_name}' on track '{track_name}' that spans the cut timecode.")
             
         relative_cut_samples = cut_samples - event_start_samples
         
@@ -948,40 +959,7 @@ class ProToolsSession:
         b262a.items.append(clip_02)
         
         # 6. Update Timeline (0x1052)
-        b1054 = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x1054), None)
-        b1052 = None
-        for track in [b for b in b1054.items if isinstance(b, PTBlock) and b.content_type == 0x1052]:
-            if len(track.items) > 0 and isinstance(track.items[0], (bytes, bytearray)):
-                hdr = track.items[0]
-                nlen = struct.unpack_from("<I", hdr, 0)[0]
-                if 4 + nlen <= len(hdr):
-                    tname = hdr[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
-                    if tname == track_name:
-                        b1052 = track
-                        break
-                        
-        if not b1052:
-            raise ValueError(f"Track '{track_name}' not found.")
-            
-        orig_1050 = None
-        orig_1050_idx = -1
-        orig_abs_ts = -1
-        
-        for i, ev in enumerate(b1052.items):
-            if isinstance(ev, PTBlock) and ev.content_type == 0x1050:
-                b104f = next((x for x in ev.items if isinstance(x, PTBlock) and x.content_type == 0x104f), None)
-                if b104f:
-                    p = b104f.items[0]
-                    cid = struct.unpack_from("<I", p, 2)[0]
-                    ts_check = struct.unpack_from('<Q', p, 7)[0]
-                    if cid == orig_clip_id and ts_check == event_start_samples:
-                        orig_1050 = ev
-                        orig_1050_idx = i
-                        orig_abs_ts = struct.unpack_from("<q", p, 7)[0]
-                        orig_abs_ts = ts_check
-                        
-        if not orig_1050:
-            raise ValueError(f"Clip '{clip_name}' is not placed on track '{track_name}'.")
+        # Variables b1052, orig_1050, orig_1050_idx, and orig_abs_ts were found in step 3.
         
         cut_abs_ts = orig_abs_ts + relative_cut_samples
         
