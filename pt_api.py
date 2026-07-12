@@ -1,7 +1,6 @@
 import struct
 import copy
 import os
-import struct
 def gen_xor_delta(xor_value: int, mul: int, negative: bool) -> int:
     for i in range(256):
         if ((i * mul) & 0xff) == xor_value:
@@ -9,7 +8,7 @@ def gen_xor_delta(xor_value: int, mul: int, negative: bool) -> int:
                 return (256 - i) & 0xff
             else:
                 return i
-    return 0
+    raise ValueError(f"No valid XOR delta found for xor_value=0x{xor_value:02x}, mul={mul}")
 
 def unxor_session(file_path: str) -> bytearray:
     try:
@@ -641,14 +640,6 @@ class ProToolsSession:
 
         # 3. Update timestamp in 0x104f
         moved_count = 0
-        def find_blocks(item, ctype):
-            found = []
-            if isinstance(item, PTBlock):
-                if item.content_type == ctype:
-                    found.append(item)
-                for child in item.items:
-                    found.extend(find_blocks(child, ctype))
-            return found
             
         for b104f in sum((r.get_all_blocks(0x104f) if isinstance(r, PTBlock) else [] for r in self.root_items), []):
             if len(b104f.items) > 0 and isinstance(b104f.items[0], bytearray) and len(b104f.items[0]) >= 15:
@@ -1146,7 +1137,7 @@ class ProToolsSession:
         # 2. Find track and event on timeline
         b1054 = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x1054), None)
         b1052 = None
-        for b in find_blocks(b1054, 0x1052):
+        for b in b1054.get_all_blocks(0x1052):
             if len(b.items) > 0 and isinstance(b.items[0], bytearray):
                 hdr = b.items[0]
                 nlen = struct.unpack_from("<I", hdr, 0)[0]
@@ -1305,12 +1296,12 @@ class ProToolsSession:
 
         all_261c = []
         for r in self.root_items:
-            all_261c.extend(find_blocks(r, 0x261c))
+            all_261c.extend(r.get_all_blocks(0x261c) if isinstance(r, PTBlock) else [])
 
         found_260a = None
         for b261c in all_261c:
             # Check track name in 0x2619
-            b2619s = find_blocks(b261c, 0x2619)
+            b2619s = b261c.get_all_blocks(0x2619)
             matched = False
             for b2619 in b2619s:
                 if len(b2619.items) > 0 and isinstance(b2619.items[0], bytearray):
@@ -1328,12 +1319,12 @@ class ProToolsSession:
 
             if matched:
                 # We found the track! Find 0x260d
-                b260ds = find_blocks(b261c, 0x260d)
+                b260ds = b261c.get_all_blocks(0x260d)
                 if b260ds:
                     # Inside 0x260d, the FIRST 0x260a is Volume automation.
                     # Be careful: we must iterate directly on the block tree to find the first 260a
                     # because find_blocks traverses everything and order is preserved.
-                    all_260a = find_blocks(b260ds[0], 0x260a)
+                    all_260a = b260ds[0].get_all_blocks(0x260a)
                     if all_260a:
                         found_260a = all_260a[0]
                         break
