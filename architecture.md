@@ -21,7 +21,7 @@
 ### Classes principales
 - **`PTBlock`** : Bloc binaire. Attributs : `block_type`, `content_type`, `items` (list), `original_offset` (`-1` pour les nouveaux blocs).
 - **`ProToolsSession`** : Charge, parse et sauvegarde une session.
-  - *Méthodes publiques* : `get_tracks()`, `get_markers()`, `get_clips()`, `add_marker()`, `mute_clip()`, `move_clip()`, `rename_clip()`, `delete_clip_group()`, `add_volume_node()`, `add_fade()`, `add_crossfade()`, `split_clip()`, `save()`.
+  - *Méthodes publiques* : `get_tracks()`, `get_markers()`, `get_clips()`, `get_timeline_clips()`, `add_marker()`, `mute_clip()`, `move_clip()`, `rename_clip()`, `delete_clip_group()`, `add_volume_node()`, `add_fade()`, `add_crossfade()`, `split_clip()`, `save()`.
   - *Méthodes internes clés* : `_ensure_fade_cache(track_name)` (injection du cache `0x2077`, **toujours** utilisée pour ça — ne jamais la redupliquer inline, cf. régression Phase 8), `_collect_offsets_recursive()` / `_purge_0002_records()` (voir règle de suppression ci-dessous).
 
 ### Système de sauvegarde (`save()`) — 4 passes
