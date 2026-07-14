@@ -325,10 +325,13 @@ class ProToolsSession:
                         name = payload[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
                         flags = struct.unpack_from("<H", payload, 4+nlen)[0]
                         ctype = "parent" if flags == 0x0000 else "virtual"
-                        if flags in (0x0000, 0x0001):
+                        if flags == 0x0000:
                             length = struct.unpack_from("<I", payload, 4+nlen+5)[0]
                             src_offset = 0
-                        elif flags == 0x3001:  # 01 30 -> 0x3001
+                        elif flags == 0x0001:
+                            length = struct.unpack_from("<I", payload, 4+nlen+5)[0] & 0x00FFFFFF
+                            src_offset = 0
+                        elif flags > 0x0001:
                             offset_bytes = payload[4+nlen+5 : 4+nlen+8]
                             len_bytes = payload[4+nlen+8 : 4+nlen+11]
                             src_offset = offset_bytes[0] | (offset_bytes[1]<<8) | (offset_bytes[2]<<16)
@@ -396,10 +399,13 @@ class ProToolsSession:
                                 src_offset = 0
                                 if offset + 2 <= len(payload):
                                     flags = struct.unpack_from("<H", payload, offset)[0]
-                                    if flags in (0x0000, 0x0001):
+                                    if flags == 0x0000:
                                         if offset + 9 <= len(payload):
                                             length = struct.unpack_from("<I", payload, offset+5)[0]
-                                    elif flags == 0x3001:
+                                    elif flags == 0x0001:
+                                        if offset + 9 <= len(payload):
+                                            length = struct.unpack_from("<I", payload, offset+5)[0] & 0x00FFFFFF
+                                    elif flags > 0x0001:
                                         if offset + 11 <= len(payload):
                                             offset_bytes = payload[offset+5 : offset+8]
                                             len_bytes = payload[offset+8 : offset+11]
