@@ -78,14 +78,15 @@ Le bloc `0x0002` est une suite d'enregistrements structurés de taille variable.
 
 Lorsqu'un clip est coupé, Pro Tools génère des sous-clips virtuels.
 - **Indexation** : Le Clip ID utilisé dans la timeline (`0x104f`) est strictement défini par la position ordinale du bloc `0x2629` au sein de la liste `0x262a`.
-- **Encodage de Trimming** : Les informations de longueur et de décalage des sous-clips sont encodées à la fin du payload du bloc `0x2628`.
-- **Drapeaux 24-bits vs 32-bits** :
-  - `01 00` : Sans offset source (Clip original ou première moitié de la découpe).
-  - `01 30` : Avec offset source 24-bits (Deuxième moitié de la découpe). La limite théorique du format 24-bits est `16 777 215` samples.
+- **Encodage de Trimming** : Les informations de longueur et de décalage source (`src_offset`) des sous-clips sont encodées à la fin du payload du bloc `0x2628`, juste après le nom du clip (qui est une chaîne de longueur variable `N`).
+- **Drapeaux et Extraction (à partir de l'offset `4 + N`)** :
+  - `01 00 30 44 00` : Clip original. La **longueur (32-bits)** se trouve à `offset + 5`. `src_offset` = 0.
+  - `01 00 30 44 08` : Moitié gauche (découpée à la fin). La **longueur (24-bits)** se trouve à `offset + 5` (masque `& 0x00FFFFFF`). `src_offset` = 0.
+  - `01 30 30 44 08` : Moitié droite (découpée au début). Le **décalage source (`src_offset`, 24-bits)** se trouve à `offset + 5`. La **longueur (24-bits)** se trouve à `offset + 8` (masques `& 0x00FFFFFF`). La limite théorique du format 24-bits est `16 777 215` samples.
 
 **Règle de Scission (`split`) :**
-1. **Clip de Gauche (`-01`)** : Drapeaux `01 00`, longueur 32-bits. Timestamps hérités du parent. Zone métadonnées remplie de zéros. Padding de fin : `ff*8 + fe`.
-2. **Clip de Droite (`-02`)** : Drapeaux `01 30`, offset source 24-bits, longueur 24-bits. Timestamps modifiés en valeurs absolues de timeline. Padding de fin : `ff*8` seulement.
+1. **Clip de Gauche (`-01`)** : Hérite du drapeau `01 00` original, longueur 32-bits modifiée. Timestamps hérités du parent. Zone métadonnées remplie de zéros. Padding de fin : `ff*8 + fe`.
+2. **Clip de Droite (`-02`)** : Nouveau drapeau `01 30`, insertion du `src_offset` 24-bits, longueur 24-bits. Timestamps modifiés en valeurs absolues de timeline. Padding de fin : `ff*8` seulement.
 
 ---
 
