@@ -80,9 +80,9 @@ Lorsqu'un clip est coupé, Pro Tools génère des sous-clips virtuels.
 - **Indexation** : Le Clip ID utilisé dans la timeline (`0x104f`) est strictement défini par la position ordinale du bloc `0x2629` au sein de la liste `0x262a`.
 - **Encodage de Trimming** : Les informations de longueur et de décalage source (`src_offset`) des sous-clips sont encodées à la fin du payload du bloc `0x2628`, juste après le nom du clip (qui est une chaîne de longueur variable `N`).
 - **Drapeaux et Extraction (à partir de l'offset `4 + N`)** :
-  - `01 00 30 44 00` : Clip original. La **longueur (32-bits)** se trouve à `offset + 5`. `src_offset` = 0.
-  - `01 00 30 44 08` : Moitié gauche (découpée à la fin). La **longueur (24-bits)** se trouve à `offset + 5` (masque `& 0x00FFFFFF`). `src_offset` = 0.
-  - `01 30 30 44 08` : Moitié droite (découpée au début). Le **décalage source (`src_offset`, 24-bits)** se trouve à `offset + 5`. La **longueur (24-bits)** se trouve à `offset + 8` (masques `& 0x00FFFFFF`). La limite théorique du format 24-bits est `16 777 215` samples.
+  - L'API lit d'abord un UInt16 LE (le *flag*) à `offset`. Les 3 octets suivants (`30 44 08` par exemple) sont des octets de remplissage internes qui peuvent varier et doivent être ignorés.
+  - **Flag `0x0000` ou `0x0001`** : Clip original ou moitié gauche. La **longueur (32-bits)** se trouve à `offset + 5`. `src_offset` = 0.
+  - **Flag `0x3001` (`01 30`)** : Moitié droite (découpée au début). Le **décalage source (`src_offset`, 24-bits)** se trouve à `offset + 5`. La **longueur (24-bits)** se trouve à `offset + 8`. La limite théorique du format 24-bits est `16 777 215` samples.
 
 **Règle de Scission (`split`) :**
 1. **Clip de Gauche (`-01`)** : Hérite du drapeau `01 00` original, longueur 32-bits modifiée. Timestamps hérités du parent. Zone métadonnées remplie de zéros. Padding de fin : `ff*8 + fe`.

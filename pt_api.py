@@ -391,21 +391,20 @@ class ProToolsSession:
                                 name = payload[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
                                 offset = 4 + nlen
                                 
-                                # Extract length exactly like get_clips() does
+                                # Extract length using robust UInt16 flag checking
                                 length = 0
                                 src_offset = 0
-                                if offset + 5 <= len(payload):
-                                    hdr = payload[offset:offset+5]
-                                    if hdr == b"\x01\x30\x30\x44\x08": # Trimmed right clip
-                                        if offset + 11 <= len(payload):
-                                            src_offset = struct.unpack_from("<I", payload, offset+5)[0] & 0x00FFFFFF
-                                            length = struct.unpack_from("<I", payload, offset+8)[0] & 0x00FFFFFF
-                                    elif hdr in (b"\x00\x00\x30\x44\x00", b"\x01\x00\x30\x44\x00"): # Normal 32-bit root clip
+                                if offset + 2 <= len(payload):
+                                    flags = struct.unpack_from("<H", payload, offset)[0]
+                                    if flags in (0x0000, 0x0001):
                                         if offset + 9 <= len(payload):
                                             length = struct.unpack_from("<I", payload, offset+5)[0]
-                                    elif hdr == b"\x01\x00\x30\x44\x08": # Trimmed left clip
-                                        if offset + 8 <= len(payload):
-                                            length = struct.unpack_from("<I", payload, offset+5)[0] & 0x00FFFFFF
+                                    elif flags == 0x3001:
+                                        if offset + 11 <= len(payload):
+                                            offset_bytes = payload[offset+5 : offset+8]
+                                            len_bytes = payload[offset+8 : offset+11]
+                                            src_offset = offset_bytes[0] | (offset_bytes[1]<<8) | (offset_bytes[2]<<16)
+                                            length = len_bytes[0] | (len_bytes[1]<<8) | (len_bytes[2]<<16)
                                             
                                 clip_id_in_dict = i - 1
                                 clip_dict[clip_id_in_dict] = {'name': name, 'length': length, 'src_offset': src_offset}

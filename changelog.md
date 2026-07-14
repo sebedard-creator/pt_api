@@ -9,6 +9,9 @@
 - **Fix** : `split_clip()` filtre désormais correctement la piste lors de la recherche du clip d'origine, évitant les erreurs de découpage avec les clips copiés sur de multiples pistes.
 - **Cleanup** : Suppression du code mort et des imports dupliqués. Validation complète de l'absence de conflit entre les caches de fondu (0x2077) et les marqueurs.
 
+## [1.1.2] - 2026-07-14
+- **Bug Fix / Robustness** : Amélioration de l'extraction de `length` et `src_offset` dans `get_timeline_clips()`. L'API utilise désormais un `unpack_from("<H")` pour lire formellement le flag UInt16 au lieu de se fier à une signature stricte de 5 octets qui échouait en présence de padding imprévu.
+
 ## [1.1.1] - 2026-07-14
 - **Feature Update** : La méthode `get_timeline_clips()` retourne désormais la clé `src_offset_samples`, extrayant dynamiquement le décalage source des sous-clips (flag `0x3001` / `0x01 0x30`) stocké dans le bloc `0x2628`. Crucial pour l'alignement audio.
 
