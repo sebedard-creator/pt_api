@@ -20,7 +20,9 @@ The `ProToolsSession` class in `pt_api.py` exposes a high-level API to manipulat
 |---|---|---|
 | **I/O & Crypto** | `__init__(file)`, `save(file)` | Decrypts and parses the session on load. Rebuilds pointer tables and encrypts on save. |
 | **Markers** | `add_marker(name, timecode)` | Injects a new Memory Location / Marker at a specific timecode. |
-| **Clip Operations** | `rename_clip(name, new_name)` | Renames an audio clip directly in its definition block. |
+| **Clip Operations** | `get_clips()` | Returns a dictionary of all clips in the Clip Bin. |
+| | `get_timeline_clips()` | Returns a chronological list of all events placed on the timeline, including start and end samples. |
+| | `rename_clip(name, new_name)` | Renames an audio clip directly in its definition block. |
 | | `mute_clip(clip_name, mute)` | Toggles the mute state of a clip on the timeline. |
 | | `move_clip(clip_name, timecode)` | Moves a clip to a new absolute timestamp on the timeline. |
 | | `duplicate_clip(name, timecode)`| Clones a timeline event to create a duplicate clip at a new location. |

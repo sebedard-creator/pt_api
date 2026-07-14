@@ -368,6 +368,86 @@ class ProToolsSession:
                         })
         return clips
 
+    def get_timeline_clips(self):
+        """
+        Returns a flat list of all events placed on the timeline across all tracks.
+        Returns: [{'track', 'clip_name', 'start_samples', 'length_samples', 'end_samples', 'muted', 'is_fade'}]
+        """
+        timeline = []
+        
+        # 1. Build a dictionary mapping clip_id (index in 0x262a) to its properties
+        clip_dict = {}
+        b262a = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x262a), None)
+        
+        if b262a:
+            for i, child in enumerate(b262a.items):
+                if isinstance(child, PTBlock) and child.content_type == 0x2629:
+                    b2628 = next((c for c in child.items if isinstance(c, PTBlock) and c.content_type == 0x2628), None)
+                    if b2628:
+                        payload = b2628.items[0]
+                        if len(payload) >= 4:
+                            nlen = struct.unpack_from("<I", payload, 0)[0]
+                            if 4 + nlen <= len(payload):
+                                name = payload[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
+                                offset = 4 + nlen
+                                
+                                # Extract length exactly like get_clips() does
+                                length = 0
+                                if offset + 5 <= len(payload):
+                                    hdr = payload[offset:offset+5]
+                                    if hdr == b"\x01\x30\x30\x44\x08": # Trimmed right clip
+                                        if offset + 11 <= len(payload):
+                                            length = struct.unpack_from("<I", payload, offset+8)[0] & 0x00FFFFFF
+                                    elif hdr in (b"\x00\x00\x30\x44\x00", b"\x01\x00\x30\x44\x00"): # Normal 32-bit root clip
+                                        if offset + 9 <= len(payload):
+                                            length = struct.unpack_from("<I", payload, offset+5)[0]
+                                    elif hdr == b"\x01\x00\x30\x44\x08": # Trimmed left clip
+                                        if offset + 8 <= len(payload):
+                                            length = struct.unpack_from("<I", payload, offset+5)[0] & 0x00FFFFFF
+                                            
+                                clip_id_in_dict = i - 1
+                                clip_dict[clip_id_in_dict] = {'name': name, 'length': length}
+
+        # 2. Iterate over tracks and their events
+        b1054 = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x1054), None)
+        if not b1054:
+            return timeline
+            
+        for track in b1054.items:
+            if isinstance(track, PTBlock) and track.content_type == 0x1052:
+                if len(track.items) > 0 and isinstance(track.items[0], (bytes, bytearray)):
+                    hdr = track.items[0]
+                    nlen = struct.unpack_from("<I", hdr, 0)[0]
+                    if 4 + nlen <= len(hdr):
+                        track_name = hdr[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
+                        
+                        for ev in track.items[1:]:
+                            if isinstance(ev, PTBlock) and ev.content_type == 0x1050:
+                                b104f = next((c for c in ev.items if isinstance(c, PTBlock) and c.content_type == 0x104f), None)
+                                if b104f:
+                                    payload = b104f.items[0]
+                                    if len(payload) >= 16:
+                                        is_muted = (payload[0] == 0x01)
+                                        clip_id = struct.unpack_from("<I", payload, 2)[0]
+                                        start_ts = struct.unpack_from("<Q", payload, 7)[0]
+                                        ev_type = payload[15] # 0x01 = Fade, 0x03 = Audio
+                                        
+                                        clip_info = clip_dict.get(clip_id, {'name': 'UNKNOWN', 'length': 0})
+                                        
+                                        timeline.append({
+                                            'track': track_name,
+                                            'clip_name': clip_info['name'],
+                                            'start_samples': start_ts,
+                                            'length_samples': clip_info['length'],
+                                            'end_samples': start_ts + clip_info['length'],
+                                            'muted': is_muted,
+                                            'is_fade': (ev_type == 0x01)
+                                        })
+                                        
+        # 3. Sort by track, then chronological order
+        timeline.sort(key=lambda x: (x['track'], x['start_samples']))
+        return timeline
+
     def delete_clip_group(self, group_name):
         """Removes a clip group from the session (both from the clip list and the timeline)."""
         
