@@ -393,10 +393,12 @@ class ProToolsSession:
                                 
                                 # Extract length exactly like get_clips() does
                                 length = 0
+                                src_offset = 0
                                 if offset + 5 <= len(payload):
                                     hdr = payload[offset:offset+5]
                                     if hdr == b"\x01\x30\x30\x44\x08": # Trimmed right clip
                                         if offset + 11 <= len(payload):
+                                            src_offset = struct.unpack_from("<I", payload, offset+5)[0] & 0x00FFFFFF
                                             length = struct.unpack_from("<I", payload, offset+8)[0] & 0x00FFFFFF
                                     elif hdr in (b"\x00\x00\x30\x44\x00", b"\x01\x00\x30\x44\x00"): # Normal 32-bit root clip
                                         if offset + 9 <= len(payload):
@@ -406,7 +408,7 @@ class ProToolsSession:
                                             length = struct.unpack_from("<I", payload, offset+5)[0] & 0x00FFFFFF
                                             
                                 clip_id_in_dict = i - 1
-                                clip_dict[clip_id_in_dict] = {'name': name, 'length': length}
+                                clip_dict[clip_id_in_dict] = {'name': name, 'length': length, 'src_offset': src_offset}
 
         # 2. Iterate over tracks and their events
         b1054 = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x1054), None)
@@ -432,7 +434,7 @@ class ProToolsSession:
                                         start_ts = struct.unpack_from("<Q", payload, 7)[0]
                                         ev_type = payload[15] # 0x01 = Fade, 0x03 = Audio
                                         
-                                        clip_info = clip_dict.get(clip_id, {'name': 'UNKNOWN', 'length': 0})
+                                        clip_info = clip_dict.get(clip_id, {'name': 'UNKNOWN', 'length': 0, 'src_offset': 0})
                                         
                                         timeline.append({
                                             'track': track_name,
@@ -440,6 +442,7 @@ class ProToolsSession:
                                             'start_samples': start_ts,
                                             'length_samples': clip_info['length'],
                                             'end_samples': start_ts + clip_info['length'],
+                                            'src_offset_samples': clip_info['src_offset'],
                                             'muted': is_muted,
                                             'is_fade': (ev_type == 0x01)
                                         })
