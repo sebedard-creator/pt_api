@@ -1,6 +1,46 @@
-import struct
 import copy
+import logging
+import math
 import os
+import struct
+
+
+logger = logging.getLogger(__name__)
+
+
+def _coerce_string_path(value, parameter_name):
+    """Normalize a path-like value while rejecting ambiguous bytes paths."""
+    try:
+        path = os.fspath(value)
+    except TypeError as exc:
+        raise TypeError(
+            f"{parameter_name} must be a string or path-like object."
+        ) from exc
+    if not isinstance(path, str):
+        raise TypeError(f"{parameter_name} must resolve to a string path.")
+    if not path:
+        raise ValueError(f"{parameter_name} cannot be empty.")
+    return path
+
+
+def _validate_ptx_header(data):
+    """Validate the unencrypted 20-byte PTX envelope before body processing."""
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("Session data must be bytes or bytearray.")
+    if len(data) < 0x14:
+        raise ValueError("Session data must contain at least the 20-byte header.")
+    if data[0] != 0x03 or any(
+        byte not in (ord("0"), ord("1")) for byte in data[1:17]
+    ):
+        raise ValueError("Invalid PTX header signature or version field.")
+    if data[0x11] not in (0x00, 0x01):
+        raise ValueError("Invalid PTX endianness flag.")
+    if data[0x12] not in (0x01, 0x05):
+        raise ValueError(
+            f"Unknown encryption type (xor_type: 0x{data[0x12]:02x})"
+        )
+
+
 def gen_xor_delta(xor_value: int, mul: int, negative: bool) -> int:
     for i in range(256):
         if ((i * mul) & 0xff) == xor_value:
@@ -10,71 +50,96 @@ def gen_xor_delta(xor_value: int, mul: int, negative: bool) -> int:
                 return i
     raise ValueError(f"No valid XOR delta found for xor_value=0x{xor_value:02x}, mul={mul}")
 
-def unxor_session(file_path: str) -> bytearray:
-    try:
-        with open(file_path, "rb") as f:
-            data = bytearray(f.read())
-    except IOError as e:
-        raise Exception(f"Cannot open file {file_path}: {e}")
-        
-    if len(data) < 0x14:
-        raise Exception("File is too small to be a valid Pro Tools session.")
-        
-    xor_type = data[0x12]
-    xor_value = data[0x13]
-    
+
+def _transform_session_xor(data) -> bytearray:
+    """Return an XOR-transformed copy while preserving its 20-byte header."""
+    _validate_ptx_header(data)
+
+    transformed = bytearray(data)
+    xor_type = transformed[0x12]
+    xor_value = transformed[0x13]
     if xor_type == 0x01:
         xor_delta = gen_xor_delta(xor_value, 53, False)
     elif xor_type == 0x05:
         xor_delta = gen_xor_delta(xor_value, 11, True)
-    else:
-        raise Exception(f"Unknown encryption type (xor_type: 0x{xor_type:02x})")
-        
-    xxor = bytearray(256)
-    for i in range(256):
-        xxor[i] = (i * xor_delta) & 0xff
-        
-    for i in range(0x14, len(data)):
-        if xor_type == 0x01:
-            xor_index = i & 0xff
-        else:
-            xor_index = (i >> 12) & 0xff
-        data[i] ^= xxor[xor_index]
-        
-    return data
+
+    xxor = bytearray((i * xor_delta) & 0xFF for i in range(256))
+    for index in range(0x14, len(transformed)):
+        xor_index = index & 0xFF if xor_type == 0x01 else (index >> 12) & 0xFF
+        transformed[index] ^= xxor[xor_index]
+    return transformed
+
+
+def unxor_session(file_path: str) -> bytearray:
+    file_path = _coerce_string_path(file_path, "file_path")
+
+    with open(file_path, "rb") as f:
+        data = f.read()
+    if len(data) < 0x14:
+        raise ValueError("File is too small to be a valid Pro Tools session.")
+    return _transform_session_xor(data)
+
 
 def xor_session(data: bytearray, out_path: str):
-    xor_type = data[0x12]
-    xor_value = data[0x13]
-    
-    if xor_type == 0x01:
-        xor_delta = gen_xor_delta(xor_value, 53, False)
-    elif xor_type == 0x05:
-        xor_delta = gen_xor_delta(xor_value, 11, True)
-    else:
-        raise Exception("Unknown encryption type")
-        
-    xxor = bytearray(256)
-    for i in range(256):
-        xxor[i] = (i * xor_delta) & 0xff
-        
-    for i in range(0x14, len(data)):
-        if xor_type == 0x01:
-            xor_index = i & 0xff
-        else:
-            xor_index = (i >> 12) & 0xff
-        data[i] ^= xxor[xor_index]
-        
-    with open(out_path, "wb") as f:
-        f.write(data)
+    """Atomically write an XOR-transformed copy of decrypted session data."""
+    encrypted = _transform_session_xor(data)
+    out_path = _coerce_string_path(out_path, "out_path")
+
+    import tempfile
+
+    destination = os.path.abspath(out_path)
+    destination_dir = os.path.dirname(destination)
+    if not os.path.isdir(destination_dir):
+        raise FileNotFoundError(f"Output directory does not exist: {destination_dir}")
+
+    descriptor = None
+    temp_path = None
+    try:
+        descriptor, temp_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(destination)}.",
+            suffix=".tmp",
+            dir=destination_dir,
+        )
+        with os.fdopen(descriptor, "wb") as output:
+            descriptor = None
+            written = output.write(encrypted)
+            if written != len(encrypted):
+                raise OSError(
+                    f"Short write while encrypting session: {written}/{len(encrypted)} bytes."
+                )
+        os.replace(temp_path, destination)
+        temp_path = None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temp_path is not None:
+            try:
+                os.remove(temp_path)
+            except FileNotFoundError:
+                pass
 
 class TimecodeEngine:
     def __init__(self, sample_rate, frame_rate_enum):
+        if (
+            isinstance(sample_rate, bool)
+            or not isinstance(sample_rate, (int, float))
+        ):
+            raise ValueError("Sample rate must be a finite positive number.")
+        try:
+            sample_rate_is_finite = math.isfinite(sample_rate)
+        except OverflowError:
+            sample_rate_is_finite = False
+        if not sample_rate_is_finite or sample_rate <= 0:
+            raise ValueError("Sample rate must be a finite positive number.")
+        if sample_rate > 0xFFFFFFFF:
+            raise ValueError("Sample rate exceeds the PTX UInt32 range.")
+        if isinstance(frame_rate_enum, bool) or not isinstance(frame_rate_enum, int):
+            raise TypeError("Frame-rate enum must be an integer.")
         self.sample_rate = sample_rate
         self.frame_rate_enum = frame_rate_enum
 
     def get_frame_rate(self):
-        # Enum mapping based on block 0x204d payload offset 2
+        # Enum mapping based on block 0x204d payload offset 0
         # 0x01 = 24 fps
         # 0x09 = 23.976 fps
         # 0x05 = 29.97 DF fps
@@ -87,71 +152,131 @@ class TimecodeEngine:
         else:
             raise ValueError(f"Unsupported frame rate enum: {hex(self.frame_rate_enum)}. The API cannot accurately calculate timecodes for this frame rate yet.")
 
+    def _nominal_fps(self):
+        if self.frame_rate_enum in (0x01, 0x09):
+            return 24
+        if self.frame_rate_enum == 0x05:
+            return 30
+        self.get_frame_rate()  # Raises the public unsupported-rate error.
+
+    def _validate_components(self, hh, mm, ss, ff, *, position):
+        components = (hh, mm, ss, ff)
+        if any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in components
+        ):
+            raise TypeError("Timecode components must be integers.")
+        nominal_fps = self._nominal_fps()
+        if (
+            hh < 0 or mm < 0 or mm > 59
+            or ss < 0 or ss > 59 or ff < 0 or ff >= nominal_fps
+        ):
+            raise ValueError("Invalid timecode components.")
+
+        _, is_drop_frame = self.get_frame_rate()
+        if (
+            position
+            and is_drop_frame
+            and mm % 10 != 0
+            and ss == 0
+            and ff < 2
+        ):
+            raise ValueError("Timecode falls on a dropped frame number.")
+        return nominal_fps
+
+    @staticmethod
+    def _round_nonnegative(value):
+        return int(math.floor(value + 0.5))
+
     def samples_to_timecode(self, samples):
+        if isinstance(samples, bool) or not isinstance(samples, int):
+            raise TypeError("Sample position must be an integer.")
+        if samples < 0:
+            raise ValueError("Sample position cannot be negative.")
         actual_fps, is_df = self.get_frame_rate()
-        
-        if self.frame_rate_enum == 0x09: # 23.976
-            nominal_fps = 24
-        elif self.frame_rate_enum == 0x05: # 29.97 DF
-            nominal_fps = 30
-        else:
-            nominal_fps = int(actual_fps)
+        nominal_fps = self._nominal_fps()
             
-        total_seconds = samples / self.sample_rate
-        
-        if not is_df:
-            total_frames = int(round(total_seconds * actual_fps))
-            ff = total_frames % nominal_fps
-            ss = (total_frames // nominal_fps) % 60
-            mm = (total_frames // (nominal_fps * 60)) % 60
-            hh = total_frames // (nominal_fps * 3600)
-        else:
-            # Drop frame logic (29.97)
-            frames = int(round(total_seconds * actual_fps))
-            d = frames // 17982
-            m = frames % 17982
-            if m >= 2:
-                frames += 18 * d + 2 * ((m - 2) // 1798)
-                
-            ff = frames % 30
-            ss = (frames // 30) % 60
-            mm = (frames // 1800) % 60
-            hh = frames // 108000
+        try:
+            total_seconds = samples / self.sample_rate
+
+            if not is_df:
+                total_frames = self._round_nonnegative(total_seconds * actual_fps)
+                ff = total_frames % nominal_fps
+                ss = (total_frames // nominal_fps) % 60
+                mm = (total_frames // (nominal_fps * 60)) % 60
+                hh = total_frames // (nominal_fps * 3600)
+            else:
+                # Drop frame logic (29.97)
+                frames = self._round_nonnegative(total_seconds * actual_fps)
+                d = frames // 17982
+                m = frames % 17982
+                frames += 18 * d
+                if m >= 2:
+                    frames += 2 * ((m - 2) // 1798)
+
+                ff = frames % 30
+                ss = (frames // 30) % 60
+                mm = (frames // 1800) % 60
+                hh = frames // 108000
+        except OverflowError as exc:
+            raise ValueError("Sample position exceeds the timecode conversion range.") from exc
             
         return f"{hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}"
 
     def timecode_to_samples(self, hh, mm, ss, ff):
+        nominal_fps = self._validate_components(hh, mm, ss, ff, position=True)
         actual_fps, is_df = self.get_frame_rate()
 
-        if self.frame_rate_enum == 0x09: # 23.976
-            nominal_fps = 24
-        elif self.frame_rate_enum == 0x05: # 29.97 DF
-            nominal_fps = 30
-        else:
-            nominal_fps = int(actual_fps)
+        try:
+            if not is_df:
+                total_frames = (hh * 3600 + mm * 60 + ss) * nominal_fps + ff
+                total_seconds = total_frames / actual_fps
+                return self._round_nonnegative(total_seconds * self.sample_rate)
+            else:
+                # Drop frame logic
+                # For 29.97 DF, frame rate is exactly 30000/1001
+                # 2 frames are dropped every minute, except every 10th minute
+                total_minutes = hh * 60 + mm
 
-        if not is_df:
+                # The nominal frame count if it were exactly 30 fps
+                nominal_frames = (total_minutes * 60 + ss) * 30 + ff
+
+                # Subtract dropped frames
+                dropped = 2 * total_minutes - 2 * (total_minutes // 10)
+
+                actual_frames = nominal_frames - dropped
+
+                total_seconds = actual_frames / (30000 / 1001)
+                return self._round_nonnegative(total_seconds * self.sample_rate)
+        except OverflowError as exc:
+            raise ValueError("Timecode position exceeds the sample conversion range.") from exc
+
+    def duration_to_samples(self, hh, mm, ss, ff):
+        """Convert a duration without applying drop-frame label exclusions."""
+        nominal_fps = self._validate_components(hh, mm, ss, ff, position=False)
+        actual_fps, _ = self.get_frame_rate()
+        try:
             total_frames = (hh * 3600 + mm * 60 + ss) * nominal_fps + ff
-            total_seconds = total_frames / actual_fps
-            return int(round(total_seconds * self.sample_rate))
-        else:
-            # Drop frame logic
-            # For 29.97 DF, frame rate is exactly 30000/1001
-            # 2 frames are dropped every minute, except every 10th minute
-            total_minutes = hh * 60 + mm
-
-            # The nominal frame count if it were exactly 30 fps
-            nominal_frames = (total_minutes * 60 + ss) * 30 + ff
-
-            # Subtract dropped frames
-            dropped = 2 * total_minutes - 2 * (total_minutes // 10)
-
-            actual_frames = nominal_frames - dropped
-
-            total_seconds = actual_frames / (30000 / 1001)
-            return int(round(total_seconds * self.sample_rate))
+            return self._round_nonnegative(
+                (total_frames / actual_fps) * self.sample_rate
+            )
+        except OverflowError as exc:
+            raise ValueError("Timecode duration exceeds the sample conversion range.") from exc
 
 ZMARK = 0x5a
+MAX_PTX_BLOCK_DEPTH = 128
+# These supported payload formats are byte records, not nested TLV streams.
+# Treating an incidental 0x5A plus plausible size as a child would make later
+# pointer relocation depend on arbitrary timestamps, gain values, or names.
+FLAT_PTX_CONTENT_TYPES = frozenset({
+    0x0002,  # Root pointer table.
+    0x1028,  # Session sample rate.
+    0x104F,  # Timeline event payload.
+    0x204D,  # Session frame rate.
+    0x260A,  # Volume automation envelope.
+    0x262F,  # Fade geometry.
+    0x2637,  # Clip Gain point dictionary.
+})
 
 def u_endian_read2(buf, offset, is_bigendian):
     fmt = ">H" if is_bigendian else "<H"
@@ -160,6 +285,15 @@ def u_endian_read2(buf, offset, is_bigendian):
 def u_endian_read4(buf, offset, is_bigendian):
     fmt = ">I" if is_bigendian else "<I"
     return struct.unpack_from(fmt, buf, offset)[0]
+
+
+def _merge_unique_offset_mapping(target, source):
+    duplicates = set(target).intersection(source)
+    if duplicates:
+        duplicate = min(duplicates)
+        raise ValueError(f"Duplicate original block offset: 0x{duplicate:08x}.")
+    target.update(source)
+
 
 class PTBlock:
     def __init__(self, block_type, content_type, original_size=0):
@@ -170,6 +304,48 @@ class PTBlock:
         self.original_offset = 0
 
     def to_bytes(self, is_bigendian=False, base_offset=0):
+        if not isinstance(is_bigendian, bool):
+            raise TypeError("is_bigendian must be a boolean.")
+        if isinstance(base_offset, bool) or not isinstance(base_offset, int):
+            raise TypeError("base_offset must be an integer.")
+        if base_offset < 0 or base_offset > 0xFFFFFFFF:
+            raise ValueError("base_offset must fit an unsigned 32-bit offset.")
+        return self._to_bytes(is_bigendian, base_offset, set())
+
+    def _to_bytes(self, is_bigendian, base_offset, ancestors):
+        if len(ancestors) > MAX_PTX_BLOCK_DEPTH:
+            raise ValueError(
+                f"PTBlock nesting exceeds {MAX_PTX_BLOCK_DEPTH} levels."
+            )
+        identity = id(self)
+        if identity in ancestors:
+            raise ValueError("Cycle detected in PTBlock tree.")
+        ancestors.add(identity)
+        try:
+            return self._to_bytes_impl(is_bigendian, base_offset, ancestors)
+        finally:
+            ancestors.remove(identity)
+
+    def _to_bytes_impl(self, is_bigendian, base_offset, ancestors):
+        if isinstance(self.block_type, bool) or not isinstance(self.block_type, int):
+            raise TypeError("block_type must be an integer.")
+        if self.block_type < 0 or self.block_type > 0xFF:
+            raise ValueError("block_type must fit the supported 8-bit PTX range.")
+        if isinstance(self.content_type, bool) or not isinstance(self.content_type, int):
+            raise TypeError("content_type must be an integer.")
+        if self.content_type < 0 or self.content_type > 0xFFFF:
+            raise ValueError("content_type must fit an unsigned 16-bit value.")
+        if isinstance(self.original_size, bool) or not isinstance(self.original_size, int):
+            raise TypeError("original_size must be an integer.")
+        if self.original_size < 0 or self.original_size > 0xFFFFFFFF:
+            raise ValueError("original_size must fit an unsigned 32-bit value.")
+        if isinstance(self.original_offset, bool) or not isinstance(self.original_offset, int):
+            raise TypeError("original_offset must be an integer.")
+        if self.original_offset < -1 or self.original_offset > 0xFFFFFFFF:
+            raise ValueError("original_offset must be -1 or an unsigned 32-bit value.")
+        if base_offset < 0 or base_offset > 0xFFFFFFFF:
+            raise OverflowError("Serialized block offset exceeds UInt32.")
+
         payload = bytearray()
         mapping = {}
 
@@ -178,11 +354,15 @@ class PTBlock:
 
         for item in self.items:
             if isinstance(item, PTBlock):
-                child_bytes, child_mapping = item.to_bytes(is_bigendian, current_offset)
+                child_bytes, child_mapping = item._to_bytes(
+                    is_bigendian, current_offset, ancestors
+                )
                 payload.extend(child_bytes)
-                mapping.update(child_mapping)
+                _merge_unique_offset_mapping(mapping, child_mapping)
                 current_offset += len(child_bytes)
             else:
+                if not isinstance(item, (bytes, bytearray)):
+                    raise TypeError("PTBlock items must be bytes, bytearray, or PTBlock.")
                 payload.extend(item)
                 current_offset += len(item)
 
@@ -197,36 +377,64 @@ class PTBlock:
             header.extend(struct.pack(fmt_size, size))
         else:
             size = len(payload) + 2
+            if size > 0xFFFFFFFF:
+                raise OverflowError("PTBlock payload exceeds the UInt32 size field.")
             header = bytearray([0x5a])
             header.extend(struct.pack(fmt_type, self.block_type))
             header.extend(struct.pack(fmt_size, size))
             header.extend(struct.pack(fmt_ctype, self.content_type))
 
+        serialized_length = len(header) + len(payload)
+        if base_offset + serialized_length > 0x100000000:
+            raise OverflowError("Serialized PTBlock extends beyond the UInt32 file range.")
+
         if self.original_offset > 0:
+            if self.original_offset in mapping:
+                raise ValueError(
+                    f"Duplicate original block offset: 0x{self.original_offset:08x}."
+                )
             mapping[self.original_offset] = base_offset
 
         return header + payload, mapping
 
 
     def get_all_blocks(self, content_type=None):
+        return self._get_all_blocks(content_type, set())
+
+    def _get_all_blocks(self, content_type, ancestors):
+        if len(ancestors) > MAX_PTX_BLOCK_DEPTH:
+            raise ValueError(
+                f"PTBlock nesting exceeds {MAX_PTX_BLOCK_DEPTH} levels."
+            )
+        identity = id(self)
+        if identity in ancestors:
+            raise ValueError("Cycle detected in PTBlock tree.")
+        ancestors.add(identity)
         res = []
-        if content_type is None or self.content_type == content_type:
-            res.append(self)
-        for item in self.items:
-            if isinstance(item, PTBlock):
-                res.extend(item.get_all_blocks(content_type))
-        return res
+        try:
+            if content_type is None or self.content_type == content_type:
+                res.append(self)
+            for item in self.items:
+                if isinstance(item, PTBlock):
+                    res.extend(item._get_all_blocks(content_type, ancestors))
+            return res
+        finally:
+            ancestors.remove(identity)
 
 class ProToolsSession:
     def __init__(self, file_path):
+        file_path = os.path.abspath(
+            _coerce_string_path(file_path, "file_path")
+        )
         self.file_path = file_path
-        print(f"Loading {file_path}...")
+        logger.info("Loading %s...", file_path)
         self.data = unxor_session(file_path)
 
-        if len(self.data) < 0x14:
-            raise Exception("File too small")
-
-        self.is_bigendian = bool(self.data[0x11])
+        if self.data[0x11] == 0x01:
+            raise ValueError(
+                "Big-endian PTX sessions are not supported by the payload API."
+            )
+        self.is_bigendian = False
 
         # Parse root blocks
         self.root_items = []
@@ -250,6 +458,7 @@ class ProToolsSession:
         if current_bytes:
             self.root_items.append(current_bytes)
 
+        self._validate_session_envelope()
         self._parse_session_metadata()
 
         # Tracks original_offset values of blocks that were physically
@@ -257,6 +466,84 @@ class ProToolsSession:
         # longer appear in global_mapping at save() time, so their stale
         # 0x0002 records must be purged explicitly instead of left dangling.
         self._removed_offsets = []
+
+    @staticmethod
+    def _is_initial_pointer_block(item):
+        """Identify the special first 0x0001 block represented generically."""
+        return (
+            isinstance(item, PTBlock)
+            and item.block_type == 0x0001
+            and item.original_size == 4
+            and item.original_offset == 0x14
+        )
+
+    def _content_root_items(self):
+        """Return roots excluding the special 0x0001 pointer pseudo-content."""
+        if self.root_items and self._is_initial_pointer_block(self.root_items[0]):
+            return self.root_items[1:]
+        return self.root_items
+
+    def _root_blocks(self, content_type):
+        return [
+            root for root in self._content_root_items()
+            if isinstance(root, PTBlock) and root.content_type == content_type
+        ]
+
+    def _validate_session_envelope(self):
+        """Validate the PTX header and the two root pointer structures."""
+        _validate_ptx_header(self.data)
+
+        if not self.root_items or not isinstance(self.root_items[0], PTBlock):
+            raise ValueError("Missing initial 0x0001 pointer block.")
+        pointer_block = self.root_items[0]
+        if (
+            pointer_block.original_offset != 0x14
+            or pointer_block.block_type != 0x0001
+            or pointer_block.original_size != 4
+        ):
+            raise ValueError("Invalid initial 0x0001 pointer block.")
+
+        pointer_tables = self._root_blocks(0x0002)
+        if len(pointer_tables) != 1:
+            raise ValueError("A unique root 0x0002 pointer table is required.")
+        pointer_table = pointer_tables[0]
+        if self.root_items[-1] is not pointer_table:
+            raise ValueError("The 0x0002 pointer table must be the final root block.")
+        if pointer_table.original_offset + 7 + pointer_table.original_size != len(self.data):
+            raise ValueError("The 0x0002 pointer table does not end at end-of-file.")
+
+        pointer_format = ">I" if self.is_bigendian else "<I"
+        declared_pointer = struct.unpack_from(pointer_format, self.data, 0x1B)[0]
+        if declared_pointer != pointer_table.original_offset:
+            raise ValueError(
+                "The 0x0001 block does not point to the root 0x0002 table."
+            )
+
+        parsed_offsets = set()
+
+        def collect_offsets(node):
+            if not isinstance(node, PTBlock):
+                return
+            parsed_offsets.add(node.original_offset)
+            for child in node.items:
+                collect_offsets(child)
+
+        for root in self.root_items:
+            collect_offsets(root)
+
+        pointer_payload = bytearray()
+        for item in pointer_table.items:
+            if not isinstance(item, (bytes, bytearray)):
+                raise ValueError("Invalid nested block inside root 0x0002 table.")
+            pointer_payload.extend(item)
+        for _, pointer_position in self._validate_0002_record_layout(pointer_payload):
+            target = struct.unpack_from(
+                pointer_format, pointer_payload, pointer_position
+            )[0]
+            if target not in parsed_offsets:
+                raise ValueError(
+                    f"0x0002 record references unknown block offset {target}."
+                )
 
     def _collect_offsets_recursive(self, node, out):
         """Recursively collect original_offset (>0) of node and all its
@@ -270,17 +557,67 @@ class ProToolsSession:
 
     def get_tracks(self):
         """Returns a list of all track names in the session."""
-        tracks = []
-        b1054 = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x1054), None)
-        if b1054:
-            for track in [b for b in b1054.items if isinstance(b, PTBlock) and b.content_type == 0x1052]:
-                if len(track.items) > 0 and isinstance(track.items[0], (bytes, bytearray)):
-                    hdr = track.items[0]
-                    nlen = struct.unpack_from("<I", hdr, 0)[0]
-                    if 4 + nlen <= len(hdr):
-                        tname = hdr[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
-                        tracks.append(tname)
-        return tracks
+        return [name for _, name, _ in self._validated_main_playlists()]
+
+    def _validated_main_playlists(self):
+        """Return direct main playlists as (block, name, events) tuples."""
+        track_maps = self._root_blocks(0x1054)
+        if not track_maps:
+            return []
+        if len(track_maps) != 1:
+            raise ValueError("Ambiguous session: multiple root 0x1054 track maps.")
+        track_map = track_maps[0]
+        if (
+            not track_map.items
+            or not isinstance(track_map.items[0], (bytes, bytearray))
+            or len(track_map.items[0]) < 4
+        ):
+            raise ValueError("Invalid 0x1054 track counter payload.")
+
+        playlists = [
+            child for child in track_map.items
+            if isinstance(child, PTBlock) and child.content_type == 0x1052
+        ]
+        declared_tracks = struct.unpack_from("<I", track_map.items[0], 0)[0]
+        if declared_tracks != len(playlists):
+            raise ValueError(
+                f"Inconsistent 0x1054 track count: declared={declared_tracks}, "
+                f"actual={len(playlists)}."
+            )
+
+        result = []
+        for playlist in playlists:
+            if (
+                not playlist.items
+                or not isinstance(playlist.items[0], (bytes, bytearray))
+                or len(playlist.items[0]) < 8
+            ):
+                raise ValueError("Invalid 0x1052 playlist header.")
+            header = playlist.items[0]
+            name_length = struct.unpack_from("<I", header, 0)[0]
+            count_offset = 4 + name_length
+            if count_offset + 4 > len(header):
+                raise ValueError("Invalid 0x1052 event counter offset.")
+            try:
+                name = header[4:count_offset].decode("utf-8").strip("\x00")
+            except UnicodeDecodeError as exc:
+                raise ValueError("Invalid UTF-8 track name.") from exc
+            if not name:
+                raise ValueError("Track name cannot be empty.")
+
+            events = [
+                child for child in playlist.items
+                if isinstance(child, PTBlock) and child.content_type == 0x1050
+            ]
+            declared_events = struct.unpack_from("<I", header, count_offset)[0]
+            if declared_events != len(events):
+                raise ValueError(
+                    f"Inconsistent 0x1052 event count for track '{name}': "
+                    f"declared={declared_events}, actual={len(events)}."
+                )
+            result.append((playlist, name, events))
+
+        return result
 
     def get_markers(self):
         """Returns a list of dictionaries describing session markers.
@@ -288,18 +625,240 @@ class ProToolsSession:
         """
         engine = TimecodeEngine(self.sample_rate, self.frame_rate_enum)
         markers = []
-        marker_indices = [i for i, x in enumerate(self.root_items) if isinstance(x, PTBlock) and x.content_type == 0x2030]
-        for idx in marker_indices:
-            container = self.root_items[idx]
-            for child in container.items:
-                if isinstance(child, PTBlock) and child.content_type == 0x2077:
-                    payload = child.items[0]
-                    m_idx = struct.unpack_from("<H", payload, 0)[0]
-                    nlen = struct.unpack_from("<I", payload, 6)[0]
-                    name = payload[10:10+nlen].decode('utf-8', 'ignore').strip('\x00')
-                    tc_samples = struct.unpack_from("<q", payload, 10+nlen)[0]
-                    markers.append({'index': m_idx, 'name': name, 'timecode': engine.samples_to_timecode(tc_samples)})
+        seen_indices = set()
+
+        for container in self._root_blocks(0x2030):
+            layout = self._marker_container_layout(container)
+            if layout is None:
+                continue
+
+            _, marker_blocks = layout
+            for child in marker_blocks:
+                if (
+                    not child.items
+                    or not isinstance(child.items[0], (bytes, bytearray))
+                    or len(child.items[0]) < 26
+                ):
+                    raise ValueError("Invalid 0x2077 marker payload.")
+
+                payload = child.items[0]
+                m_idx = struct.unpack_from("<H", payload, 0)[0]
+                nlen = struct.unpack_from("<I", payload, 6)[0]
+                timestamp_offset = 10 + nlen
+                if timestamp_offset + 16 > len(payload):
+                    raise ValueError("Invalid 0x2077 marker name length.")
+                try:
+                    name = payload[10:timestamp_offset].decode('utf-8').strip('\x00')
+                except UnicodeDecodeError as exc:
+                    raise ValueError("Invalid UTF-8 marker name.") from exc
+                tc_samples = struct.unpack_from("<q", payload, timestamp_offset)[0]
+
+                if m_idx in seen_indices:
+                    raise ValueError(f"Duplicate marker index: {m_idx}.")
+                seen_indices.add(m_idx)
+                markers.append({
+                    'index': m_idx,
+                    'name': name,
+                    'timecode': engine.samples_to_timecode(tc_samples),
+                })
         return markers
+
+    def _marker_container_layout(self, container):
+        """Validate a root 0x2030 marker ruler and return its direct markers.
+
+        Root 0x2030 blocks are generic containers, so a non-marker-shaped block
+        returns None. A marker-shaped block with an inconsistent count or layout
+        is rejected instead of being mutated into a still-invalid session.
+        """
+        if not isinstance(container, PTBlock) or container.content_type != 0x2030:
+            return None
+
+        items = container.items
+        if (
+            len(items) == 1
+            and isinstance(items[0], (bytes, bytearray))
+            and len(items[0]) == 12
+        ):
+            count = struct.unpack_from("<I", items[0], 0)[0]
+            if count != 0:
+                raise ValueError("Invalid empty 0x2030 marker counter.")
+            return 0, []
+
+        has_marker = any(
+            isinstance(item, PTBlock) and item.content_type == 0x2077
+            for item in items
+        )
+        if not has_marker:
+            return None
+
+        if (
+            len(items) < 3
+            or not isinstance(items[0], (bytes, bytearray))
+            or len(items[0]) != 4
+            or not isinstance(items[-1], (bytes, bytearray))
+            or len(items[-1]) != 8
+            or any(
+                not isinstance(item, PTBlock) or item.content_type != 0x2077
+                for item in items[1:-1]
+            )
+        ):
+            raise ValueError("Invalid 0x2030 marker container layout.")
+
+        marker_blocks = items[1:-1]
+        count = struct.unpack_from("<I", items[0], 0)[0]
+        if count != len(marker_blocks):
+            raise ValueError(
+                f"Invalid 0x2030 marker count: declared {count}, "
+                f"found {len(marker_blocks)}."
+            )
+        return count, marker_blocks
+
+    def _decode_audio_clip_payload(self, payload):
+        """Decode the name, length and source offset of one 0x2628 payload."""
+        if not isinstance(payload, (bytes, bytearray)) or len(payload) < 6:
+            raise ValueError("Invalid 0x2628 clip payload.")
+        name_length = struct.unpack_from("<I", payload, 0)[0]
+        attribute_offset = 4 + name_length
+        if attribute_offset + 2 > len(payload):
+            raise ValueError("Invalid 0x2628 clip name length.")
+        try:
+            name = payload[4:attribute_offset].decode("utf-8").strip("\x00")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Invalid UTF-8 clip name.") from exc
+
+        flags = struct.unpack_from("<H", payload, attribute_offset)[0]
+        if flags == 0x0000:
+            if attribute_offset + 9 > len(payload):
+                raise ValueError("Truncated 32-bit parent clip length.")
+            source_offset = 0
+            # The following timestamp begins immediately after the 24-bit
+            # length, so the fourth byte read by UInt32 belongs to that field.
+            length = struct.unpack_from("<I", payload, attribute_offset + 5)[0] & 0x00FFFFFF
+        elif flags == 0x0001:
+            if attribute_offset + 9 > len(payload):
+                raise ValueError("Truncated 32-bit virtual clip length.")
+            source_offset = 0
+            length = struct.unpack_from("<I", payload, attribute_offset + 5)[0] & 0x00FFFFFF
+        elif flags == 0x4001:
+            if attribute_offset + 13 > len(payload):
+                raise ValueError("Truncated 32-bit source-offset clip payload.")
+            source_offset = struct.unpack_from("<I", payload, attribute_offset + 5)[0]
+            length = struct.unpack_from("<I", payload, attribute_offset + 9)[0]
+        elif flags in (0x2001, 0x3001):
+            if attribute_offset + 11 > len(payload):
+                raise ValueError("Truncated 24-bit source-offset clip payload.")
+            source_offset = int.from_bytes(
+                payload[attribute_offset + 5:attribute_offset + 8], "little"
+            )
+            length = int.from_bytes(
+                payload[attribute_offset + 8:attribute_offset + 11], "little"
+            )
+        else:
+            raise ValueError(f"Unsupported 0x2628 clip flags: 0x{flags:04x}.")
+
+        return {
+            "name": name,
+            "flags": flags,
+            "length": length,
+            "src_offset": source_offset,
+        }
+
+    def _decode_clip_group_payload(self, payload):
+        """Decode the verified 0x5000 Clip Group 0x2628 layout."""
+        if not isinstance(payload, (bytes, bytearray)) or len(payload) < 6:
+            raise ValueError("Invalid Clip Group 0x2628 payload.")
+        name_length = struct.unpack_from("<I", payload, 0)[0]
+        attribute_offset = 4 + name_length
+        if attribute_offset + 13 > len(payload):
+            raise ValueError("Truncated Clip Group 0x2628 payload.")
+        try:
+            name = payload[4:attribute_offset].decode("utf-8").strip("\x00")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Invalid UTF-8 Clip Group name.") from exc
+
+        flags = struct.unpack_from("<H", payload, attribute_offset)[0]
+        if flags != 0x5000:
+            raise ValueError(f"Unsupported Clip Group flags: 0x{flags:04x}.")
+
+        # The verified simple-group layout stores its complete span as a
+        # 24-bit value at +10. Bytes +13 and +17 are absolute timestamps.
+        length = int.from_bytes(
+            payload[attribute_offset + 10:attribute_offset + 13], "little"
+        )
+        return {"name": name, "flags": flags, "length": length, "src_offset": 0}
+
+    def _physical_audio_filenames(self):
+        """Return deterministic disk and 0x1004 filename candidates."""
+        import os
+        import re
+
+        disk_files = []
+        file_path = getattr(self, "file_path", "")
+        if file_path:
+            audio_dir = os.path.join(os.path.dirname(file_path), "Audio Files")
+            try:
+                disk_files = sorted(
+                    (
+                        name for name in os.listdir(audio_dir)
+                        if name.lower().endswith((".wav", ".aif", ".aiff"))
+                    ),
+                    key=str.casefold,
+                )
+            except OSError:
+                disk_files = []
+
+        metadata_files = []
+        metadata_keys = set()
+        for root in self._root_blocks(0x1004):
+            for entry in root.items:
+                if (
+                    not isinstance(entry, PTBlock)
+                    or entry.content_type != 0x103a
+                    or not entry.items
+                    or not isinstance(entry.items[0], (bytes, bytearray))
+                ):
+                    continue
+                decoded = entry.items[0].decode("mac_roman")
+                for match in re.finditer(
+                    r"([^\x00\\/:]*?\.(?:wav|aif|aiff))", decoded, re.IGNORECASE
+                ):
+                    filename = "".join(
+                        character for character in match.group(1) if ord(character) >= 32
+                    ).strip()
+                    key = filename.casefold()
+                    if filename and key not in metadata_keys:
+                        metadata_keys.add(key)
+                        metadata_files.append(filename)
+
+        return disk_files, metadata_files
+
+    @staticmethod
+    def _match_physical_filename(clip_name, disk_files, metadata_files):
+        """Resolve a virtual clip name without inventing a filename."""
+        import os
+        import re
+
+        base_name = re.sub(r"-\d+(?:\.[A-Za-z0-9]+)?$", "", clip_name)
+        base_name = re.sub(r"\.A[1-9]$", "", base_name, flags=re.IGNORECASE)
+        base_key = base_name.casefold()
+
+        for candidates in (disk_files, metadata_files):
+            exact = [
+                filename for filename in candidates
+                if os.path.splitext(filename)[0].casefold() == base_key
+            ]
+            if len(exact) == 1:
+                return exact[0]
+
+            compatible = [
+                filename for filename in candidates
+                if os.path.splitext(filename)[0].casefold().startswith(base_key)
+                or base_key.startswith(os.path.splitext(filename)[0].casefold())
+            ]
+            if len(compatible) == 1:
+                return compatible[0]
+
+        return None
 
     def get_clips(self):
         """Returns a list of dictionaries describing available clips and clip groups.
@@ -307,233 +866,578 @@ class ProToolsSession:
         """
         engine = TimecodeEngine(self.sample_rate, self.frame_rate_enum)
         clips = []
-        b262a = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x262a), None)
-        b262c = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x262c), None)
-        
-        # 1. Parse normal clips
-        if b262a:
-            for child in getattr(b262a, 'items', []):
-                if isinstance(child, PTBlock) and child.content_type == 0x2629:
-                    b2628 = next((c for c in child.items if isinstance(c, PTBlock) and c.content_type == 0x2628), None)
-                    if b2628:
-                        payload = getattr(b2628, 'items', [b""])[0]
-                        if not isinstance(payload, (bytes, bytearray)) or len(payload) < 4:
-                            continue
-                        nlen = struct.unpack_from("<I", payload, 0)[0]
-                        if 4 + nlen > len(payload):
-                            continue
-                        name = payload[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
-                        flags = struct.unpack_from("<H", payload, 4+nlen)[0]
-                        ctype = "parent" if flags == 0x0000 else "virtual"
-                        if flags == 0x0000:
-                            length = struct.unpack_from("<I", payload, 4+nlen+5)[0]
-                            src_offset = 0
-                        elif flags == 0x0001:
-                            length = struct.unpack_from("<I", payload, 4+nlen+5)[0] & 0x00FFFFFF
-                            src_offset = 0
-                        elif flags > 0x0001:
-                            offset_bytes = payload[4+nlen+5 : 4+nlen+8]
-                            len_bytes = payload[4+nlen+8 : 4+nlen+11]
-                            src_offset = offset_bytes[0] | (offset_bytes[1]<<8) | (offset_bytes[2]<<16)
-                            length = len_bytes[0] | (len_bytes[1]<<8) | (len_bytes[2]<<16)
-                        else:
-                            length = 0
-                            src_offset = 0
-                        clips.append({
-                            'name': name,
-                            'type': ctype,
-                            'length': engine.samples_to_timecode(length),
-                            'src_offset': engine.samples_to_timecode(src_offset)
-                        })
-                        
-        # 2. Parse clip groups
-        if b262c:
-            for child in getattr(b262c, 'items', []):
-                if isinstance(child, PTBlock) and child.content_type == 0x262b:
-                    b2628 = next((c for c in child.items if isinstance(c, PTBlock) and c.content_type == 0x2628), None)
-                    if b2628:
-                        payload = getattr(b2628, 'items', [b""])[0]
-                        if not isinstance(payload, (bytes, bytearray)) or len(payload) < 4:
-                            continue
-                        nlen = struct.unpack_from("<I", payload, 0)[0]
-                        if 4 + nlen > len(payload):
-                            continue
-                        name = payload[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
-                        ctype = "group"
-                        length = 0
-                        if 4+nlen+9 <= len(payload):
-                            length = struct.unpack_from("<I", payload, 4+nlen+5)[0]
-                        clips.append({
-                            'name': name,
-                            'type': ctype,
-                            'length': engine.samples_to_timecode(length),
-                            'src_offset': engine.samples_to_timecode(0)
-                        })
+
+        clip_roots = self._root_blocks(0x262a)
+        if len(clip_roots) > 1:
+            raise ValueError("Ambiguous session: multiple root 0x262a clip lists.")
+        if clip_roots:
+            clip_root = clip_roots[0]
+            if (
+                not clip_root.items
+                or not isinstance(clip_root.items[0], (bytes, bytearray))
+                or len(clip_root.items[0]) < 4
+            ):
+                raise ValueError("Invalid 0x262a clip counter payload.")
+            definitions = [
+                item for item in clip_root.items
+                if isinstance(item, PTBlock) and item.content_type == 0x2629
+            ]
+            declared = struct.unpack_from("<I", clip_root.items[0], 0)[0]
+            if declared != len(definitions):
+                raise ValueError(
+                    f"Inconsistent 0x262a clip count: declared={declared}, "
+                    f"actual={len(definitions)}."
+                )
+            for definition in definitions:
+                payload_blocks = [
+                    item for item in definition.items
+                    if isinstance(item, PTBlock) and item.content_type == 0x2628
+                ]
+                if (
+                    len(payload_blocks) != 1
+                    or not payload_blocks[0].items
+                    or not isinstance(payload_blocks[0].items[0], (bytes, bytearray))
+                ):
+                    raise ValueError("Invalid 0x2629 clip definition.")
+                info = self._decode_audio_clip_payload(payload_blocks[0].items[0])
+                clips.append({
+                    "name": info["name"],
+                    "type": "parent" if info["flags"] == 0x0000 else "virtual",
+                    "length": engine.samples_to_timecode(info["length"]),
+                    "src_offset": engine.samples_to_timecode(info["src_offset"]),
+                })
+
+        group_roots = self._root_blocks(0x262c)
+        if len(group_roots) > 1:
+            raise ValueError("Ambiguous session: multiple root 0x262c group lists.")
+        if group_roots:
+            group_root = group_roots[0]
+            if (
+                not group_root.items
+                or not isinstance(group_root.items[0], (bytes, bytearray))
+                or len(group_root.items[0]) < 4
+            ):
+                raise ValueError("Invalid 0x262c group counter payload.")
+            definitions = [
+                item for item in group_root.items
+                if isinstance(item, PTBlock) and item.content_type == 0x262b
+            ]
+            declared = struct.unpack_from("<I", group_root.items[0], 0)[0]
+            if declared != len(definitions):
+                raise ValueError(
+                    f"Inconsistent 0x262c group count: declared={declared}, "
+                    f"actual={len(definitions)}."
+                )
+            for definition in definitions:
+                payload_blocks = [
+                    item for item in definition.items
+                    if isinstance(item, PTBlock) and item.content_type == 0x2628
+                ]
+                if (
+                    len(payload_blocks) != 1
+                    or not payload_blocks[0].items
+                    or not isinstance(payload_blocks[0].items[0], (bytes, bytearray))
+                ):
+                    raise ValueError("Invalid 0x262b Clip Group definition.")
+                info = self._decode_clip_group_payload(payload_blocks[0].items[0])
+                clips.append({
+                    "name": info["name"],
+                    "type": "group",
+                    "length": engine.samples_to_timecode(info["length"]),
+                    "src_offset": engine.samples_to_timecode(0),
+                })
         return clips
 
     def get_timeline_clips(self):
-        """
-        Returns a flat list of all events placed on the timeline across all tracks.
-        Returns: [{'track', 'clip_name', 'start_samples', 'length_samples', 'end_samples', 'muted', 'is_fade'}]
-        """
-        timeline = []
-        
-        # 1. Build a dictionary mapping clip_id (index in 0x262a) to its properties
-        clip_dict = {}
-        b262a = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x262a), None)
-        
-        if b262a:
-            for i, child in enumerate(b262a.items):
-                if isinstance(child, PTBlock) and child.content_type == 0x2629:
-                    b2628 = next((c for c in child.items if isinstance(c, PTBlock) and c.content_type == 0x2628), None)
-                    if b2628:
-                        payload = b2628.items[0]
-                        if len(payload) >= 4:
-                            nlen = struct.unpack_from("<I", payload, 0)[0]
-                            if 4 + nlen <= len(payload):
-                                name = payload[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
-                                offset = 4 + nlen
-                                
-                                # Extract length using robust UInt16 flag checking
-                                length = 0
-                                src_offset = 0
-                                if offset + 2 <= len(payload):
-                                    flags = struct.unpack_from("<H", payload, offset)[0]
-                                    if flags == 0x0000:
-                                        if offset + 9 <= len(payload):
-                                            length = struct.unpack_from("<I", payload, offset+5)[0]
-                                    elif flags == 0x0001:
-                                        if offset + 9 <= len(payload):
-                                            length = struct.unpack_from("<I", payload, offset+5)[0] & 0x00FFFFFF
-                                    elif flags > 0x0001:
-                                        if offset + 11 <= len(payload):
-                                            offset_bytes = payload[offset+5 : offset+8]
-                                            len_bytes = payload[offset+8 : offset+11]
-                                            src_offset = offset_bytes[0] | (offset_bytes[1]<<8) | (offset_bytes[2]<<16)
-                                            length = len_bytes[0] | (len_bytes[1]<<8) | (len_bytes[2]<<16)
-                                            
-                                clip_id_in_dict = i - 1
-                                clip_dict[clip_id_in_dict] = {'name': name, 'length': length, 'src_offset': src_offset}
+        """Return validated audio and fade events in global timeline order."""
+        clip_lists = self._root_blocks(0x262a)
+        if not clip_lists:
+            return []
+        if len(clip_lists) != 1:
+            raise ValueError("Ambiguous session: multiple root 0x262a clip lists.")
+        clip_list = clip_lists[0]
+        if (
+            not clip_list.items
+            or not isinstance(clip_list.items[0], (bytes, bytearray))
+            or len(clip_list.items[0]) < 4
+        ):
+            raise ValueError("Invalid 0x262a clip counter payload.")
 
-        # 2. Iterate over tracks and their events
-        b1054 = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x1054), None)
-        if not b1054:
-            return timeline
-            
-        for track in b1054.items:
-            if isinstance(track, PTBlock) and track.content_type == 0x1052:
-                if len(track.items) > 0 and isinstance(track.items[0], (bytes, bytearray)):
-                    hdr = track.items[0]
-                    nlen = struct.unpack_from("<I", hdr, 0)[0]
-                    if 4 + nlen <= len(hdr):
-                        track_name = hdr[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
-                        
-                        for ev in track.items[1:]:
-                            if isinstance(ev, PTBlock) and ev.content_type == 0x1050:
-                                b104f = next((c for c in ev.items if isinstance(c, PTBlock) and c.content_type == 0x104f), None)
-                                if b104f:
-                                    payload = b104f.items[0]
-                                    if len(payload) >= 16:
-                                        is_muted = (payload[0] == 0x01)
-                                        clip_id = struct.unpack_from("<I", payload, 2)[0]
-                                        start_ts = struct.unpack_from("<Q", payload, 7)[0]
-                                        ev_type = payload[15] # 0x01 = Fade, 0x03 = Audio
-                                        
-                                        clip_info = clip_dict.get(clip_id, {'name': 'UNKNOWN', 'length': 0, 'src_offset': 0})
-                                        
-                                        timeline.append({
-                                            'track': track_name,
-                                            'clip_name': clip_info['name'],
-                                            'start_samples': start_ts,
-                                            'length_samples': clip_info['length'],
-                                            'end_samples': start_ts + clip_info['length'],
-                                            'src_offset_samples': clip_info['src_offset'],
-                                            'muted': is_muted,
-                                            'is_fade': (ev_type == 0x01)
-                                        })
-                                        
-        # 3. Sort by track, then chronological order
-        timeline.sort(key=lambda x: (x['track'], x['start_samples']))
+        definitions = [
+            item for item in clip_list.items
+            if isinstance(item, PTBlock) and item.content_type == 0x2629
+        ]
+        declared_clips = struct.unpack_from("<I", clip_list.items[0], 0)[0]
+        if declared_clips != len(definitions):
+            raise ValueError(
+                f"Inconsistent 0x262a clip count: declared={declared_clips}, "
+                f"actual={len(definitions)}."
+            )
+
+        clip_dict = {}
+        for clip_id, definition in enumerate(definitions):
+            payload_blocks = [
+                item for item in definition.items
+                if isinstance(item, PTBlock) and item.content_type == 0x2628
+            ]
+            if (
+                len(payload_blocks) != 1
+                or not payload_blocks[0].items
+                or not isinstance(payload_blocks[0].items[0], (bytes, bytearray))
+            ):
+                raise ValueError("Invalid 0x2629 clip definition.")
+            clip_dict[clip_id] = self._decode_audio_clip_payload(
+                payload_blocks[0].items[0]
+            )
+
+        events = self._validated_main_timeline_events()
+        _, _, fade_bindings = self._validated_fade_geometry_bindings(events)
+        geometry_by_event = {
+            id(entry[1]): geometry
+            for entry, _, geometry in fade_bindings
+        }
+        disk_files, metadata_files = self._physical_audio_filenames()
+        physical_by_clip = {
+            clip_id: self._match_physical_filename(
+                info["name"], disk_files, metadata_files
+            )
+            for clip_id, info in clip_dict.items()
+        }
+
+        track_names = {
+            id(playlist): name
+            for playlist, name, _ in self._validated_main_playlists()
+        }
+        audio_placements = []
+        for playlist, event, _, payload in events:
+            if self._audio_timeline_event_kind(event, payload) != "audio":
+                continue
+            clip_id = struct.unpack_from("<I", payload, 2)[0]
+            if clip_id not in clip_dict:
+                raise ValueError(f"Timeline event references unknown clip ID {clip_id}.")
+            start = struct.unpack_from("<Q", payload, 7)[0]
+            audio_placements.append({
+                "playlist": playlist,
+                "event": event,
+                "clip_id": clip_id,
+                "clip_info": clip_dict[clip_id],
+                "start": start,
+                "end": start + clip_dict[clip_id]["length"],
+            })
+
+        audio_by_event = {
+            id(placement["event"]): placement for placement in audio_placements
+        }
+        timeline = []
+        for playlist, event, _, payload in events:
+            event_type = payload[15]
+            if event_type not in (0x01, 0x03):
+                continue
+            # Clip Group macro IDs occupy an independent namespace and can
+            # numerically collide with ordinary 0x262a IDs. They are not audio
+            # clip events and must not be mislabeled as the colliding clip.
+            if (
+                event_type == 0x03
+                and self._audio_timeline_event_kind(event, payload) == "clip_group"
+            ):
+                continue
+            anchor_timestamp = struct.unpack_from("<Q", payload, 7)[0]
+
+            if event_type == 0x03:
+                placement = audio_by_event[id(event)]
+                clip_id = placement["clip_id"]
+                clip_info = placement["clip_info"]
+                start_samples = placement["start"]
+                length_samples = clip_info["length"]
+                muted = payload[0] == 0x01
+            else:
+                geometry = geometry_by_event[id(event)]
+                if (
+                    not geometry.items
+                    or not isinstance(geometry.items[0], (bytes, bytearray))
+                ):
+                    raise ValueError("Invalid 0x262f fade geometry payload.")
+                geometry_payload = geometry.items[0]
+                geometry_length = len(geometry_payload)
+                if geometry_length == 22:
+                    length_samples = struct.unpack_from("<H", geometry_payload, 8)[0]
+                    start_samples = anchor_timestamp
+                    candidates = [
+                        placement for placement in audio_placements
+                        if placement["playlist"] is playlist
+                        and placement["start"] == anchor_timestamp
+                    ]
+                elif geometry_length in (26, 27):
+                    length_samples = struct.unpack_from("<H", geometry_payload, 8)[0]
+                    if length_samples > anchor_timestamp:
+                        raise ValueError("Fade Out starts before sample zero.")
+                    start_samples = anchor_timestamp - length_samples
+                    candidates = [
+                        placement for placement in audio_placements
+                        if placement["playlist"] is playlist
+                        and placement["end"] == anchor_timestamp
+                    ]
+                elif geometry_length == 34:
+                    pre_roll = struct.unpack_from("<H", geometry_payload, 8)[0]
+                    length_samples = struct.unpack_from("<H", geometry_payload, 10)[0]
+                    if pre_roll > anchor_timestamp:
+                        raise ValueError("Crossfade starts before sample zero.")
+                    start_samples = anchor_timestamp - pre_roll
+                    # A native crossfade precedes the right-hand audio event at
+                    # the same anchor. Fall back to the left-hand event only
+                    # for sessions whose right side is unavailable.
+                    candidates = [
+                        placement for placement in audio_placements
+                        if placement["playlist"] is playlist
+                        and placement["start"] == anchor_timestamp
+                    ]
+                    if not candidates:
+                        candidates = [
+                            placement for placement in audio_placements
+                            if placement["playlist"] is playlist
+                            and placement["end"] == anchor_timestamp
+                        ]
+                else:
+                    raise ValueError(
+                        f"Unsupported 0x262f fade geometry length: "
+                        f"{geometry_length}."
+                    )
+                if len(candidates) != 1:
+                    raise ValueError(
+                        "Fade event cannot be associated with one audio placement."
+                    )
+                clip_id = candidates[0]["clip_id"]
+                clip_info = candidates[0]["clip_info"]
+                muted = False
+
+            timeline.append({
+                "track": track_names[id(playlist)],
+                "clip_name": clip_info["name"],
+                "start_samples": start_samples,
+                "length_samples": length_samples,
+                "end_samples": start_samples + length_samples,
+                "src_offset_samples": clip_info["src_offset"],
+                "physical_filename": physical_by_clip[clip_id],
+                "muted": muted,
+                "is_fade": event_type == 0x01,
+            })
+
+        timeline.sort(key=lambda item: (item["start_samples"], item["track"]))
         return timeline
 
     def delete_clip_group(self, group_name):
-        """Removes a clip group from the session (both from the clip list and the timeline)."""
-        
-        # 1. Find the 0x262b block in the clip group list (0x262c)
-        b262c = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x262c), None)
-        if not b262c:
+        """Atomically dissolve one supported simple clip group."""
+        original_root_items = copy.deepcopy(self.root_items)
+        original_removed_offsets = list(getattr(self, "_removed_offsets", []))
+        try:
+            return self._delete_clip_group_impl(group_name)
+        except Exception:
+            self.root_items = original_root_items
+            self._removed_offsets = original_removed_offsets
+            raise
+
+    def _delete_clip_group_impl(self, group_name):
+        """Dissolve a simple clip group and restore its audio events.
+
+        The main playlist contains a macro event while the component events
+        live in a hidden 0x2428 playlist. Dissolving the group moves those
+        events back to the macro's track, rebases their timestamps, and removes
+        the now-unused group metadata.
+
+        The verified layout is deliberately narrow: one simple group containing
+        audio events on one track. More complex layouts are rejected before
+        mutation instead of being guessed at.
+        """
+
+        if not isinstance(group_name, str) or not group_name:
+            raise ValueError("group_name must be a non-empty string.")
+
+        def root_blocks(content_type):
+            return self._root_blocks(content_type)
+
+        def child_blocks(container, content_type):
+            return [
+                item for item in container.items
+                if isinstance(item, PTBlock) and item.content_type == content_type
+            ]
+
+        def raw_count(container, label):
+            if not container.items or not isinstance(container.items[0], (bytes, bytearray)):
+                raise ValueError(f"Invalid {label} counter payload.")
+            payload = container.items[0]
+            if len(payload) < 4:
+                raise ValueError(f"Invalid {label} counter payload.")
+            return struct.unpack_from("<I", payload, 0)[0]
+
+        def validate_count(container, child_type, label):
+            declared = raw_count(container, label)
+            children = child_blocks(container, child_type)
+            if declared != len(children):
+                raise ValueError(
+                    f"Inconsistent {label} count: declared={declared}, actual={len(children)}."
+                )
+            return declared, children
+
+        def event_info(event, label):
+            b104f = next(
+                (item for item in event.items
+                 if isinstance(item, PTBlock) and item.content_type == 0x104f),
+                None
+            )
+            if (
+                b104f is None or not b104f.items
+                or not isinstance(b104f.items[0], (bytes, bytearray))
+                or len(b104f.items[0]) < 16
+            ):
+                raise ValueError(f"Invalid {label} 0x104f payload.")
+            payload = b104f.items[0]
+            raw_tail = b"".join(
+                bytes(item) for item in event.items
+                if isinstance(item, (bytes, bytearray))
+            )
+            return {
+                'block': b104f,
+                'payload': payload,
+                'clip_id': struct.unpack_from("<I", payload, 2)[0],
+                'timestamp': struct.unpack_from("<Q", payload, 7)[0],
+                'event_type': payload[15],
+                'tail': raw_tail,
+            }
+
+        # Resolve and validate every part of the group before modifying it.
+        roots_262c = root_blocks(0x262c)
+        if not roots_262c:
             return 0
-            
-        group_id = None
+        if len(roots_262c) != 1:
+            raise ValueError("Ambiguous session: multiple root 0x262c blocks.")
+        b262c = roots_262c[0]
+        group_count, group_blocks = validate_count(b262c, 0x262b, "0x262c group")
+        if group_count == 0:
+            raise ValueError(f"Clip group '{group_name}' not found.")
+        if group_count > 1:
+            raise NotImplementedError(
+                "delete_clip_group currently supports sessions containing exactly one clip group."
+            )
+
         group_block = None
-        
-        # The first item in b262c is the count payload.
-        clip_index = 0
-        for i, child in enumerate(b262c.items[1:], start=1):
-            if isinstance(child, PTBlock) and child.content_type == 0x262b:
-                b2628 = next((x for x in child.items if isinstance(x, PTBlock) and x.content_type == 0x2628), None)
-                if b2628:
-                    payload = getattr(b2628, 'items', [b""])[0]
-                    if isinstance(payload, (bytes, bytearray)) and len(payload) >= 4:
-                        nlen = struct.unpack_from("<I", payload, 0)[0]
-                        name = payload[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
-                        if name == group_name:
-                            group_id = clip_index
-                            group_block = child
-                            break
-                clip_index += 1
-                
+        group_id = None
+        for index, candidate in enumerate(group_blocks):
+            b2628 = next(
+                (item for item in candidate.items
+                 if isinstance(item, PTBlock) and item.content_type == 0x2628),
+                None
+            )
+            if (
+                b2628 is None or not b2628.items
+                or not isinstance(b2628.items[0], (bytes, bytearray))
+                or len(b2628.items[0]) < 4
+            ):
+                raise ValueError("Invalid 0x262b group name payload.")
+            payload = b2628.items[0]
+            name_length = struct.unpack_from("<I", payload, 0)[0]
+            if 4 + name_length > len(payload):
+                raise ValueError("Invalid 0x262b group name length.")
+            name = payload[4:4 + name_length].decode('utf-8', 'strict').rstrip('\x00')
+            if name == group_name:
+                group_block = candidate
+                group_id = index
+                break
+
         if group_block is None:
             raise ValueError(f"Clip group '{group_name}' not found.")
 
-        # CRITICAL: per architecture.md, we must NEVER pop() a block that
-        # has a live pointer in the 0x0002 table without also purging that
-        # pointer's record — otherwise save() leaves a dangling pointer and
-        # Pro Tools throws "Magic ID does not match". Since a deletion has
-        # no natural replacement to mutate-in-place (unlike split_clip),
-        # we instead track every original_offset being removed here, and
-        # save() strips the matching 0x0002 records for them (see
-        # _purge_0002_records()).
-        self._collect_offsets_recursive(group_block, self._removed_offsets)
+        roots_2428 = root_blocks(0x2428)
+        if len(roots_2428) != 1:
+            raise ValueError("Unsupported clip-group layout: expected one hidden 0x2428 timeline.")
+        b2428 = roots_2428[0]
+        hidden_roots = child_blocks(b2428, 0x1054)
+        if len(hidden_roots) != 1:
+            raise ValueError("Unsupported clip-group layout: expected one hidden 0x1054 block.")
+        hidden_1054 = hidden_roots[0]
+        hidden_track_count, hidden_tracks = validate_count(
+            hidden_1054, 0x1052, "hidden 0x1054 track"
+        )
+        if hidden_track_count != 1:
+            raise NotImplementedError(
+                "delete_clip_group currently supports a group containing exactly one track."
+            )
+        hidden_track = hidden_tracks[0]
+        hidden_events = child_blocks(hidden_track, 0x1050)
+        if not hidden_events:
+            raise ValueError("The hidden clip-group playlist contains no events.")
+        if not hidden_track.items or not isinstance(hidden_track.items[0], (bytes, bytearray)):
+            raise ValueError("Invalid hidden 0x1052 track header.")
+        hidden_header = hidden_track.items[0]
+        if len(hidden_header) < 4:
+            raise ValueError("Invalid hidden 0x1052 track header.")
+        hidden_name_length = struct.unpack_from("<I", hidden_header, 0)[0]
+        hidden_count_offset = 4 + hidden_name_length
+        if hidden_count_offset + 4 > len(hidden_header):
+            raise ValueError("Invalid hidden 0x1052 event counter offset.")
+        hidden_declared = struct.unpack_from("<I", hidden_header, hidden_count_offset)[0]
+        if hidden_declared != len(hidden_events):
+            raise ValueError(
+                "Inconsistent hidden 0x1052 event count: "
+                f"declared={hidden_declared}, actual={len(hidden_events)}."
+            )
+        hidden_infos = [event_info(event, "hidden group event") for event in hidden_events]
+        if any(info['event_type'] != 0x03 or info['tail'] != b"\x00\x01\x01" for info in hidden_infos):
+            raise NotImplementedError(
+                "Nested groups, fades, and non-audio events inside a clip group are not supported yet."
+            )
 
-        # 2. Remove from 0x262c (Clip group list)
-        b262c.items.remove(group_block)
-        
-        # Decrement count in 0x262c payload
-        count_pl = bytearray(b262c.items[0])
-        old_count = struct.unpack_from("<I", count_pl, 0)[0]
-        struct.pack_into("<I", count_pl, 0, old_count - 1)
-        b262c.items[0] = count_pl
-        
-        # 3. Remove all events referencing this group_id from the timeline (0x1054 -> 0x1052 -> 0x1050)
-        deleted_count = 0
-        b1054 = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x1054), None)
-        if b1054:
-            for track in [b for b in b1054.items if isinstance(b, PTBlock) and b.content_type == 0x1052]:
-                events_to_remove = []
-                for ev in track.items:
-                    if isinstance(ev, PTBlock) and ev.content_type == 0x1050:
-                        b104f = next((x for x in ev.items if isinstance(x, PTBlock) and x.content_type == 0x104f), None)
-                        if b104f and isinstance(b104f.items[0], (bytes, bytearray)):
-                            cid = struct.unpack_from("<I", b104f.items[0], 2)[0]
-                            if cid == group_id:
-                                events_to_remove.append(ev)
-                
-                for ev in events_to_remove:
-                    self._collect_offsets_recursive(ev, self._removed_offsets)
-                    track.items.remove(ev)
-                    deleted_count += 1
-                    
-        return deleted_count
+        roots_1054 = root_blocks(0x1054)
+        if len(roots_1054) != 1:
+            raise ValueError("Ambiguous session: expected one main 0x1054 timeline.")
+        main_1054 = roots_1054[0]
+        macro_matches = []
+        for track in child_blocks(main_1054, 0x1052):
+            for event in child_blocks(track, 0x1050):
+                info = event_info(event, "main timeline event")
+                # Group and normal clip IDs occupy independent namespaces.
+                if info['clip_id'] == group_id and info['tail'] == b"\x00\x00\x01":
+                    macro_matches.append((track, event, info))
+        if len(macro_matches) != 1:
+            raise NotImplementedError(
+                "delete_clip_group currently supports exactly one placed instance of the group."
+            )
+        main_track, macro_event, macro_info = macro_matches[0]
 
-    def _parse_block(self, pos, max_limit):
-        if pos + 9 > max_limit:
+        main_events = child_blocks(main_track, 0x1050)
+        if not main_track.items or not isinstance(main_track.items[0], (bytes, bytearray)):
+            raise ValueError("Invalid main 0x1052 track header.")
+        main_header = main_track.items[0]
+        if len(main_header) < 4:
+            raise ValueError("Invalid main 0x1052 track header.")
+        track_name_length = struct.unpack_from("<I", main_header, 0)[0]
+        main_count_offset = 4 + track_name_length
+        if main_count_offset + 4 > len(main_header):
+            raise ValueError("Invalid main 0x1052 event counter offset.")
+        main_declared = struct.unpack_from("<I", main_header, main_count_offset)[0]
+        if main_declared != len(main_events):
+            raise ValueError(
+                f"Inconsistent main 0x1052 event count: declared={main_declared}, "
+                f"actual={len(main_events)}."
+            )
+
+        # 0x2424 stores the group-name index. 0x2426 stores a parallel
+        # metadata record whose ordinal matches the group ID.
+        roots_2424 = root_blocks(0x2424)
+        roots_2426 = root_blocks(0x2426)
+        if len(roots_2424) != 1 or len(roots_2426) != 1:
+            raise ValueError("Unsupported clip-group metadata layout (0x2424/0x2426).")
+        b2424 = roots_2424[0]
+        name_count, name_blocks = validate_count(b2424, 0x2423, "0x2424 group-name")
+        b2426 = roots_2426[0]
+        metadata_count, metadata_blocks = validate_count(b2426, 0x2425, "0x2426 group-metadata")
+        if name_count != group_count or metadata_count != group_count:
+            raise ValueError("Clip-group metadata lists do not match the 0x262c group count.")
+
+        matching_name_blocks = []
+        for name_block in name_blocks:
+            if not name_block.items or not isinstance(name_block.items[0], (bytes, bytearray)):
+                raise ValueError("Invalid 0x2423 group-name payload.")
+            payload = name_block.items[0]
+            if len(payload) < 8:
+                raise ValueError("Invalid 0x2423 group-name payload.")
+            name_length = struct.unpack_from("<I", payload, 4)[0]
+            if 8 + name_length > len(payload):
+                raise ValueError("Invalid 0x2423 group-name length.")
+            name = payload[8:8 + name_length].decode('utf-8', 'strict').rstrip('\x00')
+            if name == group_name:
+                matching_name_blocks.append(name_block)
+        if len(matching_name_blocks) != 1:
+            raise ValueError("The 0x2423 group-name index does not match the requested group.")
+        group_name_block = matching_name_blocks[0]
+        group_metadata_block = metadata_blocks[group_id]
+
+        # Move the actual hidden event blocks so live pointer records can be
+        # mapped to their new offsets by save().
+        hidden_origin = min(info['timestamp'] for info in hidden_infos)
+        restored_payloads = []
+        for info in hidden_infos:
+            payload = bytearray(info['payload'])
+            restored_timestamp = macro_info['timestamp'] + info['timestamp'] - hidden_origin
+            if restored_timestamp > 0xffffffffffffffff:
+                raise OverflowError("Restored clip-group timestamp exceeds UInt64.")
+            struct.pack_into("<Q", payload, 7, restored_timestamp)
+            restored_payloads.append((info, payload))
+
+        for info, payload in restored_payloads:
+            info['block'].items[0] = payload
+
+        for event in hidden_events:
+            hidden_track.items.remove(event)
+
+        macro_index = main_track.items.index(macro_event)
+        self._collect_offsets_recursive(macro_event, self._removed_offsets)
+        main_track.items[macro_index:macro_index + 1] = hidden_events
+
+        # Keep event slots chronological without moving the playlist trailer.
+        event_slots = [
+            index for index, item in enumerate(main_track.items)
+            if isinstance(item, PTBlock) and item.content_type == 0x1050
+        ]
+        sorted_events = sorted(
+            (main_track.items[index] for index in event_slots),
+            key=lambda event: event_info(event, "restored main event")['timestamp']
+        )
+        for index, event in zip(event_slots, sorted_events):
+            main_track.items[index] = event
+
+        main_header = bytearray(main_header)
+        struct.pack_into(
+            "<I", main_header, main_count_offset,
+            main_declared - 1 + len(hidden_events)
+        )
+        main_track.items[0] = main_header
+
+        # Retain the empty hidden timeline containers, matching Pro Tools.
+        self._collect_offsets_recursive(hidden_track, self._removed_offsets)
+        hidden_1054.items.remove(hidden_track)
+        hidden_count_payload = bytearray(hidden_1054.items[0])
+        struct.pack_into("<I", hidden_count_payload, 0, 0)
+        hidden_1054.items[0] = hidden_count_payload
+
+        # Remove the definition and its two parallel metadata records.
+        for container, block in (
+            (b262c, group_block),
+            (b2424, group_name_block),
+            (b2426, group_metadata_block),
+        ):
+            self._collect_offsets_recursive(block, self._removed_offsets)
+            container.items.remove(block)
+            count_payload = bytearray(container.items[0])
+            old_count = struct.unpack_from("<I", count_payload, 0)[0]
+            struct.pack_into("<I", count_payload, 0, old_count - 1)
+            container.items[0] = count_payload
+
+        return 1
+
+
+    def _parse_block(self, pos, max_limit, depth=0):
+        if depth > MAX_PTX_BLOCK_DEPTH:
+            raise ValueError(
+                f"PTX block nesting exceeds {MAX_PTX_BLOCK_DEPTH} levels."
+            )
+        if (
+            isinstance(pos, bool) or not isinstance(pos, int)
+            or isinstance(max_limit, bool) or not isinstance(max_limit, int)
+            or pos < 0 or max_limit < 0 or max_limit > len(self.data)
+            or pos + 7 > max_limit
+            or self.data[pos] != ZMARK
+        ):
             return None, 0
 
         block_type = u_endian_read2(self.data, pos + 1, self.is_bigendian)
         block_size = u_endian_read4(self.data, pos + 3, self.is_bigendian)
 
         if pos + 7 + block_size > max_limit:
+            return None, 0
+
+        # A non-empty generic block must at least contain its two-byte
+        # content_type. Size 1 can only be a false 0x5A hit in raw payload.
+        if block_size == 1:
             return None, 0
 
         if (block_type & 0xff00) != 0:
@@ -554,9 +1458,14 @@ class ProToolsSession:
         i = payload_start
         current_bytes = bytearray()
 
+        # Supported fixed-record payloads cannot contain child blocks. Other
+        # content types remain context-sensitive because PTX uses many wrapper
+        # types whose nesting is not fully reverse-engineered yet.
+        allow_children = content_type not in FLAT_PTX_CONTENT_TYPES
+
         while i < payload_end:
-            if self.data[i] == ZMARK:
-                child, jump = self._parse_block(i, payload_end)
+            if allow_children and self.data[i] == ZMARK:
+                child, jump = self._parse_block(i, payload_end, depth + 1)
                 if child:
                     if current_bytes:
                         block.items.append(current_bytes)
@@ -574,24 +1483,65 @@ class ProToolsSession:
 
     def add_marker(self, name, tc_samples, index=None):
         from binascii import unhexlify
+        import uuid
+
+        if not self._validated_main_playlists():
+            raise ValueError("Cannot add a marker to a session without an audio track.")
+
+        if not isinstance(name, str):
+            raise TypeError("Marker name must be a string.")
+        if '\x00' in name:
+            raise ValueError("Marker name cannot contain a null byte.")
+        if isinstance(tc_samples, bool) or not isinstance(tc_samples, int):
+            raise TypeError("Marker timestamp must be an integer sample position.")
+        if tc_samples < 0 or tc_samples > 0x7FFFFFFFFFFFFFFF:
+            raise ValueError("Marker timestamp is outside the signed 64-bit range.")
+
+        marker_containers = []
+        for item in self._root_blocks(0x2030):
+            layout = self._marker_container_layout(item)
+            if layout is not None:
+                marker_containers.append((item, layout))
+        if not marker_containers:
+            raise ValueError("No valid root 0x2030 marker ruler found.")
+        if len(marker_containers) != 1:
+            raise ValueError("Multiple root 0x2030 marker rulers found.")
+
+        container, (marker_count, _) = marker_containers[0]
+        existing = self.get_markers()
+        existing_indices = {marker['index'] for marker in existing}
         if index is None:
-            existing = self.get_markers()
-            if existing:
-                index = max(m['index'] for m in existing) + 1
-            else:
-                index = 1
+            index = max(existing_indices, default=0) + 1
+        elif isinstance(index, bool) or not isinstance(index, int):
+            raise TypeError("Marker index must be an integer.")
+        if index < 1 or index > 0xFFFF:
+            raise ValueError("Marker index must be between 1 and 65535.")
+        if index in existing_indices:
+            raise ValueError(f"Marker index {index} already exists.")
+
+        try:
+            new_name_bytes = name.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("Marker name must be valid UTF-8.") from exc
+        if len(new_name_bytes) > 0xFFFFFFFF:
+            raise ValueError("Marker name is too long for the PTX format.")
+
         template_bytes = unhexlify("5a05003c0100003020010000005a12002701000077200100030900000c0000004d41524b45525f414c504841a059650a00000000a059650a00000000000000000000f0bfffffffffffffffffffffffffffbfffffffffffffffbf00000000000000400000000000000040ffffffff01000000000100000000000000000000000000000000ffffffff000000000000000000000000ffffffff0000000000000000000000001500010000005a03000a0000000625ffffffff00000000000000000000000000000000000000000000000000ffffb2056497c372490ba13368d4d04e64cfffffffffffffffffffffffff5a010009000000264801003f009a00ff5a0100090000002648000000000000005a01001e000000274800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")
 
         temp_sess = ProToolsSession.__new__(ProToolsSession)
         temp_sess.data = template_bytes
         temp_sess.is_bigendian = False
         block, _ = temp_sess._parse_block(0, len(template_bytes))
+        if (
+            block is None
+            or block.content_type != 0x2030
+            or len(block.items) < 2
+            or not isinstance(block.items[1], PTBlock)
+            or block.items[1].content_type != 0x2077
+        ):
+            raise ValueError("Invalid built-in marker template.")
 
-        block.items[0] = struct.pack("<I", index)
-
-        b2077 = block.items[1]
-
-        new_name_bytes = name.encode('utf-8')
+        marker_02077 = block.items[1]
         new_len = len(new_name_bytes)
 
         header = bytearray(struct.pack("<H", index))
@@ -603,221 +1553,527 @@ class ProToolsSession:
 
         rest = unhexlify("000000000000f0bfffffffffffffffffffffffffffbfffffffffffffffbf00000000000000400000000000000040ffffffff01000000000100000000000000000000000000000000ffffffff000000000000000000000000ffffffff000000000000000000000000150001000000")
         header.extend(rest)
-        b2077.items[0] = header
+        marker_02077.items[0] = header
 
-        # The second payload part contains a 16-byte UUID starting at offset 20
-        payload2 = bytearray(b2077.items[2])
-        random_uuid = os.urandom(16)
-        payload2[20:36] = random_uuid
-        b2077.items[2] = payload2
+        # Bytes 23..38 of the secondary payload are an RFC 4122 UUID. The
+        # preceding 00 FF FF bytes and the trailing FF bytes are structural.
+        if (
+            len(marker_02077.items) < 3
+            or not isinstance(marker_02077.items[2], (bytes, bytearray))
+            or len(marker_02077.items[2]) < 39
+        ):
+            raise ValueError("Invalid built-in marker UUID payload.")
+        payload2 = bytearray(marker_02077.items[2])
+        payload2[23:39] = uuid.uuid4().bytes
+        marker_02077.items[2] = payload2
 
-        # Find existing root-level 0x2030 blocks
-        marker_indices = [i for i, x in enumerate(self.root_items) if isinstance(x, PTBlock) and x.content_type == 0x2030]
+        # Template offsets refer to the standalone byte string, not this
+        # session. Keeping them would pollute the old->new pointer mapping.
+        self._wipe_offsets_recursive(marker_02077)
 
-        # Note: block here is a 0x2030 block because we used the template which wraps the marker in a 0x2030.
-        # But we actually just want the 0x2077 block!
-        marker_02077 = block.items[1]
-
-        if marker_indices:
-            # Get the root 0x2030 container
-            container = self.root_items[marker_indices[0]]
-
-            # If the container is empty (size 12, meaning payload is 0s)
-            if len(container.items) == 1 and len(container.items[0]) == 12:
-                container.items = [bytearray([1, 0, 0, 0]), marker_02077, bytearray(8)]
-            else:
-                # Get current count
-                count = struct.unpack("<I", container.items[0])[0]
-                container.items[0] = struct.pack("<I", count + 1)
-                # Insert the marker right before the final 8 bytes of padding
-                container.items.insert(-1, marker_02077)
+        if marker_count == 0:
+            empty_payload = container.items[0]
+            container.items = [
+                bytearray(struct.pack("<I", 1)),
+                marker_02077,
+                bytearray(empty_payload[4:12]),
+            ]
         else:
-            # Fallback if no 0x2030 block is found, we create the container
-            container = PTBlock(0x05, 0x2030, 0)
-            container.items = [bytearray([1, 0, 0, 0]), marker_02077, bytearray(8)]
-            self.root_items.append(container)
+            count_payload = bytearray(container.items[0])
+            struct.pack_into("<I", count_payload, 0, marker_count + 1)
+            container.items[0] = count_payload
+            container.items.insert(-1, marker_02077)
+
+        return index
 
     def _parse_session_metadata(self):
-        self.sample_rate = 48000
-        self.frame_rate_enum = 0x01 # 24 by default
+        sample_rate_blocks = self._root_blocks(0x1028)
+        frame_rate_blocks = self._root_blocks(0x204d)
+        if len(sample_rate_blocks) != 1:
+            raise ValueError("A unique root 0x1028 sample-rate block is required.")
+        if len(frame_rate_blocks) != 1:
+            raise ValueError("A unique root 0x204d frame-rate block is required.")
 
-        for item in self.root_items:
-            if isinstance(item, PTBlock):
-                if item.content_type == 0x1028:
-                    if len(item.items) > 0 and isinstance(item.items[0], bytearray) and len(item.items[0]) >= 6:
-                        # sample rate is a 4-byte LE uint at offset 2 in the payload
-                        fmt = ">I" if self.is_bigendian else "<I"
-                        self.sample_rate = struct.unpack_from(fmt, item.items[0], 2)[0]
-                elif item.content_type == 0x204d:
-                    if len(item.items) > 0 and isinstance(item.items[0], bytearray) and len(item.items[0]) > 0:
-                        # framerate enum is 1 byte at offset 0 in the payload
-                        self.frame_rate_enum = item.items[0][0]
+        sample_block = sample_rate_blocks[0]
+        if (
+            not sample_block.items
+            or not isinstance(sample_block.items[0], (bytes, bytearray))
+            or len(sample_block.items[0]) < 6
+        ):
+            raise ValueError("Invalid root 0x1028 sample-rate payload.")
+        fmt = ">I" if self.is_bigendian else "<I"
+        sample_rate = struct.unpack_from(fmt, sample_block.items[0], 2)[0]
+        if sample_rate <= 0:
+            raise ValueError("Session sample rate must be positive.")
+
+        frame_block = frame_rate_blocks[0]
+        if (
+            not frame_block.items
+            or not isinstance(frame_block.items[0], (bytes, bytearray))
+            or len(frame_block.items[0]) < 1
+        ):
+            raise ValueError("Invalid root 0x204d frame-rate payload.")
+
+        self.sample_rate = sample_rate
+        self.frame_rate_enum = frame_block.items[0][0]
+
+    def _resolve_unique_clip_id(self, clip_name):
+        if not isinstance(clip_name, str) or not clip_name:
+            raise ValueError("clip_name must be a non-empty string.")
+
+        clip_lists = self._root_blocks(0x262a)
+        if not clip_lists:
+            raise ValueError("No clips found in session.")
+        if len(clip_lists) != 1:
+            raise ValueError("Ambiguous session: multiple root 0x262a clip lists.")
+        b262a = clip_lists[0]
+        if (
+            not b262a.items
+            or not isinstance(b262a.items[0], (bytes, bytearray))
+            or len(b262a.items[0]) < 4
+        ):
+            raise ValueError("Invalid 0x262a clip counter payload.")
+
+        clip_definitions = [
+            child for child in b262a.items
+            if isinstance(child, PTBlock) and child.content_type == 0x2629
+        ]
+        declared_clips = struct.unpack_from("<I", b262a.items[0], 0)[0]
+        if declared_clips != len(clip_definitions):
+            raise ValueError(
+                f"Inconsistent 0x262a clip count: declared={declared_clips}, "
+                f"actual={len(clip_definitions)}."
+            )
+
+        matching_ids = []
+        for region_id, definition in enumerate(clip_definitions):
+            names = [
+                child for child in definition.items
+                if isinstance(child, PTBlock) and child.content_type == 0x2628
+            ]
+            if len(names) != 1 or not names[0].items or not isinstance(
+                names[0].items[0], (bytes, bytearray)
+            ):
+                raise ValueError("Invalid 0x2629 clip definition.")
+            payload = names[0].items[0]
+            if len(payload) < 4:
+                raise ValueError("Invalid 0x2628 clip name payload.")
+            name_length = struct.unpack_from("<I", payload, 0)[0]
+            if 4 + name_length > len(payload):
+                raise ValueError("Invalid 0x2628 clip name length.")
+            try:
+                name = payload[4:4 + name_length].decode('utf-8').strip('\x00')
+            except UnicodeDecodeError as exc:
+                raise ValueError("Invalid UTF-8 clip name.") from exc
+            if name == clip_name:
+                matching_ids.append(region_id)
+
+        if not matching_ids:
+            raise ValueError(f"Clip '{clip_name}' not found in session.")
+        if len(matching_ids) != 1:
+            raise ValueError(f"Clip name '{clip_name}' is ambiguous in the session.")
+        return matching_ids[0]
+
+    def _audio_clip_info_by_id(self, clip_id):
+        """Return the validated 0x2628 information for one ordinal clip ID."""
+        clip_lists = self._root_blocks(0x262a)
+        if len(clip_lists) != 1:
+            raise ValueError("A unique root 0x262a clip list is required.")
+        clip_list = clip_lists[0]
+        if (
+            not clip_list.items
+            or not isinstance(clip_list.items[0], (bytes, bytearray))
+            or len(clip_list.items[0]) < 4
+        ):
+            raise ValueError("Invalid 0x262a clip counter payload.")
+        definitions = [
+            item for item in clip_list.items
+            if isinstance(item, PTBlock) and item.content_type == 0x2629
+        ]
+        declared = struct.unpack_from("<I", clip_list.items[0], 0)[0]
+        if declared != len(definitions):
+            raise ValueError(
+                f"Inconsistent 0x262a clip count: declared={declared}, "
+                f"actual={len(definitions)}."
+            )
+        if clip_id < 0 or clip_id >= len(definitions):
+            raise ValueError(f"Unknown clip ID {clip_id}.")
+        payload_blocks = [
+            item for item in definitions[clip_id].items
+            if isinstance(item, PTBlock) and item.content_type == 0x2628
+        ]
+        if (
+            len(payload_blocks) != 1
+            or not payload_blocks[0].items
+            or not isinstance(payload_blocks[0].items[0], (bytes, bytearray))
+        ):
+            raise ValueError("Invalid 0x2629 clip definition.")
+        return self._decode_audio_clip_payload(payload_blocks[0].items[0])
+
+    def _validated_main_timeline_events(self):
+        """Return validated direct events from the visible 0x1054 playlists."""
+        timeline_events = []
+        playlists = self._validated_main_playlists()
+        if not playlists:
+            raise ValueError("No main track map (0x1054) found.")
+        for playlist, _, events in playlists:
+            for event in events:
+                event_payloads = [
+                    child for child in event.items
+                    if isinstance(child, PTBlock) and child.content_type == 0x104f
+                ]
+                if len(event_payloads) != 1:
+                    raise ValueError("Invalid 0x1050 event structure.")
+                b104f = event_payloads[0]
+                if (
+                    not b104f.items
+                    or not isinstance(b104f.items[0], (bytes, bytearray))
+                    or len(b104f.items[0]) < 16
+                ):
+                    raise ValueError("Invalid 0x104f event payload.")
+                payload = b104f.items[0]
+                timeline_events.append((playlist, event, b104f, payload))
+
+        return timeline_events
+
+    @staticmethod
+    def _audio_timeline_event_kind(event, payload):
+        """Classify a type-0x03 event as audio or Clip Group macro."""
+        if payload[15] != 0x03:
+            return None
+        secondary_payload = b"".join(
+            bytes(item) for item in event.items
+            if isinstance(item, (bytes, bytearray))
+        )
+        if secondary_payload == b"\x00\x01\x01":
+            return "audio"
+        if secondary_payload == b"\x00\x00\x01":
+            return "clip_group"
+        raise ValueError("Unsupported audio event secondary payload.")
+
+    def _validated_fade_geometry_list(self):
+        """Return the unique, internally consistent root 0x2630 list."""
+        geometry_roots = self._root_blocks(0x2630)
+        if len(geometry_roots) != 1:
+            raise ValueError("A unique fade geometry list (0x2630) is required.")
+        geometry_root = geometry_roots[0]
+        if (
+            not geometry_root.items
+            or not isinstance(geometry_root.items[0], (bytes, bytearray))
+            or len(geometry_root.items[0]) < 4
+        ):
+            raise ValueError("Invalid 0x2630 fade geometry counter.")
+
+        geometries = [
+            item for item in geometry_root.items
+            if isinstance(item, PTBlock) and item.content_type == 0x262f
+        ]
+        declared = struct.unpack_from("<I", geometry_root.items[0], 0)[0]
+        if declared != len(geometries):
+            raise ValueError(
+                f"Inconsistent 0x2630 geometry count: declared={declared}, "
+                f"actual={len(geometries)}."
+            )
+        if any(
+            not geometry.items
+            or not isinstance(geometry.items[0], (bytes, bytearray))
+            for geometry in geometries
+        ):
+            raise ValueError("Invalid 0x262f fade geometry payload.")
+        return geometry_root, geometries
+
+    def _validated_fade_geometry_bindings(self, timeline_events=None):
+        """Bind each fade event to the 0x262f index stored in 0x104f +2.
+
+        Fade and audio events reuse the same four-byte field at +2, but they
+        use different namespaces: audio values index 0x262a clip definitions,
+        while fade values index the global 0x2630 geometry list.
+        """
+        if timeline_events is None:
+            timeline_events = self._validated_main_timeline_events()
+        fade_entries = [
+            entry for entry in timeline_events if entry[3][15] == 0x01
+        ]
+        has_geometry_root = bool(self._root_blocks(0x2630))
+        if not fade_entries and not has_geometry_root:
+            return None, [], []
+
+        geometry_root, geometries = self._validated_fade_geometry_list()
+        if len(fade_entries) != len(geometries):
+            raise ValueError("Fade event and 0x262f geometry counts do not match.")
+
+        bindings = []
+        used_geometry_ids = set()
+        for entry in fade_entries:
+            geometry_id = struct.unpack_from("<I", entry[3], 2)[0]
+            if geometry_id >= len(geometries):
+                raise ValueError(
+                    f"Fade event references unknown geometry ID {geometry_id}."
+                )
+            if geometry_id in used_geometry_ids:
+                raise ValueError(f"Duplicate fade geometry ID {geometry_id}.")
+            used_geometry_ids.add(geometry_id)
+            bindings.append((entry, geometry_id, geometries[geometry_id]))
+
+        return geometry_root, geometries, bindings
+
+    def _fade_bindings_for_audio_placement(
+        self, start_samples, length_samples, playlist, timeline_events=None
+    ):
+        """Return native fades touching one exact visible audio placement."""
+        _, _, bindings = self._validated_fade_geometry_bindings(timeline_events)
+        end_samples = start_samples + length_samples
+        related = []
+        for entry, geometry_id, geometry in bindings:
+            if entry[0] is not playlist:
+                continue
+            if (
+                not geometry.items
+                or not isinstance(geometry.items[0], (bytes, bytearray))
+            ):
+                raise ValueError("Invalid 0x262f fade geometry payload.")
+            geometry_length = len(geometry.items[0])
+            anchor = struct.unpack_from("<Q", entry[3], 7)[0]
+            is_related = (
+                (geometry_length == 22 and anchor == start_samples)
+                or (geometry_length in (26, 27) and anchor == end_samples)
+                or (geometry_length == 34 and anchor in (start_samples, end_samples))
+            )
+            if is_related:
+                related.append((entry, geometry_id, geometry))
+        return related
 
     def mute_clip(self, clip_name, mute=True):
-        # 1. Find Region ID from clip name
-        region_id = None
+        """Mute or unmute every visible audio placement of a clip.
 
-        b262a = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x262a), None)
-        if not b262a:
-            raise ValueError("No clips found in session.")
-            
-        region_id = -1
-        current_idx = 0
-        for child in b262a.items:
-            if isinstance(child, PTBlock) and child.content_type == 0x2629:
-                b2628 = next((c for c in child.items if isinstance(c, PTBlock) and c.content_type == 0x2628), None)
-                if b2628:
-                    payload = getattr(b2628, 'items', [b""])[0]
-                    if isinstance(payload, (bytes, bytearray)) and len(payload) >= 4:
-                        nlen = struct.unpack_from("<I", payload, 0)[0]
-                        if 4 + nlen <= len(payload):
-                            name = payload[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
-                            if name == clip_name:
-                                region_id = current_idx
-                                break
-                current_idx += 1
+        Fade geometry IDs can numerically collide with audio clip IDs, so only
+        direct audio events (0x1050 -> 0x104f with event type 0x03) in the main
+        0x1054 playlists are eligible. Hidden group playlists are untouched.
+        """
+        if not isinstance(mute, bool):
+            raise TypeError("mute must be a boolean.")
 
-        if region_id == -1:
-            raise ValueError(f"Clip '{clip_name}' not found in session.")
+        region_id = self._resolve_unique_clip_id(clip_name)
+        targets = []
+        for _, event, b104f, payload in self._validated_main_timeline_events():
+            if self._audio_timeline_event_kind(event, payload) != "audio":
+                continue
+            placed_id = struct.unpack_from("<I", payload, 2)[0]
+            if placed_id == region_id:
+                targets.append(b104f)
 
-        # 2. Find placement in 0x1050 -> 0x104f
-        all_104f = []
-        for r in self.root_items:
-            all_104f.extend(r.get_all_blocks(0x104f) if isinstance(r, PTBlock) else [])
+        if not targets:
+            raise ValueError(f"Clip '{clip_name}' has no visible audio placement.")
 
-        muted_count = 0
-        for b104f in all_104f:
-            if len(b104f.items) > 0 and isinstance(b104f.items[0], bytearray) and len(b104f.items[0]) >= 7:
-                payload = b104f.items[0]
-                placed_id = struct.unpack_from("<I", payload, 2)[0]
-                if placed_id == region_id:
-                    # Mute flag is at offset 0
-                    payload[0] = 0x01 if mute else 0x00
-                    muted_count += 1
+        for b104f in targets:
+            payload = bytearray(b104f.items[0])
+            payload[0] = 0x01 if mute else 0x00
+            b104f.items[0] = payload
 
-        return muted_count
+        return len(targets)
 
     def move_clip(self, clip_name, hh, mm, ss, ff):
-        # 1. Calculate target samples using TimecodeEngine
+        """Move one unambiguous visible audio placement to an absolute TC.
+
+        The public signature cannot identify one occurrence when the same clip
+        is placed multiple times. Such sessions, and clips with native fades,
+        are rejected instead of collapsing related events onto one timestamp.
+        """
+        components = (hh, mm, ss, ff)
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in components):
+            raise TypeError("Timecode components must be integers.")
+        if hh < 0 or mm < 0 or mm > 59 or ss < 0 or ss > 59 or ff < 0:
+            raise ValueError("Invalid target timecode components.")
+
         engine = TimecodeEngine(self.sample_rate, self.frame_rate_enum)
+        _, is_drop_frame = engine.get_frame_rate()
+        nominal_fps = 30 if self.frame_rate_enum == 0x05 else (
+            24 if self.frame_rate_enum == 0x09 else int(engine.get_frame_rate()[0])
+        )
+        if ff >= nominal_fps:
+            raise ValueError(f"Frame component must be below {nominal_fps}.")
+        if is_drop_frame and mm % 10 != 0 and ss == 0 and ff < 2:
+            raise ValueError("Target timecode falls on a dropped frame number.")
+
         target_samples = engine.timecode_to_samples(hh, mm, ss, ff)
+        if target_samples < 0 or target_samples > 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("Target sample position is outside the UInt64 range.")
 
-        # 2. Find Region ID
-        region_id = -1
-        b262a = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x262a), None)
-        if not b262a:
-            raise ValueError("No clips found in session.")
-            
-        current_idx = 0
-        for child in b262a.items:
-            if isinstance(child, PTBlock) and child.content_type == 0x2629:
-                b2628 = next((c for c in child.items if isinstance(c, PTBlock) and c.content_type == 0x2628), None)
-                if b2628:
-                    payload = getattr(b2628, 'items', [b""])[0]
-                    if isinstance(payload, (bytes, bytearray)) and len(payload) >= 4:
-                        nlen = struct.unpack_from("<I", payload, 0)[0]
-                        if 4 + nlen <= len(payload):
-                            name = payload[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
-                            if name == clip_name:
-                                region_id = current_idx
-                                break
-                current_idx += 1
+        region_id = self._resolve_unique_clip_id(clip_name)
+        timeline_events = self._validated_main_timeline_events()
+        placements = []
+        for entry in timeline_events:
+            _, event, _, payload = entry
+            if self._audio_timeline_event_kind(event, payload) != "audio":
+                continue
+            if struct.unpack_from("<I", payload, 2)[0] == region_id:
+                placements.append(entry)
+        if not placements:
+            raise ValueError(f"Clip '{clip_name}' has no visible audio placement.")
+        if len(placements) != 1:
+            raise ValueError(
+                f"Clip '{clip_name}' has multiple visible placements; "
+                "the move target is ambiguous."
+            )
 
-        if region_id == -1:
-            raise ValueError(f"Clip '{clip_name}' not found in session.")
+        target_playlist, _, target_b104f, target_original_payload = placements[0]
+        original_start = struct.unpack_from("<Q", target_original_payload, 7)[0]
+        has_fade_events = any(entry[3][15] == 0x01 for entry in timeline_events)
+        if has_fade_events:
+            clip_length = self._audio_clip_info_by_id(region_id)["length"]
+            related_fades = self._fade_bindings_for_audio_placement(
+                original_start, clip_length, target_playlist, timeline_events
+            )
+        else:
+            related_fades = []
+        if related_fades:
+            raise NotImplementedError(
+                "Moving a clip with attached fades is not supported safely yet."
+            )
 
-        # 3. Update timestamp in 0x104f
-        moved_count = 0
-            
-        for b104f in sum((r.get_all_blocks(0x104f) if isinstance(r, PTBlock) else [] for r in self.root_items), []):
-            if len(b104f.items) > 0 and isinstance(b104f.items[0], bytearray) and len(b104f.items[0]) >= 15:
-                payload = b104f.items[0]
-                placed_id = struct.unpack_from("<I", payload, 2)[0]
-                if placed_id == region_id:
-                    # Timestamp is 8 bytes at offset 7
-                    struct.pack_into("<q", payload, 7, target_samples)
-                    moved_count += 1
+        target_payload = bytearray(target_b104f.items[0])
+        struct.pack_into("<Q", target_payload, 7, target_samples)
+        target_b104f.items[0] = target_payload
 
-        return moved_count
+        # Keep the direct 0x1050 slots chronological while preserving every
+        # raw/non-event item at its exact position in the playlist.
+        event_slots = [
+            index for index, item in enumerate(target_playlist.items)
+            if isinstance(item, PTBlock) and item.content_type == 0x1050
+        ]
+
+        def event_timestamp(event):
+            b104f = next(
+                child for child in event.items
+                if isinstance(child, PTBlock) and child.content_type == 0x104f
+            )
+            return struct.unpack_from("<Q", b104f.items[0], 7)[0]
+
+        sorted_events = sorted(
+            (target_playlist.items[index] for index in event_slots),
+            key=event_timestamp,
+        )
+        for index, event in zip(event_slots, sorted_events):
+            target_playlist.items[index] = event
+
+        return 1
 
     def rename_clip(self, old_name, new_name):
-        renamed_count = 0
-        b262a = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x262a), None)
-        if b262a:
-            for child in b262a.items:
-                if isinstance(child, PTBlock) and child.content_type == 0x2629:
-                    b2628 = next((c for c in child.items if isinstance(c, PTBlock) and c.content_type == 0x2628), None)
-                    if b2628:
-                        payload = getattr(b2628, 'items', [b""])[0]
-                        if isinstance(payload, (bytes, bytearray)) and len(payload) >= 4:
-                            nlen = struct.unpack_from("<I", payload, 0)[0]
-                            if 4 + nlen <= len(payload):
-                                name = payload[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
-                                if name == old_name:
-                                    name_bytes = new_name.encode('utf-8') + b'\x00'
-                                    new_len = len(name_bytes)
-                                    new_payload = bytearray(4 + new_len + (len(payload) - (4 + nlen)))
-                                    struct.pack_into("<I", new_payload, 0, new_len)
-                                    new_payload[4:4+new_len] = name_bytes
-                                    new_payload[4+new_len:] = payload[4+nlen:]
-                                    b2628.items[0] = new_payload
-                                    renamed_count += 1
-        return renamed_count
+        """Rename one uniquely identified audio clip definition."""
+        if not isinstance(old_name, str):
+            raise TypeError("Old clip name must be a string.")
+        if not old_name:
+            raise ValueError("Old clip name must be non-empty.")
+        if "\x00" in old_name:
+            raise ValueError("Old clip name cannot contain a NUL character.")
+        if not isinstance(new_name, str):
+            raise TypeError("New clip name must be a string.")
+        if not new_name:
+            raise ValueError("New clip name must be non-empty.")
+        if "\x00" in new_name:
+            raise ValueError("New clip name cannot contain a NUL character.")
+
+        try:
+            name_bytes = new_name.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("New clip name must be valid UTF-8.") from exc
+        if len(name_bytes) > 0xFFFFFFFF:
+            raise ValueError("New clip name is too long for the PTX format.")
+
+        target_id = self._resolve_unique_clip_id(old_name)
+        b262a = self._root_blocks(0x262a)[0]
+        definitions = [
+            child for child in b262a.items
+            if isinstance(child, PTBlock) and child.content_type == 0x2629
+        ]
+
+        target_b2628 = None
+        target_payload = None
+        target_name_length = None
+        for clip_id, definition in enumerate(definitions):
+            name_blocks = [
+                child for child in definition.items
+                if isinstance(child, PTBlock) and child.content_type == 0x2628
+            ]
+            # _resolve_unique_clip_id() has already validated this structure and
+            # every UTF-8 name. Repeat only the extraction needed for mutation.
+            b2628 = name_blocks[0]
+            payload = b2628.items[0]
+            name_length = struct.unpack_from("<I", payload, 0)[0]
+            current_name = payload[4:4 + name_length].decode("utf-8").strip("\x00")
+            if clip_id != target_id and current_name == new_name:
+                raise ValueError(f"Clip name '{new_name}' already exists in the session.")
+            if clip_id == target_id:
+                target_b2628 = b2628
+                target_payload = payload
+                target_name_length = name_length
+
+        if target_b2628 is None:
+            raise ValueError("Resolved clip definition disappeared before rename.")
+
+        new_payload = bytearray(
+            4 + len(name_bytes) + (len(target_payload) - (4 + target_name_length))
+        )
+        struct.pack_into("<I", new_payload, 0, len(name_bytes))
+        new_payload[4:4 + len(name_bytes)] = name_bytes
+        new_payload[4 + len(name_bytes):] = target_payload[4 + target_name_length:]
+        target_b2628.items[0] = new_payload
+        return 1
 
     def duplicate_clip(self, clip_name, hh, mm, ss, ff, mute=False):
-        """Duplicates an existing clip on the timeline and places it at the specified timecode."""
-        
-        target_event = None
-        target_b1052 = None
+        """Atomically duplicate one unambiguous visible audio placement."""
+        original_root_items = copy.deepcopy(self.root_items)
+        original_removed_offsets = list(getattr(self, '_removed_offsets', []))
+        try:
+            return self._duplicate_clip_impl(clip_name, hh, mm, ss, ff, mute)
+        except Exception:
+            self.root_items = original_root_items
+            self._removed_offsets = original_removed_offsets
+            raise
+
+    def _duplicate_clip_impl(self, clip_name, hh, mm, ss, ff, mute=False):
+        if not isinstance(mute, bool):
+            raise TypeError("mute must be a boolean.")
+
         engine = TimecodeEngine(self.sample_rate, self.frame_rate_enum)
         new_samples = engine.timecode_to_samples(hh, mm, ss, ff)
-        
-        b262a = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x262a), None)
-        if not b262a:
-            raise ValueError("No clips found in session.")
-            
-        clip_id = -1
-        current_idx = 0
-        for child in b262a.items:
-            if isinstance(child, PTBlock) and child.content_type == 0x2629:
-                b2628 = next((c for c in child.items if isinstance(c, PTBlock) and c.content_type == 0x2628), None)
-                if b2628:
-                    payload = getattr(b2628, 'items', [b""])[0]
-                    if isinstance(payload, (bytes, bytearray)) and len(payload) >= 4:
-                        nlen = struct.unpack_from("<I", payload, 0)[0]
-                        if 4 + nlen <= len(payload):
-                            name = payload[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
-                            if name == clip_name:
-                                clip_id = current_idx
-                                break
-                current_idx += 1
-                
-        if clip_id == -1:
-            raise ValueError(f"Clip '{clip_name}' not found.")
-            
-        # Find the event for this clip_id
-        b1054 = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x1054), None)
-        if not b1054:
-            raise ValueError("No track map (0x1054) found.")
-            
-        for child in b1054.items:
-            if isinstance(child, PTBlock) and child.content_type == 0x1052:
-                for ev in child.items:
-                    if isinstance(ev, PTBlock) and ev.content_type == 0x1050:
-                        b104f = next((c for c in ev.items if isinstance(c, PTBlock) and c.content_type == 0x104f), None)
-                        if b104f:
-                            payload = bytearray(b104f.items[0])
-                            if len(payload) >= 6:
-                                ev_clip_id = struct.unpack_from("<I", payload, 2)[0]
-                                if ev_clip_id == clip_id:
-                                    target_event = ev
-                                    target_b1052 = child
-                                    break
-                if target_event: break
-            if target_event: break
-            
-        if not target_event or not target_b1052:
-            raise ValueError(f"Could not find an event for clip '{clip_name}' on the timeline.")
+        if new_samples > 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("Target sample position is outside the UInt64 range.")
+        clip_id = self._resolve_unique_clip_id(clip_name)
+        timeline_events = self._validated_main_timeline_events()
+        placements = []
+        for entry in timeline_events:
+            _, event, _, payload = entry
+            if self._audio_timeline_event_kind(event, payload) != "audio":
+                continue
+            if struct.unpack_from("<I", payload, 2)[0] == clip_id:
+                placements.append(entry)
+
+        if not placements:
+            raise ValueError(f"Clip '{clip_name}' has no visible audio placement.")
+        if len(placements) != 1:
+            raise ValueError(
+                f"Clip '{clip_name}' has multiple visible placements; "
+                "the duplicate source is ambiguous."
+            )
+
+        target_b1052, target_event, _, source_payload = placements[0]
+        if len(source_payload) != 35:
+            raise ValueError("Audio event 0x104f payload must be exactly 35 bytes.")
+        source_start = struct.unpack_from("<Q", source_payload, 7)[0]
+        source_length = self._audio_clip_info_by_id(clip_id)["length"]
+        related_fades = self._fade_bindings_for_audio_placement(
+            source_start, source_length, target_b1052, timeline_events
+        )
+        if related_fades or source_payload[33] != 0:
+            raise NotImplementedError(
+                "Duplicating a clip placement with attached fades is not supported safely yet."
+            )
+
+        header = bytearray(target_b1052.items[0])
+        nlen = struct.unpack_from("<I", header, 0)[0]
+        count_offset = 4 + nlen
+        current_count = struct.unpack_from("<I", header, count_offset)[0]
             
         # Duplicate the event
         new_event = copy.deepcopy(target_event)
@@ -827,60 +2083,135 @@ class ProToolsSession:
         b104f = next(c for c in new_event.items if isinstance(c, PTBlock) and c.content_type == 0x104f)
         payload = bytearray(b104f.items[0])
         
-        # Mute flag
-        if mute:
-            payload[0] = 0x01
-        else:
-            payload[0] = 0x00
-            
-        # Update timestamp (offset 7)
-        if len(payload) >= 15:
-            struct.pack_into("<Q", payload, 7, new_samples)
+        payload[0] = 0x01 if mute else 0x00
+        struct.pack_into("<Q", payload, 7, new_samples)
             
         b104f.items[0] = payload
         
-        # Add to playlist
-        # Insert before the last element (which is the trailing dummy event)
-        target_b1052.items.insert(len(target_b1052.items) - 1, new_event)
-        
-        # We must increment the count in the 1052 header!
-        header = bytearray(target_b1052.items[0])
-        nlen = struct.unpack_from("<I", header, 0)[0]
-        # The count is 4 bytes after the string
-        count_offset = 4 + nlen
-        current_count = struct.unpack_from("<I", header, count_offset)[0]
+        # Insert after events at the same timestamp, but before the first later
+        # event. The resulting 0x1052 playlist remains chronological.
+        insert_idx = 1
+        for i in range(1, len(target_b1052.items)):
+            event = target_b1052.items[i]
+            if not isinstance(event, PTBlock) or event.content_type != 0x1050:
+                continue
+            event_104f = next((c for c in event.items if isinstance(c, PTBlock) and c.content_type == 0x104f), None)
+            if not event_104f or not event_104f.items or not isinstance(event_104f.items[0], (bytes, bytearray)):
+                continue
+            event_payload = event_104f.items[0]
+            if len(event_payload) < 15:
+                continue
+            event_timestamp = struct.unpack_from("<Q", event_payload, 7)[0]
+            if event_timestamp > new_samples:
+                insert_idx = i
+                break
+            insert_idx = i + 1
+
+        target_b1052.items.insert(insert_idx, new_event)
+
         struct.pack_into("<I", header, count_offset, current_count + 1)
         target_b1052.items[0] = header
         
-        print(f"Duplicated clip '{clip_name}' to {hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}, mute={mute}")
+        logger.info(
+            "Duplicated clip %r to %02d:%02d:%02d:%02d, mute=%s",
+            clip_name, hh, mm, ss, ff, mute,
+        )
         
         return clip_id
 
     
     def split_clip(self, track_name, clip_name, cut_hh, cut_mm, cut_ss, cut_ff):
-        """Splits a clip into two virtual clips at the specified timecode."""
+        """Atomically split one audio placement into two virtual sub-clips."""
+        components = (cut_hh, cut_mm, cut_ss, cut_ff)
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in components):
+            raise TypeError("Timecode components must be integers.")
+        if (
+            cut_hh < 0 or cut_mm < 0 or cut_mm > 59
+            or cut_ss < 0 or cut_ss > 59 or cut_ff < 0
+        ):
+            raise ValueError("Invalid cut timecode components.")
+
+        engine = TimecodeEngine(self.sample_rate, self.frame_rate_enum)
+        _, is_drop_frame = engine.get_frame_rate()
+        nominal_fps = 30 if self.frame_rate_enum == 0x05 else (
+            24 if self.frame_rate_enum == 0x09 else int(engine.get_frame_rate()[0])
+        )
+        if cut_ff >= nominal_fps:
+            raise ValueError(f"Frame component must be below {nominal_fps}.")
+        if is_drop_frame and cut_mm % 10 != 0 and cut_ss == 0 and cut_ff < 2:
+            raise ValueError("Cut timecode falls on a dropped frame number.")
+
+        original_root_items = copy.deepcopy(self.root_items)
+        original_removed_offsets = list(getattr(self, '_removed_offsets', []))
+        try:
+            return self._split_clip_impl(
+                track_name, clip_name, cut_hh, cut_mm, cut_ss, cut_ff
+            )
+        except Exception:
+            self.root_items = original_root_items
+            self._removed_offsets = original_removed_offsets
+            raise
+
+    def _split_clip_impl(self, track_name, clip_name, cut_hh, cut_mm, cut_ss, cut_ff):
         engine = TimecodeEngine(self.sample_rate, self.frame_rate_enum)
         cut_samples = engine.timecode_to_samples(cut_hh, cut_mm, cut_ss, cut_ff)
+        if not isinstance(track_name, str) or not track_name:
+            raise ValueError("track_name must be a non-empty string.")
+        if not isinstance(clip_name, str) or not clip_name:
+            raise ValueError("clip_name must be a non-empty string.")
         
         # 1. Find the clip definition (0x2629)
-        b262a = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x262a), None)
-        if not b262a:
+        clip_lists = self._root_blocks(0x262a)
+        if not clip_lists:
             raise ValueError("No clip list (0x262a) found.")
-            
+        if len(clip_lists) != 1:
+            raise ValueError("Ambiguous session: multiple root 0x262a clip lists.")
+        b262a = clip_lists[0]
+        if (
+            not b262a.items
+            or not isinstance(b262a.items[0], (bytes, bytearray))
+            or len(b262a.items[0]) < 4
+        ):
+            raise ValueError("Invalid 0x262a clip counter payload.")
+
         orig_2629 = None
         orig_clip_id = -1
         clips = [c for c in b262a.items if isinstance(c, PTBlock) and c.content_type == 0x2629]
+        declared_clips = struct.unpack_from("<I", b262a.items[0], 0)[0]
+        if declared_clips != len(clips):
+            raise ValueError(
+                f"Inconsistent 0x262a clip count: declared={declared_clips}, "
+                f"actual={len(clips)}."
+            )
+
+        clip_names = []
         for i, c in enumerate(clips):
-            b2628 = next((x for x in c.items if isinstance(x, PTBlock) and x.content_type == 0x2628), None)
-            if b2628:
-                pl = b2628.items[0]
-                nlen = struct.unpack_from("<I", pl, 0)[0]
-                name = pl[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
-                if name == clip_name:
-                    orig_2629 = c
-                    orig_clip_id = i
-                    break
-                    
+            name_blocks = [
+                item for item in c.items
+                if isinstance(item, PTBlock) and item.content_type == 0x2628
+            ]
+            if (
+                len(name_blocks) != 1
+                or not name_blocks[0].items
+                or not isinstance(name_blocks[0].items[0], (bytes, bytearray))
+                or len(name_blocks[0].items[0]) < 4
+            ):
+                raise ValueError("Invalid 0x2629 clip definition.")
+            pl = name_blocks[0].items[0]
+            nlen = struct.unpack_from("<I", pl, 0)[0]
+            if 4 + nlen > len(pl):
+                raise ValueError("Invalid 0x2628 clip name length.")
+            try:
+                name = pl[4:4 + nlen].decode('utf-8').strip('\x00')
+            except UnicodeDecodeError as exc:
+                raise ValueError("Invalid UTF-8 clip name.") from exc
+            clip_names.append(name)
+            if name == clip_name:
+                if orig_2629 is not None:
+                    raise ValueError(f"Clip name '{clip_name}' is ambiguous in the session.")
+                orig_2629 = c
+                orig_clip_id = i
+
         if not orig_2629:
             raise ValueError(f"Clip '{clip_name}' not found.")
             
@@ -889,6 +2220,8 @@ class ProToolsSession:
         pl_orig = b2628_orig.items[0]
         nlen = struct.unpack_from("<I", pl_orig, 0)[0]
         offset = 4 + nlen
+        if offset + 17 > len(pl_orig):
+            raise ValueError("Invalid root 0x2628 clip payload.")
         
         # Ensure it is a 32-bit root clip format (00 00 or 01 00 followed by 30 44 00)
         hdr = pl_orig[offset:offset+5]
@@ -897,66 +2230,139 @@ class ProToolsSession:
             
         orig_length = struct.unpack_from("<I", pl_orig, offset+5)[0]
         orig_ts1 = struct.unpack_from("<I", pl_orig, offset+9)[0]
-        orig_ts2 = struct.unpack_from("<I", pl_orig, offset+13)[0]
         
         # 3. Find the track and event on the timeline
-        b1054 = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x1054), None)
-        if not b1054:
+        track_maps = self._root_blocks(0x1054)
+        if not track_maps:
             raise ValueError("No track map (0x1054) found.")
-            
-        b1052 = None
-        for track in [b for b in b1054.items if isinstance(b, PTBlock) and b.content_type == 0x1052]:
-            if len(track.items) > 0 and isinstance(track.items[0], (bytes, bytearray)):
-                hdr = track.items[0]
-                nlen = struct.unpack_from("<I", hdr, 0)[0]
-                if 4 + nlen <= len(hdr):
-                    tname = hdr[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
-                    if tname == track_name:
-                        b1052 = track
-                        break
-                        
-        if not b1052:
+        if len(track_maps) != 1:
+            raise ValueError("Ambiguous session: multiple root 0x1054 track maps.")
+        b1054 = track_maps[0]
+        if (
+            not b1054.items
+            or not isinstance(b1054.items[0], (bytes, bytearray))
+            or len(b1054.items[0]) < 4
+        ):
+            raise ValueError("Invalid 0x1054 track counter payload.")
+        tracks = [
+            item for item in b1054.items
+            if isinstance(item, PTBlock) and item.content_type == 0x1052
+        ]
+        declared_tracks = struct.unpack_from("<I", b1054.items[0], 0)[0]
+        if declared_tracks != len(tracks):
+            raise ValueError(
+                f"Inconsistent 0x1054 track count: declared={declared_tracks}, "
+                f"actual={len(tracks)}."
+            )
+
+        matching_tracks = []
+        for track in tracks:
+            if (
+                not track.items
+                or not isinstance(track.items[0], (bytes, bytearray))
+                or len(track.items[0]) < 8
+            ):
+                raise ValueError("Invalid 0x1052 playlist header.")
+            track_header = track.items[0]
+            track_name_length = struct.unpack_from("<I", track_header, 0)[0]
+            count_offset = 4 + track_name_length
+            if count_offset + 4 > len(track_header):
+                raise ValueError("Invalid 0x1052 event counter offset.")
+            try:
+                parsed_name = track_header[4:count_offset].decode('utf-8').strip('\x00')
+            except UnicodeDecodeError as exc:
+                raise ValueError("Invalid UTF-8 track name.") from exc
+            events = [
+                item for item in track.items
+                if isinstance(item, PTBlock) and item.content_type == 0x1050
+            ]
+            declared_events = struct.unpack_from("<I", track_header, count_offset)[0]
+            if declared_events != len(events):
+                raise ValueError(
+                    f"Inconsistent 0x1052 event count: declared={declared_events}, "
+                    f"actual={len(events)}."
+                )
+            if parsed_name == track_name:
+                matching_tracks.append(track)
+
+        if not matching_tracks:
             raise ValueError(f"Track '{track_name}' not found.")
+        if len(matching_tracks) != 1:
+            raise ValueError(f"Track name '{track_name}' is ambiguous in the session.")
+        b1052 = matching_tracks[0]
             
-        orig_1050 = None
-        orig_1050_idx = -1
-        event_start_samples = 0
-        orig_abs_ts = -1
-        
+        matching_events = []
         for i, ev in enumerate(b1052.items):
             if isinstance(ev, PTBlock) and ev.content_type == 0x1050:
-                b104f = next((c for c in ev.items if isinstance(c, PTBlock) and c.content_type == 0x104f), None)
-                if b104f:
-                    payload = bytearray(b104f.items[0])
-                    if len(payload) >= 15:
-                        ev_clip_id = struct.unpack_from("<I", payload, 2)[0]
-                        if ev_clip_id == orig_clip_id:
-                            ts = struct.unpack_from("<Q", payload, 7)[0]
-                            if ts < cut_samples < ts + orig_length:
-                                orig_1050 = ev
-                                orig_1050_idx = i
-                                event_start_samples = ts
-                                orig_abs_ts = ts
-                                break
-                                
-        if not orig_1050:
+                event_payloads = [
+                    item for item in ev.items
+                    if isinstance(item, PTBlock) and item.content_type == 0x104f
+                ]
+                if (
+                    len(event_payloads) != 1
+                    or not event_payloads[0].items
+                    or not isinstance(event_payloads[0].items[0], (bytes, bytearray))
+                    or len(event_payloads[0].items[0]) < 16
+                ):
+                    raise ValueError("Invalid 0x1050 timeline event.")
+                payload = event_payloads[0].items[0]
+                if self._audio_timeline_event_kind(ev, payload) != "audio":
+                    continue
+                ev_clip_id = struct.unpack_from("<I", payload, 2)[0]
+                if ev_clip_id == orig_clip_id:
+                    ts = struct.unpack_from("<Q", payload, 7)[0]
+                    if ts < cut_samples < ts + orig_length:
+                        matching_events.append((i, ev, event_payloads[0], ts))
+
+        if not matching_events:
             raise ValueError(f"Could not find an instance of clip '{clip_name}' on track '{track_name}' that spans the cut timecode.")
+        if len(matching_events) != 1:
+            raise ValueError("Multiple clip placements span the requested cut timecode.")
+
+        orig_1050_idx, orig_1050, orig_104f, event_start_samples = matching_events[0]
+        orig_abs_ts = event_start_samples
+        related_fades = self._fade_bindings_for_audio_placement(
+            event_start_samples, orig_length, b1052
+        )
+        if related_fades:
+            raise NotImplementedError(
+                "Splitting a clip with attached fades is not supported safely yet."
+            )
             
         relative_cut_samples = cut_samples - event_start_samples
+        rem_length = orig_length - relative_cut_samples
+        if relative_cut_samples > 0xFFFFFF or rem_length > 0xFFFFFF:
+            raise ValueError(
+                "Split source offset and both resulting lengths must fit in 24 bits."
+            )
+        if cut_samples > 0xFFFFFFFF:
+            raise ValueError("Split timestamp exceeds the 32-bit 0x2628 timestamp range.")
+
+        suffix_values = []
+        prefix = clip_name + "-"
+        for existing_name in clip_names:
+            if existing_name.startswith(prefix):
+                suffix = existing_name[len(prefix):]
+                if suffix.isdigit():
+                    suffix_values.append(int(suffix))
+        left_suffix = max(suffix_values, default=0) + 1
+        right_suffix = left_suffix + 1
+        new_clip_name_01 = f"{clip_name}-{left_suffix:02d}"
+        new_clip_name_02 = f"{clip_name}-{right_suffix:02d}"
         
         # 4. Build Left Clip (-01)
-        import copy, os
+        import uuid
         clip_01 = copy.deepcopy(orig_2629)
         self._wipe_offsets_recursive(clip_01)
         # Fix UUID
         for i, item in enumerate(clip_01.items):
             if isinstance(item, bytearray) and len(item) == 48:
                 new_ba = bytearray(item)
-                new_ba[22:38] = os.urandom(16)
+                new_ba[22:38] = uuid.uuid4().bytes
                 clip_01.items[i] = bytes(new_ba)
         # Fix 0x2628
         b2628_01 = next(x for x in clip_01.items if isinstance(x, PTBlock) and x.content_type == 0x2628)
-        new_name_01 = (clip_name + "-01").encode('utf-8')
+        new_name_01 = new_clip_name_01.encode('utf-8')
         pl_01 = bytearray()
         pl_01.extend(struct.pack("<I", len(new_name_01)))
         pl_01.extend(new_name_01)
@@ -986,11 +2392,11 @@ class ProToolsSession:
         for i, item in enumerate(clip_02.items):
             if isinstance(item, bytearray) and len(item) == 48:
                 new_ba = bytearray(item)
-                new_ba[22:38] = os.urandom(16)
+                new_ba[22:38] = uuid.uuid4().bytes
                 clip_02.items[i] = bytes(new_ba)
         
         b2628_02 = next(x for x in clip_02.items if isinstance(x, PTBlock) and x.content_type == 0x2628)
-        new_name_02 = (clip_name + "-02").encode('utf-8')
+        new_name_02 = new_clip_name_02.encode('utf-8')
         pl_02 = bytearray()
         pl_02.extend(struct.pack("<I", len(new_name_02)))
         pl_02.extend(new_name_02)
@@ -1002,7 +2408,6 @@ class ProToolsSession:
         pl_02.append((relative_cut_samples >> 16) & 0xFF)
         
         # 24-bit length
-        rem_length = orig_length - relative_cut_samples
         pl_02.append(rem_length & 0xFF)
         pl_02.append((rem_length >> 8) & 0xFF)
         pl_02.append((rem_length >> 16) & 0xFF)
@@ -1043,8 +2448,12 @@ class ProToolsSession:
         
         struct.pack_into("<I", count_ba, 0, old_count + 2)
         b262a.items[0] = count_ba
-        b262a.items.append(clip_01)
-        b262a.items.append(clip_02)
+        last_clip_position = max(
+            index for index, item in enumerate(b262a.items)
+            if isinstance(item, PTBlock) and item.content_type == 0x2629
+        )
+        b262a.items.insert(last_clip_position + 1, clip_01)
+        b262a.items.insert(last_clip_position + 2, clip_02)
         
         # 6. Update Timeline (0x1052)
         # Variables b1052, orig_1050, orig_1050_idx, and orig_abs_ts were found in step 3.
@@ -1063,16 +2472,19 @@ class ProToolsSession:
         # Create ev_02 as a deep copy with new clip ID and timestamp
         ev_02 = copy.deepcopy(orig_1050)
         self._wipe_offsets_recursive(ev_02)
-        p_02 = bytearray(ev_02.items[0].items[0])
+        ev_02_104f = next(
+            item for item in ev_02.items
+            if isinstance(item, PTBlock) and item.content_type == 0x104f
+        )
+        p_02 = bytearray(ev_02_104f.items[0])
         struct.pack_into("<I", p_02, 2, idx_02)
-        struct.pack_into("<q", p_02, 7, cut_abs_ts)
-        ev_02.items[0].items[0] = bytearray(p_02)
+        struct.pack_into("<Q", p_02, 7, cut_abs_ts)
+        ev_02_104f.items[0] = bytearray(p_02)
         
         # Mutate the original event IN PLACE to become ev_01.
         # CRITICAL: We must NOT pop() the original event, because its pointer
         # exists in the 0x0002 table. Removing it creates a dangling pointer
         # that causes "Magic ID does not match".
-        orig_104f = next(x for x in orig_1050.items if isinstance(x, PTBlock) and x.content_type == 0x104f)
         p_orig = bytearray(orig_104f.items[0])
         struct.pack_into("<I", p_orig, 2, idx_01)
         orig_104f.items[0] = bytearray(p_orig)
@@ -1091,56 +2503,78 @@ class ProToolsSession:
         return orig_clip_id, idx_01, idx_02, cut_abs_ts
         
     def add_crossfade(self, track_name, clip_name, cut_hh, cut_mm, cut_ss, cut_ff, fade_hh, fade_mm, fade_ss, fade_ff):
+        """Atomically split a clip and add a centered Equal Power crossfade."""
+        engine = TimecodeEngine(self.sample_rate, self.frame_rate_enum)
+        fade_samples = engine.duration_to_samples(
+            fade_hh, fade_mm, fade_ss, fade_ff
+        )
+        if fade_samples <= 0:
+            raise ValueError("Crossfade duration must be greater than zero.")
+        if fade_samples > 0xFFFF:
+            raise ValueError("Crossfade duration exceeds the 16-bit geometry limit.")
+
+        self._validated_fade_geometry_list()
+
+        # split_clip() necessarily performs several linked mutations. Keep the
+        # composite operation transactional so a late structural error cannot
+        # leave a half-split session in memory and later be saved accidentally.
+        original_root_items = copy.deepcopy(self.root_items)
+        original_removed_offsets = list(getattr(self, '_removed_offsets', []))
+        try:
+            return self._add_crossfade_impl(
+                track_name, clip_name,
+                cut_hh, cut_mm, cut_ss, cut_ff,
+                fade_hh, fade_mm, fade_ss, fade_ff,
+            )
+        except Exception:
+            self.root_items = original_root_items
+            self._removed_offsets = original_removed_offsets
+            raise
+
+    def _add_crossfade_impl(self, track_name, clip_name, cut_hh, cut_mm, cut_ss, cut_ff, fade_hh, fade_mm, fade_ss, fade_ff):
         """Splits a clip and injects a crossfade at the split point."""
         # 1. Split the clip
-        orig_clip_id, idx_01, idx_02, cut_abs_ts = self.split_clip(track_name, clip_name, cut_hh, cut_mm, cut_ss, cut_ff)
+        _, _, idx_02, cut_abs_ts = self.split_clip(
+            track_name, clip_name, cut_hh, cut_mm, cut_ss, cut_ff
+        )
         
         engine = TimecodeEngine(self.sample_rate, self.frame_rate_enum)
-        fade_samples = engine.timecode_to_samples(fade_hh, fade_mm, fade_ss, fade_ff)
+        fade_samples = engine.duration_to_samples(fade_hh, fade_mm, fade_ss, fade_ff)
         half_fade = fade_samples // 2
         
         # 2. Geometry (0x262f)
-        b2630 = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x2630), None)
+        b2630, geometries = self._validated_fade_geometry_list()
         count_ba = bytearray(b2630.items[0])
-        old_count = struct.unpack_from("<I", count_ba, 0)[0]
+        old_count = len(geometries)
         struct.pack_into("<I", count_ba, 0, old_count + 1)
         b2630.items[0] = count_ba
         
-        geom_pl = bytearray(36)
-        geom_pl[0:7] = b"\x00\x00\x00\x00\x00\x33\x00"
-        
-        # Write 24-bit pre-roll at offset 8 (3 bytes)
-        geom_pl[8] = half_fade & 0xFF
-        geom_pl[9] = (half_fade >> 8) & 0xFF
-        geom_pl[10] = (half_fade >> 16) & 0xFF
-        
-        # Write 24-bit duration at offset 11 (3 bytes)
-        geom_pl[11] = fade_samples & 0xFF
-        geom_pl[12] = (fade_samples >> 8) & 0xFF
-        geom_pl[13] = (fade_samples >> 16) & 0xFF
-        
-        geom_pl[14] = 0x01
-        geom_pl[15] = 0x01 # Standard Equal Power
+        # Native crossfade geometry is a fixed 34-byte payload. Both pre-roll
+        # and total duration are UInt16 LE, followed by the Equal Power flags.
+        geom_pl = bytearray(34)
+        geom_pl[5] = 0x22
+        struct.pack_into("<H", geom_pl, 8, half_fade)
+        struct.pack_into("<H", geom_pl, 10, fade_samples)
+        geom_pl[12] = 0x01
+        geom_pl[13] = 0x01
         
         new_262f = PTBlock(2, 0x262f, 0)
         new_262f.items = [bytes(geom_pl)]
         b2630.items.append(new_262f)
         
-        # 3. Fade Event (0x1050)
-        b1054 = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x1054), None)
-        b1052 = None
-        for track in [b for b in b1054.items if isinstance(b, PTBlock) and b.content_type == 0x1052]:
-            if len(track.items) > 0 and isinstance(track.items[0], (bytes, bytearray)):
-                hdr = track.items[0]
-                nlen = struct.unpack_from("<I", hdr, 0)[0]
-                if 4 + nlen <= len(hdr):
-                    tname = hdr[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
-                    if tname == track_name:
-                        b1052 = track
-                        break
-                        
-        if not b1052:
+        # 3. Fade Event (0x1050). Reuse the strict playlist validator so an
+        # invalid UTF-8 name or inconsistent count can never be ignored while
+        # resolving the target track.
+        matching_tracks = [
+            playlist
+            for playlist, name, _ in self._validated_main_playlists()
+            if name == track_name
+        ]
+        if not matching_tracks:
             raise ValueError(f"Track '{track_name}' not found.")
+        if len(matching_tracks) != 1:
+            raise ValueError(f"Track name '{track_name}' is ambiguous.")
+        b1052 = matching_tracks[0]
                         
         # Find insertion point (just before ev_02)
         ev_idx = -1
@@ -1153,12 +2587,28 @@ class ProToolsSession:
                     if cid == idx_02:
                         ev_idx = i
                         break
+
+        if ev_idx < 0:
+            raise ValueError("Could not locate the right-hand split event for the crossfade.")
                         
+        # Pro Tools marks both the fade and the right-hand audio event as
+        # linked at byte +33. The fade itself is active (mute byte +0 = 0).
+        right_104f = next(
+            item for item in b1052.items[ev_idx].items
+            if isinstance(item, PTBlock) and item.content_type == 0x104f
+        )
+        right_payload = bytearray(right_104f.items[0])
+        right_payload[33] = 0x01
+        right_104f.items[0] = right_payload
+
         p104f = bytearray(35)
-        p104f[0] = 0x01
-        struct.pack_into("<I", p104f, 2, orig_clip_id)  # Points to PARENT clip, not -01
+        p104f[0] = 0x00
+        # Fade events index 0x2630 geometries; old_count is the index of the
+        # geometry appended above. It is not an audio clip ID.
+        struct.pack_into("<I", p104f, 2, old_count)
         struct.pack_into("<q", p104f, 7, cut_abs_ts)
         p104f[15:35] = bytes.fromhex("01feff00000000ffffffffffffffff0000000000")
+        p104f[33] = 0x01
         
         new_104f = PTBlock(10, 0x104f, 0)  # block_type=10, NOT 3
         new_104f.items = [bytes(p104f)]
@@ -1177,45 +2627,129 @@ class ProToolsSession:
         b1052.items[0] = bytearray(hdr)
                 
     def add_fade(self, track_name, clip_name, target_hh, target_mm, target_ss, target_ff, fade_type="in", duration_hh=0, duration_mm=0, duration_ss=0, duration_ff=0, fade_shape="power"):
+        """Atomically add one standalone fade with a native geometry ID."""
+        original_root_items = copy.deepcopy(self.root_items)
+        original_removed_offsets = list(getattr(self, '_removed_offsets', []))
+        try:
+            return self._add_fade_impl(
+                track_name, clip_name,
+                target_hh, target_mm, target_ss, target_ff,
+                fade_type,
+                duration_hh, duration_mm, duration_ss, duration_ff,
+                fade_shape,
+            )
+        except Exception:
+            self.root_items = original_root_items
+            self._removed_offsets = original_removed_offsets
+            raise
+
+    def _add_fade_impl(self, track_name, clip_name, target_hh, target_mm, target_ss, target_ff, fade_type="in", duration_hh=0, duration_mm=0, duration_ss=0, duration_ff=0, fade_shape="power"):
+
+        if not isinstance(track_name, str) or not track_name:
+            raise ValueError("track_name must be a non-empty string.")
+        if not isinstance(clip_name, str) or not clip_name:
+            raise ValueError("clip_name must be a non-empty string.")
+        if not isinstance(fade_type, str):
+            raise TypeError("fade_type must be a string.")
+        if not isinstance(fade_shape, str):
+            raise TypeError("fade_shape must be a string.")
 
         # 1. Convert duration to samples
         engine = TimecodeEngine(self.sample_rate, self.frame_rate_enum)
-        fade_length_samples = engine.timecode_to_samples(duration_hh, duration_mm, duration_ss, duration_ff)
+        fade_length_samples = engine.duration_to_samples(duration_hh, duration_mm, duration_ss, duration_ff)
         if fade_length_samples <= 0:
             fade_length_samples = self.sample_rate
+        if fade_length_samples > 0xFFFF:
+            raise ValueError("Standalone fade length exceeds the 16-bit geometry limit.")
 
         fade_type = fade_type.lower()
         if fade_type not in ["in", "out"]:
             raise ValueError("fade_type must be 'in' or 'out'")
-            
-        shape_byte = 0x01 if fade_shape == "power" else 0x02
+
+        fade_shapes = {"power": 0x01, "linear": 0x02}
+        fade_shape = fade_shape.lower()
+        if fade_shape not in fade_shapes:
+            raise ValueError("fade_shape must be 'power' or 'linear'")
+        shape_byte = fade_shapes[fade_shape]
             
         target_samples = engine.timecode_to_samples(target_hh, target_mm, target_ss, target_ff)
 
-        # We no longer need to find the parent clip ID. 
-        # The ID in a fade event (bt=10) is ACTUALLY the index of the fade geometry in 0x2630!
-        b2630 = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x2630), None)
-        if not b2630: raise ValueError("No 0x2630")
-        
+        # 2. Resolve the parent clip ID and its duration.
+        clip_id = self._resolve_unique_clip_id(clip_name)
+        clip_roots = self._root_blocks(0x262a)
+        clip_definitions = [
+            item for item in clip_roots[0].items
+            if isinstance(item, PTBlock) and item.content_type == 0x2629
+        ]
+        clip_payload_block = next(
+            item for item in clip_definitions[clip_id].items
+            if isinstance(item, PTBlock) and item.content_type == 0x2628
+        )
+        clip_info = self._decode_audio_clip_payload(clip_payload_block.items[0])
+        clip_length = clip_info["length"]
+        if clip_length <= 0:
+            raise ValueError(f"Clip '{clip_name}' has no positive duration.")
+
+        # 3. Resolve the requested track and the exact clip instance at target.
+        matching_tracks = [
+            playlist for playlist, name, _ in self._validated_main_playlists()
+            if name == track_name
+        ]
+        if not matching_tracks:
+            raise ValueError(f"Track '{track_name}' not found")
+        if len(matching_tracks) != 1:
+            raise ValueError(f"Track name '{track_name}' is ambiguous in the session.")
+        b1052 = matching_tracks[0]
+
+        matching_instances = []
+        timeline_events = self._validated_main_timeline_events()
+        for playlist, event, _, payload in timeline_events:
+            if playlist is not b1052:
+                continue
+            if self._audio_timeline_event_kind(event, payload) != "audio":
+                continue
+            event_clip_id = struct.unpack_from("<I", payload, 2)[0]
+            if event_clip_id != clip_id:
+                continue
+            event_start = struct.unpack_from("<Q", payload, 7)[0]
+            event_end = event_start + clip_length
+            target_in_instance = (
+                event_start <= target_samples < event_end
+                if fade_type == "in"
+                else event_start < target_samples <= event_end
+            )
+            if target_in_instance:
+                matching_instances.append((event_start, event_end))
+
+        if not matching_instances:
+            raise ValueError(
+                f"No instance of clip '{clip_name}' on track '{track_name}' contains the requested fade target."
+            )
+        if len(matching_instances) > 1:
+            raise ValueError("Fade target is ambiguous across multiple clip instances.")
+
+        event_start, event_end = matching_instances[0]
+        if fade_type == "in" and target_samples + fade_length_samples > event_end:
+            raise ValueError("Fade In extends past the end of the clip instance.")
+        if fade_type == "out" and target_samples - fade_length_samples < event_start:
+            raise ValueError("Fade Out extends before the start of the clip instance.")
+
+        b2630, existing_geometries = self._validated_fade_geometry_list()
         count_ba = bytearray(b2630.items[0])
-        fade_geometry_id = struct.unpack_from("<I", count_ba, 0)[0] # This will be the new ID
+        geometry_count = len(existing_geometries)
+        _, _, existing_fade_bindings = self._validated_fade_geometry_bindings(
+            timeline_events
+        )
+        expected_geometry_lengths = (22,) if fade_type == "in" else (26, 27)
+        if any(
+            entry[0] is b1052
+            and struct.unpack_from("<Q", entry[3], 7)[0] == target_samples
+            and len(geometry.items[0]) in expected_geometry_lengths
+            for entry, _, geometry in existing_fade_bindings
+        ):
+            raise ValueError("A fade already exists for this clip at the target timecode.")
 
-        # 2. Find track and event on timeline
-        b1054 = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x1054), None)
-        b1052 = None
-        for b in b1054.get_all_blocks(0x1052):
-            if len(b.items) > 0 and isinstance(b.items[0], bytearray):
-                hdr = b.items[0]
-                nlen = struct.unpack_from("<I", hdr, 0)[0]
-                if 4 + nlen <= len(hdr):
-                    tname = hdr[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
-                    if tname == track_name:
-                        b1052 = b
-                        break
-
-        if not b1052: raise ValueError(f"Track '{track_name}' not found")
-
-        # 3. Build geometry (0x262f)
+        # 4. Build geometry (0x262f)
         if fade_type == "in":
             # 22-byte format
             fade_geom_payload = bytearray(bytes.fromhex("00000000002000000000030100000000000000000000"))
@@ -1224,13 +2758,14 @@ class ProToolsSession:
             fade_ts = target_samples
             insert_after = False
         else:
-            # Fade Out: 26-byte format discovered in Phase 10
-            fade_geom_payload = bytearray(bytes.fromhex("0000000000220000000000000202000000000000000000000000"))
-            # Length is repeated twice? offset 8 and offset 10 (16-bit each)
+            # Native Fade Out geometry is 27 bytes. The length is repeated at
+            # offsets +8 and +10, followed by mode 0x02 and the shape byte.
+            fade_geom_payload = bytearray(bytes.fromhex(
+                "000000000022000000000000020200000000000000000000000000"
+            ))
             length_bytes = struct.pack("<H", fade_length_samples & 0xFFFF)
             fade_geom_payload[8:10] = length_bytes
             fade_geom_payload[10:12] = length_bytes
-            # Note: offset 12 is flags (02), offset 13 is shape. In the hex it's 02 02. Let's patch offset 13.
             fade_geom_payload[13] = shape_byte
             fade_ts = target_samples
             insert_after = True
@@ -1239,15 +2774,13 @@ class ProToolsSession:
         new_262f.original_offset = -1
         new_262f.items = [fade_geom_payload]
 
-        struct.pack_into("<I", count_ba, 0, fade_geometry_id + 1)
-        b2630.items[0] = count_ba
-        b2630.items.append(new_262f)
-
-        # 4. Build fade event (0x1050)
+        # 5. Build fade event (0x1050)
         p104f = bytearray(35)
-        p104f[0] = 0x01
-        struct.pack_into("<I", p104f, 2, fade_geometry_id)  # THIS IS THE GEOMETRY ID, NOT CLIP ID!
-        struct.pack_into("<q", p104f, 7, fade_ts)
+        p104f[0] = 0x00
+        # Fade events index the global 0x2630 geometry list, not 0x262a.
+        new_geometry_id = geometry_count
+        struct.pack_into("<I", p104f, 2, new_geometry_id)
+        struct.pack_into("<Q", p104f, 7, fade_ts)
         p104f[15:35] = bytes.fromhex("01feff00000000ffffffffffffffff0000000000")
 
         new_104f = PTBlock(10, 0x104f, 0)
@@ -1289,134 +2822,277 @@ class ProToolsSession:
         struct.pack_into("<I", hdr, count_offset, old_count + 1)
         b1052.items[0] = bytearray(hdr)
 
-    def set_clip_gain(self, clip_name, float_gain_db):
-        
-        # Resolve the clip_id (0-based index of the 2629 block inside the 262a block)
-        b262a = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x262a), None)
-        if not b262a:
-            raise ValueError("No clips (0x262a) found in session.")
-            
-        target_b2628 = None
-        
-        for child in b262a.items:
-            if isinstance(child, PTBlock) and child.content_type == 0x2629:
-                b2628 = next((c for c in child.items if isinstance(c, PTBlock) and c.content_type == 0x2628), None)
-                if b2628:
-                    payload = getattr(b2628, 'items', [b""])[0]
-                    if isinstance(payload, (bytes, bytearray)) and len(payload) >= 4:
-                        nlen = struct.unpack_from("<I", payload, 0)[0]
-                        if 4 + nlen <= len(payload):
-                            name = payload[4:4+nlen].decode('utf-8', 'ignore').strip('\x00')
-                            if name == clip_name:
-                                target_b2628 = b2628
-                                break
-                                
-        if not target_b2628:
-            raise ValueError(f"Clip '{clip_name}' not found.")
-            
-        # Float resolution
-        if str(float_gain_db).lower() in ('-inf', '-infinity'):
-            val = struct.unpack('<f', bytes.fromhex('f41a91c3'))[0] # -290.21057
+        # Geometry order is independent of chronological event order. Each
+        # event carries its geometry index, so new geometries are appended.
+        geometry_positions = [
+            index for index, item in enumerate(b2630.items)
+            if isinstance(item, PTBlock) and item.content_type == 0x262f
+        ]
+        if geometry_positions:
+            geometry_insert_index = geometry_positions[-1] + 1
         else:
-            val = float(float_gain_db)
-            
-        # Build 30-byte payload for a SINGLE point
-        point_meta = bytes.fromhex("0146010016000000000001000000040000000000000000000000")
-        float_bytes = struct.pack('<f', val)
-        new_point = point_meta + float_bytes
-        
-        # Inject into root block 0x2637 (List of points)
-        b2637 = next((r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x2637), None)
-        if not b2637:
-            b2637 = PTBlock(1, 0x2637, 0)
-            b2637.items.append(bytearray(b'\x00\x00\x00\x00')) # default 0 points
-            self.root_items.append(b2637)
-            
+            geometry_insert_index = 1
+        b2630.items.insert(geometry_insert_index, new_262f)
+        struct.pack_into("<I", count_ba, 0, geometry_count + 1)
+        b2630.items[0] = count_ba
+
+        return new_geometry_id
+
+    def set_clip_gain(self, clip_name, float_gain_db):
+        """Set one uniquely identified clip's static gain without shared writes."""
+        negative_infinity_value = struct.unpack(
+            "<f", bytes.fromhex("f41a91c3")
+        )[0]
+        if isinstance(float_gain_db, bool):
+            raise TypeError("Clip Gain must be a real number or -inf.")
+        if isinstance(float_gain_db, str) and float_gain_db.lower() in (
+            "-inf", "-infinity"
+        ):
+            val = negative_infinity_value
+        else:
+            try:
+                val = float(float_gain_db)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise TypeError("Clip Gain must be a real number or -inf.") from exc
+            if val == -math.inf:
+                val = negative_infinity_value
+            elif not math.isfinite(val):
+                raise ValueError("Clip Gain must be finite or -inf.")
+        try:
+            float_bytes = struct.pack("<f", val)
+        except OverflowError as exc:
+            raise ValueError("Clip Gain exceeds the Float32 range.") from exc
+
+        target_clip_id = self._resolve_unique_clip_id(clip_name)
+        b262a = self._root_blocks(0x262a)[0]
+        definitions = [
+            child for child in b262a.items
+            if isinstance(child, PTBlock) and child.content_type == 0x2629
+        ]
+
+        clip_gain_entries = []
+        for clip_id, definition in enumerate(definitions):
+            b2628 = next(
+                child for child in definition.items
+                if isinstance(child, PTBlock) and child.content_type == 0x2628
+            )
+            payload = b2628.items[0]
+            if len(payload) < 6:
+                raise ValueError(
+                    f"Clip ID {clip_id} payload is too short for a Clip Gain index."
+                )
+            automation_index = struct.unpack_from("<i", payload, len(payload) - 6)[0]
+            clip_gain_entries.append((b2628, payload, automation_index))
+
+        roots_2637 = self._root_blocks(0x2637)
+        if not roots_2637:
+            raise ValueError("No Clip Gain dictionary (0x2637) found in session.")
+        if len(roots_2637) != 1:
+            raise ValueError("Ambiguous session: multiple root 0x2637 Clip Gain dictionaries.")
+        b2637 = roots_2637[0]
+        if (
+            len(b2637.items) != 1
+            or not isinstance(b2637.items[0], (bytes, bytearray))
+            or len(b2637.items[0]) < 4
+        ):
+            raise ValueError("Invalid 0x2637 Clip Gain payload.")
+
         current_payload = bytearray(b2637.items[0])
         num_points = struct.unpack_from("<I", current_payload, 0)[0]
-        
-        automation_index = num_points
-        
-        current_payload.extend(new_point)
-        struct.pack_into("<I", current_payload, 0, num_points + 1)
-        
+        expected_length = 4 + (num_points * 30)
+        if len(current_payload) != expected_length:
+            raise ValueError(
+                f"Inconsistent 0x2637 point count: declared={num_points}, payload_length={len(current_payload)}."
+            )
+
+        for clip_id, (_, _, automation_index) in enumerate(clip_gain_entries):
+            if automation_index != -1 and not 0 <= automation_index < num_points:
+                raise ValueError(
+                    f"Clip ID {clip_id} references invalid Clip Gain index "
+                    f"{automation_index}."
+                )
+
+        target_b2628, target_payload, automation_index = clip_gain_entries[
+            target_clip_id
+        ]
+        clip_payload = bytearray(target_payload)
+
+        if automation_index == -1:
+            point_meta = bytes.fromhex("0146010016000000000001000000040000000000000000000000")
+            if num_points > 0x7FFFFFFF:
+                raise OverflowError("Clip Gain point index exceeds signed Int32.")
+            automation_index = num_points
+            current_payload.extend(point_meta + float_bytes)
+            struct.pack_into("<I", current_payload, 0, num_points + 1)
+            struct.pack_into("<i", clip_payload, len(clip_payload) - 6, automation_index)
+        elif sum(
+            index == automation_index for _, _, index in clip_gain_entries
+        ) > 1:
+            # Different clip definitions must not change together merely because
+            # they share one global point index. Clone the complete 30-byte point
+            # and relink only the requested clip.
+            if num_points > 0x7FFFFFFF:
+                raise OverflowError("Clip Gain point index exceeds signed Int32.")
+            point_offset = 4 + (automation_index * 30)
+            cloned_point = bytearray(current_payload[point_offset:point_offset + 30])
+            cloned_point[26:30] = float_bytes
+            automation_index = num_points
+            current_payload.extend(cloned_point)
+            struct.pack_into("<I", current_payload, 0, num_points + 1)
+            struct.pack_into("<i", clip_payload, len(clip_payload) - 6, automation_index)
+        else:
+            value_offset = 4 + (automation_index * 30) + 26
+            current_payload[value_offset:value_offset + 4] = float_bytes
+
         b2637.items[0] = current_payload
-            
-        # Now, flip the switch! 
-        # The 2628 block links the clip to its automation curve via the index.
-        # The index is ALWAYS stored as a signed 32-bit int at the very end of the 2628 payload (offset -6 from end).
-        # -1 (0xffffffff) means no clip gain.
-        clip_payload = bytearray(target_b2628.items[0])
-        struct.pack_into('<i', clip_payload, len(clip_payload)-6, automation_index)
         target_b2628.items[0] = clip_payload
-            
-        print(f"Applied Clip Gain of {val} dB to clip '{clip_name}'. Mapped to automation index {automation_index}.")
+
+        logger.info(
+            "Applied Clip Gain of %s dB to clip %r; automation index %d.",
+            val, clip_name, automation_index,
+        )
+        return automation_index
 
     def add_volume_node(self, track_name, hh, mm, ss, ff, db_value):
+        if not isinstance(track_name, str):
+            raise TypeError("track_name must be a string.")
+        if not track_name:
+            raise ValueError("track_name must be non-empty.")
+        if "\x00" in track_name:
+            raise ValueError("track_name cannot contain a NUL character.")
+
         engine = TimecodeEngine(self.sample_rate, self.frame_rate_enum)
         target_samples = engine.timecode_to_samples(hh, mm, ss, ff)
+        if target_samples < 0 or target_samples > 0xFFFFFFFF:
+            raise ValueError("Volume automation timestamp exceeds UInt32.")
 
-        target_val = int(round(db_value * 10))
-        # Ensure it fits in signed 16-bit
-        target_val = max(-32768, min(32767, target_val))
+        if isinstance(db_value, bool):
+            raise TypeError("Volume automation value must be a real number.")
+        try:
+            db_value = float(db_value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise TypeError("Volume automation value must be a real number.") from exc
+        if not math.isfinite(db_value):
+            raise ValueError("Volume automation value must be finite.")
+        scaled_db_value = db_value * 10
+        if not math.isfinite(scaled_db_value):
+            raise ValueError("Volume automation value exceeds signed Int16 deci-dB.")
+        target_val = int(round(scaled_db_value))
+        if target_val < -32768 or target_val > 32767:
+            raise ValueError("Volume automation value exceeds signed Int16 deci-dB.")
 
         all_261c = []
-        for r in self.root_items:
+        for r in self._content_root_items():
             all_261c.extend(r.get_all_blocks(0x261c) if isinstance(r, PTBlock) else [])
 
-        found_260a = None
+        internal_names = []
         for b261c in all_261c:
-            # Check track name in 0x2619
             b2619s = b261c.get_all_blocks(0x2619)
-            matched = False
-            for b2619 in b2619s:
-                if len(b2619.items) > 0 and isinstance(b2619.items[0], bytearray):
-                    payload = b2619.items[0]
-                    if len(payload) >= 4:
-                        name_len = struct.unpack_from("<I", payload, 0)[0]
-                        if 4 + name_len <= len(payload):
-                            try:
-                                name = payload[4:4+name_len].decode('utf-8', 'ignore').strip('\x00')
-                                if name == track_name:
-                                    matched = True
-                                    break
-                            except (UnicodeDecodeError, struct.error):
-                                pass
+            if len(b2619s) != 1:
+                raise ValueError("Each 0x261c track definition must contain one 0x2619 name.")
+            b2619 = b2619s[0]
+            if (
+                not b2619.items
+                or not isinstance(b2619.items[0], (bytes, bytearray))
+                or len(b2619.items[0]) < 4
+            ):
+                raise ValueError("Invalid 0x2619 track-name payload.")
+            payload = b2619.items[0]
+            name_len = struct.unpack_from("<I", payload, 0)[0]
+            if 4 + name_len > len(payload):
+                raise ValueError("Invalid 0x2619 track-name length.")
+            try:
+                internal_name = payload[4:4 + name_len].decode("utf-8").rstrip("\x00")
+            except UnicodeDecodeError as exc:
+                raise ValueError("Invalid UTF-8 0x2619 track name.") from exc
+            internal_names.append(internal_name)
 
-            if matched:
-                # We found the track! Find 0x260d
-                b260ds = b261c.get_all_blocks(0x260d)
-                if b260ds:
-                    # Inside 0x260d, the FIRST 0x260a is Volume automation.
-                    # Be careful: we must iterate directly on the block tree to find the first 260a
-                    # because find_blocks traverses everything and order is preserved.
-                    all_260a = b260ds[0].get_all_blocks(0x260a)
-                    if all_260a:
-                        found_260a = all_260a[0]
-                        break
+        # The public name is the 0x1052 timeline name. It must take precedence
+        # over stale 0x2619 names retained after track renames.
+        visible_playlists = self._validated_main_playlists()
+        visible_names = [name for _, name, _ in visible_playlists]
+        matching_visible = [
+            index for index, name in enumerate(visible_names)
+            if name == track_name
+        ]
+        if len(matching_visible) > 1:
+            raise ValueError(f"Visible track name '{track_name}' is ambiguous.")
+        if matching_visible:
+            if len(visible_names) != len(all_261c):
+                raise ValueError(
+                    "Cannot safely associate visible tracks with 0x261c definitions by ordinal."
+                )
+            target_261c = all_261c[matching_visible[0]]
+        else:
+            matching_internal = [
+                index for index, name in enumerate(internal_names)
+                if name == track_name
+            ]
+            if len(matching_internal) > 1:
+                raise ValueError(
+                    f"Track name '{track_name}' is ambiguous in 0x2619 definitions."
+                )
+            target_261c = (
+                all_261c[matching_internal[0]] if matching_internal else None
+            )
 
-        if found_260a is None:
+        if target_261c is None:
             raise ValueError(f"Track '{track_name}' or its volume automation block not found.")
 
+        b260ds = target_261c.get_all_blocks(0x260d)
+        if len(b260ds) != 1:
+            raise ValueError("A track must contain one unambiguous 0x260d container.")
+        direct_260a = [
+            child for child in b260ds[0].items
+            if isinstance(child, PTBlock) and child.content_type == 0x260a
+        ]
+        if not direct_260a:
+            raise ValueError(f"Track '{track_name}' has no direct volume 0x260a playlist.")
+        found_260a = direct_260a[0]
+
         # Parse existing 260a payload
-        if len(found_260a.items) == 0 or not isinstance(found_260a.items[0], bytearray):
+        if len(found_260a.items) != 1 or not isinstance(found_260a.items[0], (bytes, bytearray)):
             raise ValueError("Invalid 260a payload format.")
 
         payload = found_260a.items[0]
-        if len(payload) < 22:
+        if len(payload) < 24:
             raise ValueError("260a payload too short.")
 
         magic = payload[0:4]
+        if magic != b"\x01\x46\x01\x00":
+            raise ValueError("Invalid 0x260a volume automation identifier.")
+        declared_payload_size = struct.unpack_from("<I", payload, 4)[0]
+        if declared_payload_size != len(payload) - 10:
+            raise ValueError(
+                "Inconsistent 0x260a payload size: "
+                f"declared={declared_payload_size}, actual={len(payload) - 10}."
+            )
+        if payload[8:10] != b"\x00\x00" or payload[-2:] != b"\x00\x00":
+            raise ValueError("Invalid 0x260a fixed padding or terminator.")
         n_nodes = struct.unpack_from("<I", payload, 10)[0]
         flags = bytearray(payload[14:22])
+        expected_length = 24 + (n_nodes * 6)
+        if len(payload) != expected_length:
+            raise ValueError(
+                f"Inconsistent 0x260a node count: declared={n_nodes}, "
+                f"payload_length={len(payload)}."
+            )
+        declared_segments = struct.unpack_from("<I", flags, 2)[0]
+        expected_segments = max(0, n_nodes - 1)
+        if declared_segments != expected_segments:
+            raise ValueError(
+                f"Inconsistent 0x260a segment count: declared={declared_segments}, "
+                f"expected={expected_segments}."
+            )
 
         nodes = []
         for i in range(n_nodes):
             offset = 22 + (i * 6)
-            if offset + 6 <= len(payload):
-                ts = struct.unpack_from("<I", payload, offset)[0]
-                val = struct.unpack_from("<h", payload, offset + 4)[0]
-                nodes.append((ts, val))
+            ts = struct.unpack_from("<I", payload, offset)[0]
+            val = struct.unpack_from("<h", payload, offset + 4)[0]
+            if nodes and ts <= nodes[-1][0]:
+                raise ValueError("0x260a volume nodes must have unique increasing timestamps.")
+            nodes.append((ts, val))
 
         # Insert new node or update existing
         nodes = [n for n in nodes if n[0] != target_samples] # Remove if exact ts exists
@@ -1453,23 +3129,46 @@ class ProToolsSession:
             for child in node.items:
                 self._wipe_offsets_recursive(child)
 
-    def wipe_all_offsets(self):
-        """Set original_offset=-1 on every PTBlock in the session tree.
-        Call this before save() whenever blocks are added or removed, so the
-        pointer rebuilder generates a clean mapping without stale addresses."""
-        def _wipe(node):
-            if isinstance(node, PTBlock):
-                node.original_offset = -1
-                for child in node.items:
-                    _wipe(child)
+    def _refresh_original_offsets(self):
+        """Replace every block's load-time offset with its current offset.
+
+        The 0x0002 payload is patched in place during save().  Keeping the
+        offsets from the initially loaded file after that patch makes a later
+        save unable to match the already-updated pointers.  Refreshing the
+        tree only after a successful write keeps subsequent edits and saves
+        anchored to the file layout represented by the current 0x0002 table.
+        """
+        fmt_size = ">I" if self.is_bigendian else "<I"
+
+        def _refresh_block(block, base_offset):
+            block_bytes, _ = block.to_bytes(self.is_bigendian, base_offset)
+            block.original_offset = base_offset
+
+            block_size = struct.unpack_from(fmt_size, block_bytes, 3)[0]
+            current_offset = base_offset + (7 if block_size == 0 else 9)
+
+            for child in block.items:
+                if isinstance(child, PTBlock):
+                    child_size = _refresh_block(child, current_offset)
+                    current_offset += child_size
+                else:
+                    current_offset += len(child)
+
+            return len(block_bytes)
+
+        current_offset = 0x14
         for item in self.root_items:
-            _wipe(item)
+            if isinstance(item, PTBlock):
+                current_offset += _refresh_block(item, current_offset)
+            else:
+                current_offset += len(item)
 
     def _decode_0002_records(self, payload):
         """
         Parse the structured records inside block 0x0002.
         Each record has an 8-byte prefix (00 00 00 01 04 00 01 00) followed by
-        a 32-bit LE pointer to a block's absolute offset in the file.
+        a 32-bit LE pointer to a block's absolute offset in the file and a
+        3-byte zero suffix. The complete record is exactly 15 bytes.
         Returns a list of (prefix_start, pointer_offset_in_payload) tuples.
         """
         PREFIX = bytes.fromhex("0000000104000100")
@@ -1483,6 +3182,57 @@ class ProToolsSession:
             records.append((idx, ptr_pos))
             pos = idx + 1
         return records
+
+    def _validate_0002_record_layout(self, payload):
+        """Validate every standard record and its preceding big-endian count."""
+        records = self._decode_0002_records(payload)
+        record_size = 15
+        starts = [start for start, _ in records]
+
+        for start, pointer_position in records:
+            record_end = start + record_size
+            if (
+                record_end > len(payload)
+                or payload[pointer_position + 4:record_end] != b"\x00\x00\x00"
+            ):
+                raise ValueError("Invalid standard 0x0002 pointer record.")
+
+        index = 0
+        while index < len(starts):
+            run_start = starts[index]
+            run_length = 1
+            while (
+                index + run_length < len(starts)
+                and starts[index + run_length]
+                == run_start + run_length * record_size
+            ):
+                run_length += 1
+
+            count_position = run_start - 2
+            if count_position < 0:
+                raise ValueError("Missing 0x0002 pointer-run counter.")
+            declared_count = struct.unpack_from(">H", payload, count_position)[0]
+            if declared_count != run_length:
+                raise ValueError(
+                    "Inconsistent 0x0002 pointer-run count: "
+                    f"declared={declared_count}, actual={run_length}."
+                )
+            index += run_length
+
+        return records
+
+    @staticmethod
+    def _raw_0002_payload(b0002):
+        """Return the flat pointer-table payload without dropping valid bytes."""
+        if not isinstance(b0002, PTBlock) or b0002.content_type != 0x0002:
+            raise ValueError("Expected a root 0x0002 pointer table.")
+
+        payload = bytearray()
+        for item in b0002.items:
+            if not isinstance(item, (bytes, bytearray)):
+                raise ValueError("The root 0x0002 table must contain only raw bytes.")
+            payload.extend(item)
+        return payload
 
     def _purge_0002_records(self, b0002, removed_offsets, is_bigendian):
         """
@@ -1498,20 +3248,7 @@ class ProToolsSession:
         if not removed_offsets:
             return 0
         fmt = ">I" if is_bigendian else "<I"
-        fmt_type = ">H" if is_bigendian else "<H"
-        fmt_size = ">I" if is_bigendian else "<I"
-
-        # Reassemble the full original payload, same approach as
-        # _rebuild_0002: phantom zero-size PTBlocks get serialized back to
-        # their original 7 raw bytes first.
-        payload = bytearray()
-        for item in b0002.items:
-            if isinstance(item, bytearray):
-                payload.extend(item)
-            elif isinstance(item, PTBlock):
-                payload.append(0x5a)
-                payload.extend(struct.pack(fmt_type, item.block_type))
-                payload.extend(struct.pack(fmt_size, 0))
+        payload = self._raw_0002_payload(b0002)
 
         records = self._decode_0002_records(payload)
         if not records:
@@ -1520,73 +3257,100 @@ class ProToolsSession:
 
         removed_set = set(removed_offsets)
 
-        # Each record's span runs from its own prefix start up to the next
-        # record's prefix start (metadata length is variable per spec, so
-        # we can't assume a fixed record size).
-        spans = []
-        for i, (prefix_start, ptr_pos) in enumerate(records):
-            end = records[i + 1][0] if i + 1 < len(records) else len(payload)
-            spans.append((prefix_start, end, ptr_pos))
-
-        new_payload = bytearray()
+        # A pointer record is exactly 15 bytes. Bytes between records belong
+        # to independent metadata and must not be removed with the preceding
+        # record. Pro Tools' grouped/ungrouped files differ by exactly 15 bytes
+        # for each removed pointer.
+        record_size = 15
+        spans_to_remove = []
+        removals_by_run = {}
         purged = 0
-        last_end = 0
-        for (start, end, ptr_pos) in spans:
-            new_payload.extend(payload[last_end:start])
-            if ptr_pos + 4 <= len(payload):
-                ptr_val = struct.unpack_from(fmt, payload, ptr_pos)[0]
-            else:
-                ptr_val = None
-            if ptr_val is not None and ptr_val in removed_set:
-                purged += 1  # drop this record's bytes entirely
-            else:
-                new_payload.extend(payload[start:end])
-            last_end = end
-        new_payload.extend(payload[last_end:])
+        record_starts = [start for start, _ in records]
+        record_start_set = set(record_starts)
+        for start, ptr_pos in records:
+            if ptr_pos + 4 > len(payload):
+                continue
+            ptr_val = struct.unpack_from(fmt, payload, ptr_pos)[0]
+            if ptr_val not in removed_set:
+                continue
+            end = start + record_size
+            if end > len(payload) or payload[ptr_pos + 4:end] != b"\x00\x00\x00":
+                raise ValueError("Invalid 15-byte 0x0002 pointer record.")
+            spans_to_remove.append((start, end))
+            run_start = start
+            while run_start - record_size in record_start_set:
+                run_start -= record_size
+            removals_by_run[run_start] = removals_by_run.get(run_start, 0) + 1
+            purged += 1
 
-        b0002.items = [new_payload]
+        # Each consecutive run of records is preceded by its UInt16 BE count.
+        # Removing records without updating this count makes Pro Tools consume
+        # the following metadata as records and fail with "End of stream".
+        for run_start, removed_count in removals_by_run.items():
+            run_length = 1
+            while run_start + run_length * record_size in record_start_set:
+                run_length += 1
+            count_pos = run_start - 2
+            if count_pos < 0:
+                raise ValueError("Missing 0x0002 pointer-run counter.")
+            declared_count = struct.unpack_from(">H", payload, count_pos)[0]
+            if declared_count != run_length or removed_count > declared_count:
+                raise ValueError(
+                    "Inconsistent 0x0002 pointer-run count: "
+                    f"declared={declared_count}, actual={run_length}."
+                )
+            struct.pack_into(">H", payload, count_pos, declared_count - removed_count)
+
+        for start, end in reversed(spans_to_remove):
+            del payload[start:end]
+
+        b0002.items = [payload]
         return purged
 
     def _rebuild_0002(self, b0002, global_mapping, is_bigendian):
         """
-        Rebuild the 0x0002 block payload by patching only the 32-bit pointers
-        at their known structural positions. Never touches any other byte.
+        Relocate every 32-bit block offset stored in the 0x0002 payload.
 
-        Important: the parser may split 0x0002's payload into alternating
-        bytearrays and zero-size phantom PTBlocks (when it encounters 0x5a bytes
-        inside the raw payload that happen to parse as valid zero-size blocks).
-        We must reassemble the FULL original byte sequence before patching, then
-        replace b0002.items with a single bytearray so to_bytes() serializes it
-        correctly without duplication.
+        Besides the standard 15-byte pointer records, 0x0002 metadata contains
+        additional absolute block offsets. All occurrences whose old value is
+        an actual PTBlock offset in global_mapping must move with that block.
+
+        The parser deliberately keeps this payload flat. Reassemble every raw
+        bytes/bytearray segment before patching, then normalize it to one
+        bytearray so no valid immutable segment can be dropped.
         """
         fmt = ">I" if is_bigendian else "<I"
-        fmt_type = ">H" if is_bigendian else "<H"
-        fmt_size = ">I" if is_bigendian else "<I"
+        payload = self._raw_0002_payload(b0002)
 
-        # Reassemble the full original payload, including bytes occupied by
-        # phantom zero-size PTBlock children (serialized back to their 7 raw bytes).
-        payload = bytearray()
-        for item in b0002.items:
-            if isinstance(item, bytearray):
-                payload.extend(item)
-            elif isinstance(item, PTBlock):
-                # Zero-size phantom block: serialize back to its original 7 bytes.
-                # These are 0x5a bytes in the raw data that the parser consumed.
-                payload.append(0x5a)
-                payload.extend(struct.pack(fmt_type, item.block_type))
-                payload.extend(struct.pack(fmt_size, 0))  # size = 0, no content_type
+        original_payload = bytes(payload)
+        records = self._decode_0002_records(original_payload)
+        pointer_positions = {ptr_pos for _, ptr_pos in records}
+        record_coverage = bytearray(len(original_payload))
+        for start, _ in records:
+            end = min(start + 15, len(record_coverage))
+            record_coverage[start:end] = b"\x01" * (end - start)
 
-        records = self._decode_0002_records(payload)
-
-        patched_count = 0
-        for (prefix_start, ptr_pos) in records:
-            if ptr_pos + 4 > len(payload):
+        patches = []
+        for pos in range(0, len(original_payload) - 3):
+            # Metadata offsets may appear at any byte alignment, but a scan
+            # must never interpret bytes crossing a standard record boundary
+            # as a pointer. Inside a record, only its real +8 field is valid.
+            overlaps_record = any(record_coverage[pos:pos + 4])
+            if overlaps_record and pos not in pointer_positions:
                 continue
-            old_ptr = struct.unpack_from(fmt, payload, ptr_pos)[0]
-            if old_ptr in global_mapping and global_mapping[old_ptr] != old_ptr:
-                new_ptr = global_mapping[old_ptr]
-                struct.pack_into(fmt, payload, ptr_pos, new_ptr)
-                patched_count += 1
+            old_ptr = struct.unpack_from(fmt, original_payload, pos)[0]
+            new_ptr = global_mapping.get(old_ptr)
+            if new_ptr is not None and new_ptr != old_ptr:
+                patches.append((pos, new_ptr))
+
+        for previous, current in zip(patches, patches[1:]):
+            if current[0] < previous[0] + 4:
+                raise ValueError("Overlapping 0x0002 pointer relocations.")
+
+        for pos, new_ptr in patches:
+            struct.pack_into(fmt, payload, pos, new_ptr)
+
+        patched_count = len(patches)
 
         # Replace all items with a single bytearray so to_bytes() does not
         # re-expand the phantom blocks a second time.
@@ -1594,64 +3358,131 @@ class ProToolsSession:
 
         return patched_count
 
+    def _validate_save_structure(self):
+        """Return the unique final pointer table after validating save invariants."""
+        if not self.root_items or not isinstance(self.root_items[0], PTBlock):
+            raise ValueError("Missing initial 0x0001 pointer block before save.")
+
+        pointer_block = self.root_items[0]
+        pointer_bytes, _ = pointer_block.to_bytes(self.is_bigendian, 0x14)
+        fmt_type = ">H" if self.is_bigendian else "<H"
+        fmt_size = ">I" if self.is_bigendian else "<I"
+        if (
+            len(pointer_bytes) != 11
+            or pointer_bytes[0] != ZMARK
+            or struct.unpack_from(fmt_type, pointer_bytes, 1)[0] != 0x0001
+            or struct.unpack_from(fmt_size, pointer_bytes, 3)[0] != 4
+        ):
+            raise ValueError("Invalid initial 0x0001 pointer block before save.")
+
+        pointer_tables = self._root_blocks(0x0002)
+        if len(pointer_tables) != 1:
+            raise ValueError("A unique root 0x0002 pointer table is required before save.")
+        pointer_table = pointer_tables[0]
+        if self.root_items[-1] is not pointer_table:
+            raise ValueError("The 0x0002 pointer table must be the final root block before save.")
+        if pointer_table.original_size == 0 and not pointer_table.items:
+            raise ValueError("The root 0x0002 pointer table cannot serialize as an empty block.")
+        if any(not isinstance(item, (bytes, bytearray)) for item in pointer_table.items):
+            raise ValueError("Invalid nested block inside root 0x0002 table before save.")
+        self._validate_0002_record_layout(
+            self._raw_0002_payload(pointer_table)
+        )
+
+        # Keep the public timing attributes synchronized with the exact tree
+        # being serialized and reject incomplete metadata before writing.
+        self._parse_session_metadata()
+        return pointer_table, len(self.root_items) - 1
+
+    def _iter_serialized_root_items(self):
+        """Yield each root item as bytes plus its unique-offset mapping."""
+        current_offset = 0x14
+        for item in self.root_items:
+            if isinstance(item, (bytes, bytearray)):
+                block_bytes = bytearray(item)
+                mapping = {}
+            elif isinstance(item, PTBlock):
+                block_bytes, mapping = item.to_bytes(
+                    self.is_bigendian, current_offset
+                )
+                block_bytes = bytearray(block_bytes)
+            else:
+                raise TypeError(
+                    "Session root items must be bytes, bytearray, or PTBlock."
+                )
+            yield block_bytes, mapping
+            current_offset += len(block_bytes)
+
     def save(self, out_path):
+        """Atomically serialize the session and restore memory on failure."""
+        out_path = _coerce_string_path(out_path, "out_path")
+
+        original_root_items = copy.deepcopy(self.root_items)
+        original_removed_offsets = list(getattr(self, '_removed_offsets', []))
+        original_file_path = getattr(self, 'file_path', None)
+        try:
+            return self._save_impl(out_path)
+        except Exception:
+            self.root_items = original_root_items
+            self._removed_offsets = original_removed_offsets
+            if original_file_path is not None:
+                self.file_path = original_file_path
+            raise
+
+    def _save_impl(self, out_path):
 
         # Pass 1: Compute new absolute offsets for every block.
         # to_bytes() builds a mapping of {old_original_offset -> new_computed_offset}
         # for every block that has original_offset > 0.
         global_mapping = {}
-        current_offset = 0x14
-        for item in self.root_items:
-            if isinstance(item, bytearray):
-                current_offset += len(item)
-            else:
-                block_bytes, mapping = item.to_bytes(self.is_bigendian, current_offset)
-                global_mapping.update(mapping)
-                current_offset += len(block_bytes)
+        for _, mapping in self._iter_serialized_root_items():
+            _merge_unique_offset_mapping(global_mapping, mapping)
+
+        b0002, block_0002_idx = self._validate_save_structure()
 
         # Pass 2: Rebuild the 0x0002 pointer table using the computed mapping.
         # This is the ONLY place we modify pointers — targeted and safe.
-        b0002 = next(
-            (r for r in self.root_items if isinstance(r, PTBlock) and r.content_type == 0x0002),
-            None
-        )
-        if b0002:
-            removed = getattr(self, '_removed_offsets', [])
-            if removed:
-                purged = self._purge_0002_records(b0002, removed, self.is_bigendian)
-                if purged:
-                    print(f"Purged {purged} stale 0x0002 record(s) for deleted block(s).")
-                self._removed_offsets = []
-            self._rebuild_0002(b0002, global_mapping, self.is_bigendian)
+        removed = getattr(self, '_removed_offsets', [])
+        if removed:
+            purged = self._purge_0002_records(b0002, removed, self.is_bigendian)
+            if purged:
+                logger.info(
+                    "Purged %d stale 0x0002 record(s) for deleted block(s).",
+                    purged,
+                )
+        self._rebuild_0002(b0002, global_mapping, self.is_bigendian)
 
         # Pass 3: Fix the 0x0001 block's pointer to 0x0002.
-        # The 0x0001 block's payload (bytes 7-10 relative to ZMARK) is a 32-bit
-        # absolute offset pointing to the 0x0002 block.
-        block_0002_idx = next(
-            (i for i, r in enumerate(self.root_items)
-             if isinstance(r, PTBlock) and r.content_type == 0x0002),
-            -1
-        )
-
+        # 0x0001 is a special 11-byte block: unlike normal non-empty blocks it
+        # has no content_type field. Its four bytes after the 7-byte header are
+        # directly the absolute pointer to 0x0002.
         # Pass 4: Final serialization — build the output binary
-        out_blocks = []
-        current_offset = 0x14
-        for item in self.root_items:
-            if isinstance(item, bytearray):
-                out_blocks.append(item)
-                current_offset += len(item)
-            else:
-                block_bytes, _ = item.to_bytes(self.is_bigendian, current_offset)
-                out_blocks.append(bytearray(block_bytes))
-                current_offset += len(block_bytes)
+        out_blocks = [
+            block_bytes
+            for block_bytes, _ in self._iter_serialized_root_items()
+        ]
 
         # Patch 0x0001 -> 0x0002 pointer after we know the exact offset of 0x0002
-        if block_0002_idx != -1:
-            new_0002_offset = 0x14 + sum(len(b) for b in out_blocks[:block_0002_idx])
-            # The first block is 0x0001; its pointer is at bytes [7:11] of the serialized block
-            fmt_ptr = ">I" if self.is_bigendian else "<I"
-            first_block = out_blocks[0]
-            first_block[7:11] = struct.pack(fmt_ptr, new_0002_offset)
+        new_0002_offset = 0x14 + sum(len(b) for b in out_blocks[:block_0002_idx])
+        fmt_ptr = ">I" if self.is_bigendian else "<I"
+        fmt_type = ">H" if self.is_bigendian else "<H"
+        first_block = out_blocks[0]
+        if (
+            len(first_block) < 11
+            or first_block[0] != ZMARK
+            or struct.unpack_from(fmt_type, first_block, 1)[0] != 0x0001
+            or struct.unpack_from(fmt_ptr, first_block, 3)[0] != 4
+        ):
+            raise ValueError("Invalid or missing special 0x0001 pointer block.")
+        pointer_bytes = struct.pack(fmt_ptr, new_0002_offset)
+        first_block[7:11] = pointer_bytes
+
+        # The parser represents the special pointer's first two bytes in the
+        # content_type field and its remaining two bytes as raw payload. Keep
+        # that in-memory representation synchronized with the patched output.
+        pointer_block = self.root_items[0]
+        pointer_block.content_type = struct.unpack_from(fmt_type, pointer_bytes, 0)[0]
+        pointer_block.items = [bytearray(pointer_bytes[2:])]
 
         # Assemble and write
         out_data = bytearray()
@@ -1659,9 +3490,252 @@ class ProToolsSession:
         for block_bytes in out_blocks:
             out_data.extend(block_bytes)
 
-        print(f"Re-encrypting and saving to {out_path}...")
-        xor_session(out_data, out_path)
-        print("Done!")
+        import tempfile
+
+        destination = os.path.abspath(out_path)
+        destination_dir = os.path.dirname(destination)
+        if not os.path.isdir(destination_dir):
+            raise FileNotFoundError(
+                f"Output directory does not exist: {destination_dir}"
+            )
+
+        temp_path = None
+        logger.info("Re-encrypting and saving to %s...", destination)
+        try:
+            descriptor, temp_path = tempfile.mkstemp(
+                prefix=f".{os.path.basename(destination)}.",
+                suffix=".tmp",
+                dir=destination_dir,
+            )
+            os.close(descriptor)
+            xor_session(out_data, temp_path)
+
+            # Complete all in-memory work before the atomic replacement. If
+            # refreshing fails, the destination still contains its old bytes.
+            self._refresh_original_offsets()
+            self._removed_offsets = []
+            os.replace(temp_path, destination)
+            temp_path = None
+            self.data = out_data
+            self.file_path = destination
+        finally:
+            if temp_path is not None:
+                try:
+                    os.remove(temp_path)
+                except FileNotFoundError:
+                    pass
+
+    def create_subclip(self, orig_clip_id, new_name, src_offset, length):
+        """Create one validated 24-bit virtual clip definition."""
+        import uuid
+
+        if isinstance(orig_clip_id, bool) or not isinstance(orig_clip_id, int):
+            raise TypeError("orig_clip_id must be an integer.")
+        if not isinstance(new_name, str) or not new_name:
+            raise ValueError("new_name must be a non-empty string.")
+        if "\x00" in new_name:
+            raise ValueError("new_name cannot contain a NUL character.")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in (src_offset, length)
+        ):
+            raise TypeError("Sub-clip source offset and length must be integers.")
+        if src_offset < 0 or length <= 0:
+            raise ValueError("Sub-clip source offset must be >= 0 and length must be > 0.")
+        if src_offset > 0x00FFFFFF or length > 0x00FFFFFF:
+            raise ValueError("Trimmed sub-clips are limited to 24-bit values.")
+
+        clip_roots = self._root_blocks(0x262a)
+        if len(clip_roots) != 1:
+            raise ValueError("A unique root 0x262a clip list is required.")
+        b262a = clip_roots[0]
+        if not b262a.items or not isinstance(b262a.items[0], (bytes, bytearray)) or len(b262a.items[0]) < 4:
+            raise ValueError("Invalid 0x262a clip counter payload.")
+
+        clips = [
+            item for item in b262a.items
+            if isinstance(item, PTBlock) and item.content_type == 0x2629
+        ]
+
+        count_payload = bytearray(b262a.items[0])
+        declared_count = struct.unpack_from("<I", count_payload, 0)[0]
+        if declared_count != len(clips):
+            raise ValueError(
+                f"Inconsistent 0x262a clip count: declared={declared_count}, actual={len(clips)}."
+            )
+
+        if orig_clip_id < 0 or orig_clip_id >= len(clips):
+            raise ValueError(f"Unknown original clip ID {orig_clip_id}.")
+
+        existing_names = {
+            self._audio_clip_info_by_id(clip_id)["name"]
+            for clip_id in range(len(clips))
+        }
+        if new_name in existing_names:
+            raise ValueError(f"Clip name '{new_name}' already exists.")
+
+        orig_2629 = clips[orig_clip_id]
+        payload_blocks = [
+            item for item in orig_2629.items
+            if isinstance(item, PTBlock) and item.content_type == 0x2628
+        ]
+        identity_positions = [
+            index for index, item in enumerate(orig_2629.items)
+            if isinstance(item, (bytes, bytearray)) and len(item) == 48
+        ]
+        if len(payload_blocks) != 1 or len(identity_positions) != 1:
+            raise ValueError("Invalid 0x2629 sub-clip template structure.")
+        new_clip_id = len(clips)
+
+        new_clip = copy.deepcopy(orig_2629)
+        self._wipe_offsets_recursive(new_clip)
+        identity_index = identity_positions[0]
+        identity_payload = bytearray(new_clip.items[identity_index])
+        struct.pack_into("<I", identity_payload, 0, new_clip_id)
+        identity_payload[22:38] = uuid.uuid4().bytes
+        new_clip.items[identity_index] = bytes(identity_payload)
+
+        b2628 = next(x for x in new_clip.items if isinstance(x, PTBlock) and x.content_type == 0x2628)
+        try:
+            new_name_enc = new_name.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("new_name must be valid UTF-8.") from exc
+        pl = bytearray()
+        pl.extend(struct.pack("<I", len(new_name_enc)))
+        pl.extend(new_name_enc)
+
+        if src_offset > 0:
+            pl.extend(b"\x01\x30\x30\x44\x08")
+            pl.append(src_offset & 0xFF)
+            pl.append((src_offset >> 8) & 0xFF)
+            pl.append((src_offset >> 16) & 0xFF)
+            pl.append(length & 0xFF)
+            pl.append((length >> 8) & 0xFF)
+            pl.append((length >> 16) & 0xFF)
+            pl.extend(b"\x00" * 8)
+            pl.extend(b"\xff\xff\xff\xff\xff\xff\xff\xff")
+            rest = bytearray()
+            rest.extend(b"\xfe\xff\x00\x00\x00\x00\xff\xff\x04\x00\x04\x00")
+            rest.extend(b"\x00" * 21)
+            rest.extend(b"\xff\xff\xff\xff\x00\x00")
+            pl.extend(rest)
+        else:
+            pl.extend(b"\x01\x00\x30\x44\x08")
+            pl.extend(struct.pack("<I", length))
+            pl.extend(b"\x00" * 8)
+            pl.extend(b"\xff\xff\xff\xff\xff\xff\xff\xfe")
+            rest = bytearray()
+            rest.extend(b"\xff\x00\x00\x00\x00\xff\xff\x04\x00\x04\x00")
+            rest.extend(b"\x00" * 21)
+            rest.extend(b"\xff\xff\xff\xff\x00\x00")
+            pl.extend(rest)
+
+        b2628.items[0] = bytes(pl)
+
+        last_clip_idx = len(b262a.items) - 1
+        for idx in range(len(b262a.items) - 1, -1, -1):
+            if isinstance(b262a.items[idx], PTBlock) and b262a.items[idx].content_type == 0x2629:
+                last_clip_idx = idx
+                break
+
+        b262a.items.insert(last_clip_idx + 1, new_clip)
+        struct.pack_into("<I", count_payload, 0, declared_count + 1)
+        b262a.items[0] = count_payload
+        return new_clip_id
+
+    def trim_clip_start(self, clip_name, amount_samples):
+        """Coupe le début d'un clip de 'amount_samples' échantillons."""
+        return self._trim_clip(clip_name, amount_samples, trim_start=True)
+
+    def trim_clip_end(self, clip_name, amount_samples):
+        """Coupe la fin d'un clip de 'amount_samples' échantillons."""
+        return self._trim_clip(clip_name, amount_samples, trim_start=False)
+
+    def _trim_clip(self, clip_name, amount_samples, *, trim_start):
+        if isinstance(amount_samples, bool) or not isinstance(amount_samples, int):
+            raise TypeError("amount_samples must be an integer.")
+        if amount_samples <= 0:
+            raise ValueError("amount_samples must be greater than zero.")
+
+        original_root_items = copy.deepcopy(self.root_items)
+        original_removed_offsets = list(getattr(self, '_removed_offsets', []))
+        try:
+            clip_id = self._resolve_unique_clip_id(clip_name)
+            clip_info = self._audio_clip_info_by_id(clip_id)
+            if amount_samples >= clip_info["length"]:
+                raise ValueError("Trim amount must be smaller than the clip length.")
+
+            timeline_events = self._validated_main_timeline_events()
+            placements = []
+            for entry in timeline_events:
+                _, event, _, payload = entry
+                if self._audio_timeline_event_kind(event, payload) != "audio":
+                    continue
+                if struct.unpack_from("<I", payload, 2)[0] == clip_id:
+                    placements.append(entry)
+
+            if not placements:
+                raise ValueError(f"Clip '{clip_name}' has no visible audio placement.")
+            if len(placements) != 1:
+                raise ValueError(
+                    f"Clip '{clip_name}' has multiple visible placements; "
+                    "the trim target is ambiguous."
+                )
+
+            playlist, _, b104f, source_payload = placements[0]
+            if len(source_payload) != 35:
+                raise ValueError("Audio event 0x104f payload must be exactly 35 bytes.")
+            start_samples = struct.unpack_from("<Q", source_payload, 7)[0]
+            related_fades = self._fade_bindings_for_audio_placement(
+                start_samples, clip_info["length"], playlist, timeline_events
+            )
+            if related_fades or source_payload[33] != 0:
+                raise NotImplementedError(
+                    "Trimming a clip placement with attached fades is not supported safely yet."
+                )
+
+            new_length = clip_info["length"] - amount_samples
+            new_source_offset = clip_info["src_offset"] + (
+                amount_samples if trim_start else 0
+            )
+
+            clip_root = self._root_blocks(0x262a)[0]
+            definitions = [
+                item for item in clip_root.items
+                if isinstance(item, PTBlock) and item.content_type == 0x2629
+            ]
+            existing_names = {
+                self._audio_clip_info_by_id(index)["name"]
+                for index in range(len(definitions))
+            }
+            suffix = "tS" if trim_start else "tE"
+            base_name = f"{clip_name}-{suffix}"
+            new_name = base_name
+            sequence = 2
+            while new_name in existing_names:
+                new_name = f"{base_name}-{sequence:02d}"
+                sequence += 1
+
+            new_clip_id = self.create_subclip(
+                clip_id, new_name, new_source_offset, new_length
+            )
+            updated_payload = bytearray(source_payload)
+            struct.pack_into("<I", updated_payload, 2, new_clip_id)
+            if trim_start:
+                struct.pack_into(
+                    "<Q", updated_payload, 7, start_samples + amount_samples
+                )
+            b104f.items[0] = bytes(updated_payload)
+            direction = "start" if trim_start else "end"
+            logger.info(
+                "Trim %s applied to %r; new clip: %r.",
+                direction, clip_name, new_name,
+            )
+            return new_clip_id
+        except Exception:
+            self.root_items = original_root_items
+            self._removed_offsets = original_removed_offsets
+            raise
 
 if __name__ == "__main__":
     # Test loading and saving a session without modification (bit-perfect test)

@@ -17,5 +17,15 @@ reference_ptformat/
 *.log
 *.tmp
 
-# Ignorer les notes de passation internes
-handoff.md
+# Ignorer les artéfacts de construction
+build/
+dist/
+*.egg-info/
+
+# Conserver les sessions réelles de validation uniquement en local
+/test_session*.ptx
+/test_session_w_audio/
+/test_session_w_clip groups/
+
+# Ignorer les métadonnées macOS copiées avec les sessions
+._*
