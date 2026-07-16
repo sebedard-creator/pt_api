@@ -4,12 +4,13 @@ Ce document sert à reprendre le développement de `pt_api` sans perdre les conn
 
 ## État de reprise
 
-- Version courante : `1.3.7`.
+- Version courante : `1.3.8`.
 - L’audit fonctionnel et structurel entrepris sur cette version est terminé.
-- La suite automatisée compte 164 tests et passe intégralement.
+- La suite automatisée compte 166 tests et passe intégralement.
 - Les principales écritures ont été ouvertes et vérifiées manuellement dans Pro Tools à partir des sessions de référence.
 - `README.md`, `pt_format_specs.md`, `architecture.md` et `changelog.md` ont été resynchronisés avec le code.
 - Le relink parent/racine, virtuel à offset nul et virtuel à offset non nul est validé de bout en bout dans Pro Tools. La session OttoAlign2 confirme la structure à trois niveaux internes (`VIDEO`, `Exports`, `test ottoalign`) et 177 fichiers; ces libellés sont des métadonnées PTX, jamais des chemins sur disque. Le traitement complet de production a créé 388 identités média indépendantes et la session résultante s'est ouverte et a joué correctement.
+- Une seconde production OttoAlign2 de 71 médias utilise des suffixes nuls dans tout son catalogue `0x103a`; un seul `0x1001` de 31 octets y contient un faux bloc vide. Après réassemblage, 226 des 236 placements ont été relinkés, 10 ont été ignorés normalement, le catalogue final compte 297 médias, tous les WAV sont présents et la sauvegarde no-op est bit-perfect.
 - Les bases comparatives originales de l’utilisateur sont conservées localement et ignorées par Git. Les sorties générées, diagnostics obsolètes, builds et caches ont été supprimés après validation.
 - `handoff.md` est versionné avec le projet afin que chaque clone dispose de l’état de reprise courant.
 
@@ -46,7 +47,7 @@ Le projet est un module Python autonome, compatible Python 3.8+, sans dépendanc
 
 Les contrôles suivants ont été réussis sur la version courante :
 
-- 164 tests automatisés, y compris les entrées malformées, les restaurations après erreur, le relink virtuel, le remplacement PCM compatible, la queue média hiérarchique à trois niveaux, les faux blocs dans les enregistrements fixes et un index média supérieur à 255;
+- 166 tests automatisés, y compris les entrées malformées, les restaurations après erreur, le relink virtuel, le remplacement PCM compatible, les deux suffixes de nom physique `EVAW`/nul, la queue média hiérarchique à plusieurs niveaux, les faux blocs dans les identités `0x1001` et enregistrements fixes `0x2629`, et un index média supérieur à 255;
 - exécution de la suite avec les avertissements Python traités comme des erreurs;
 - compatibilité syntaxique Python 3.8;
 - construction PEP 517 du paquet `pt_api-1.3.7-py3-none-any.whl`;
@@ -116,6 +117,8 @@ Ces points sont documentés et ne doivent pas être « simplifiés » sans nouve
 - `relink_clip()` crée atomiquement le nouveau WAV avant que l'appelant ne sauvegarde le PTX. Une erreur interne restaure l'arbre et supprime le temporaire; une erreur ultérieure de `save()` laisse toutefois le WAV final à nettoyer par l'appelant.
 - Le relink accepte le parent/racine et les layouts virtuels de production vérifiés. Pour un virtuel, préserver la queue `0x2628` octet pour octet et calculer la référence média comme `embedded_reference - src_offset`; ne jamais remplacer cette référence par le timestamp du placement.
 - Les enregistrements fixes de 48 et 104 octets d'un `0x2629` peuvent contenir fortuitement un en-tête de bloc vide. Le relink doit les resérialiser autour du `0x4403` avant validation; ne pas exiger que le parseur les ait laissés dans un seul `bytearray`.
+- L'identité média brute de 31 octets d'un `0x1001` peut subir le même faux découpage. La réassembler avant de remplacer `+22..+30`, puis normaliser seulement le clone en un payload brut.
+- Les noms physiques ordonnés du `0x103a` existent avec un suffixe `EVAW` ou quatre octets nuls selon la session. Exiger une variante uniforme et la recopier lors de l'insertion; ne jamais normaliser arbitrairement une session vers l'autre variante.
 - La création de Clip Groups n’est pas exposée. La dissolution prise en charge est limitée au cas simple : un groupe, une piste et un placement non ambigu.
 - Seuls les PTX little-endian et les fréquences d’images explicitement listées dans `README.md` et `pt_format_specs.md` sont acceptés.
 - Les nouveaux blocs de fade peuvent être acceptés par Pro Tools sans nouvel enregistrement `0x0002`; ne pas inventer de pointeur absent des références observées.

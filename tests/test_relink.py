@@ -12,13 +12,13 @@ def block(block_type, content_type, items):
     return result
 
 
-def filename_record(filename):
+def filename_record(filename, suffix=b"EVAW"):
     encoded = filename.encode("utf-8")
     return (
         b"\x02\x00\x00\x00\x00"
         + struct.pack("<I", len(encoded))
         + encoded
-        + b"EVAW"
+        + suffix
     )
 
 
@@ -126,6 +126,7 @@ def make_session(
     catalog_labels=("SHARE TO NETWORK",),
     physical_count=1,
     virtual_source_offset=None,
+    filename_record_suffix=b"EVAW",
 ):
     if source_time_reference is None:
         source_time_reference = start_samples
@@ -149,7 +150,7 @@ def make_session(
     names.extend(b"Audio Files")
     names.extend(bytearray(4))
     for physical_name in physical_names:
-        names.extend(filename_record(physical_name))
+        names.extend(filename_record(physical_name, filename_record_suffix))
     names.extend(b"\x00\xff\xff\xff\xff")
     for depth, label in enumerate(catalog_labels, start=1):
         encoded_label = label.encode("utf-8")
@@ -300,6 +301,75 @@ def read_chunk(path, wanted):
 
 
 class RelinkTests(unittest.TestCase):
+    def test_relink_reassembles_false_block_inside_1001_identity(self):
+        session, source_umid = make_session()
+        _, media_entries, _, _, _ = session._validated_physical_audio_catalog()
+        media_info = next(
+            child for child in media_entries[0].items
+            if isinstance(child, PTBlock) and child.content_type == 0x1001
+        )
+        payload = bytearray(media_info.items[0])
+        false_block = PTBlock(0x06, 0x0000, 0)
+        false_block.items = []
+        serialized, _ = false_block.to_bytes(False, 0)
+        self.assertEqual(len(serialized), 7)
+        payload[7:14] = serialized
+        media_info.items = [payload[:7], false_block, payload[14:]]
+
+        with tempfile.TemporaryDirectory() as directory:
+            audio_dir = Path(directory)
+            source = audio_dir / "Audio 1_01.wav"
+            destination = audio_dir / "Audio 1_02.wav"
+            write_pro_tools_wave(source, source.stem, source_umid)
+
+            session.relink_clip(
+                "Audio 1",
+                "Audio 1_01",
+                1_000,
+                "Audio 1_02",
+                source,
+                destination,
+            )
+
+            _, updated_entries, _, _, _ = (
+                session._validated_physical_audio_catalog()
+            )
+            cloned_info = next(
+                child for child in updated_entries[-1].items
+                if isinstance(child, PTBlock) and child.content_type == 0x1001
+            )
+            self.assertEqual(len(cloned_info.items), 1)
+            self.assertEqual(len(cloned_info.items[0]), 31)
+
+    def test_relink_preserves_zero_filename_record_suffix_variant(self):
+        session, source_umid = make_session(
+            filename_record_suffix=b"\x00" * 4,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            audio_dir = Path(directory)
+            source = audio_dir / "Audio 1_01.wav"
+            destination = audio_dir / "Audio 1_02.wav"
+            write_pro_tools_wave(source, source.stem, source_umid)
+
+            session.relink_clip(
+                "Audio 1",
+                "Audio 1_01",
+                1_000,
+                "Audio 1_02",
+                source,
+                destination,
+            )
+
+            _, entries, name_block, names, insertion_offset = (
+                session._validated_physical_audio_catalog()
+            )
+            self.assertEqual(len(entries), 2)
+            self.assertEqual(names, ["Audio 1_01.wav", "Audio 1_02.wav"])
+            self.assertEqual(
+                name_block.items[0][insertion_offset - 4:insertion_offset],
+                b"\x00" * 4,
+            )
+
     def test_relink_clones_media_and_retargets_only_the_requested_placement(self):
         session, source_umid = make_session(source_time_reference=800)
         with tempfile.TemporaryDirectory() as directory:

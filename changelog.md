@@ -1,5 +1,11 @@
 # Pro Tools API - Changelog
 
+## v1.3.8 (Catalogue WAV sans marqueur EVAW) - 2026-07-16
+
+- **Nouveau layout `0x103a` observé** : prise en charge des catalogues physiques dont chaque enregistrement WAV se termine par quatre octets nuls au lieu du marqueur `EVAW`. Le suffixe doit être uniforme dans tout le catalogue et est préservé lors de chaque insertion; un suffixe inconnu ou un catalogue mélangeant les deux variantes reste refusé.
+- **Identité média fixe robuste** : les 31 octets du `0x1001` sont réassemblés avant mutation lorsqu'une séquence fortuite a été interprétée comme un bloc vide. Le clone est ensuite normalisé en un payload brut unique, sans modifier l'identité source.
+- **Validation OttoAlign2** : correction fondée sur une session réelle de 71 médias dont les compteurs, la hiérarchie et les index étaient déjà cohérents. Le traitement complet a ensuite produit 226 relinks indépendants sur 236 placements; les 10 autres ont été ignorés selon les règles normales. Le catalogue final contient 297 médias, aucun WAV n'est manquant et son cycle de sauvegarde sans mutation est byte-for-byte identique. Des tests automatisés vérifient les deux nouvelles variantes.
+
 ## v1.3.7 (Audit de robustesse et clips longs) - 2026-07-15
 
 - **Layouts de clips de production correctement décodés** : prise en charge des flags parent/virtuel `0x0000`/`0x0001`, `0x2000`/`0x2001`, `0x3000`/`0x3001` et `0x4001`. Les offsets source suivent le flag (0, UInt16, UInt24 ou UInt32) et les sélecteurs indépendants `0x10`/`0x20`/`0x30`/`0x40` donnent une longueur UInt8/UInt16/UInt24/UInt32. `01 30 40` signifie donc flag `0x3001`, offset UInt24 et longueur UInt32, tandis que `01 40 30` signifie le vrai flag `0x4001`, offset UInt32 et longueur UInt24.

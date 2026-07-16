@@ -1136,13 +1136,19 @@ class ProToolsSession:
         names = []
         position = records_start
         record_prefix = b"\x02\x00\x00\x00\x00"
+        record_suffix = None
         while position + 13 <= len(payload) and payload[position:position + 5] == record_prefix:
             name_length = struct.unpack_from("<I", payload, position + 5)[0]
             name_start = position + 9
             name_end = name_start + name_length
             suffix_end = name_end + 4
-            if suffix_end > len(payload) or payload[name_end:suffix_end] != b"EVAW":
+            suffix = bytes(payload[name_end:suffix_end])
+            if suffix_end > len(payload) or suffix not in (b"EVAW", b"\x00" * 4):
                 raise ValueError("Invalid 0x103a WAV filename record.")
+            if record_suffix is None:
+                record_suffix = suffix
+            elif suffix != record_suffix:
+                raise ValueError("Mixed 0x103a WAV filename record suffixes.")
             try:
                 name = payload[name_start:name_end].decode("utf-8")
             except UnicodeDecodeError as exc:
@@ -2483,6 +2489,19 @@ class ProToolsSession:
         target_b2628.items[0] = new_payload
         return 1
 
+    def _serialize_fixed_record_items(self, items, error_message):
+        """Reassemble raw bytes that may contain a falsely parsed empty block."""
+        payload = bytearray()
+        for item in items:
+            if isinstance(item, PTBlock):
+                serialized, _ = item.to_bytes(self.is_bigendian, 0)
+                payload.extend(serialized)
+            elif isinstance(item, (bytes, bytearray)):
+                payload.extend(item)
+            else:
+                raise ValueError(error_message)
+        return payload
+
     def _validated_2629_fixed_records(self, definition):
         """Reassemble the two fixed records around the 0x4403 child."""
         if not isinstance(definition, PTBlock) or definition.content_type != 0x2629:
@@ -2502,24 +2521,18 @@ class ProToolsSession:
         if metadata_position <= name_position + 1:
             raise ValueError("Invalid 0x2629 fixed-record ordering.")
 
-        def serialize_items(items):
-            payload = bytearray()
-            for item in items:
-                if isinstance(item, PTBlock):
-                    serialized, _ = item.to_bytes(self.is_bigendian, 0)
-                    payload.extend(serialized)
-                elif isinstance(item, (bytes, bytearray)):
-                    payload.extend(item)
-                else:
-                    raise ValueError("Invalid item in a 0x2629 fixed record.")
-            return payload
-
         identity_start = name_position + 1
         identity_end = metadata_position
         media_start = metadata_position + 1
         media_end = len(definition.items)
-        identity = serialize_items(definition.items[identity_start:identity_end])
-        media = serialize_items(definition.items[media_start:media_end])
+        identity = self._serialize_fixed_record_items(
+            definition.items[identity_start:identity_end],
+            "Invalid item in a 0x2629 fixed record.",
+        )
+        media = self._serialize_fixed_record_items(
+            definition.items[media_start:media_end],
+            "Invalid item in a 0x2629 fixed record.",
+        )
         if len(identity) != 48 or len(media) != 104:
             raise ValueError(
                 "A verified 48-byte identity and 104-byte media record are required."
@@ -2826,15 +2839,14 @@ class ProToolsSession:
             if len(media_info_blocks) != 1 or len(media_detail_blocks) != 1:
                 raise ValueError("Invalid 0x1003 relink media template.")
             media_info = media_info_blocks[0]
-            if (
-                len(media_info.items) != 1
-                or not isinstance(media_info.items[0], (bytes, bytearray))
-                or len(media_info.items[0]) != 31
-            ):
+            media_info_payload = self._serialize_fixed_record_items(
+                media_info.items,
+                "Invalid item in a 0x1001 relink media identity.",
+            )
+            if len(media_info_payload) != 31:
                 raise ValueError("Invalid 0x1001 relink media identity.")
-            media_info_payload = bytearray(media_info.items[0])
             media_info_payload[22:31] = identity["file_identifier"]
-            media_info.items[0] = media_info_payload
+            media_info.items = [media_info_payload]
 
             media_detail = media_detail_blocks[0]
             detail_headers = [
@@ -2880,6 +2892,9 @@ class ProToolsSession:
             media_detail.items[tail_index] = detail_tail
 
             name_payload = bytearray(name_block.items[0])
+            record_suffix = bytes(name_payload[name_insert - 4:name_insert])
+            if record_suffix not in (b"EVAW", b"\x00" * 4):
+                raise ValueError("Invalid 0x103a WAV filename record suffix.")
             top_count = struct.unpack_from("<I", name_payload, 0)[0]
             nested_count = struct.unpack_from("<I", name_payload, 5)[0]
             trailer_count_offsets = self._decode_1004_catalog_trailer(
@@ -2909,7 +2924,7 @@ class ProToolsSession:
             filename_record = bytearray(b"\x02\x00\x00\x00\x00")
             filename_record.extend(struct.pack("<I", len(new_filename_bytes)))
             filename_record.extend(new_filename_bytes)
-            filename_record.extend(b"EVAW")
+            filename_record.extend(record_suffix)
             name_payload[name_insert:name_insert] = filename_record
             name_block.items[0] = name_payload
 
