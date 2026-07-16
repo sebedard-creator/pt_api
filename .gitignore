@@ -26,6 +26,9 @@ dist/
 /test_session*.ptx
 /test_session_w_audio/
 /test_session_w_clip groups/
+/virtual_relink_before/
+/test_6min_audio/
+/relink_before/
 
 # Ignorer les métadonnées macOS copiées avec les sessions
 ._*

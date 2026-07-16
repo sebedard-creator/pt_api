@@ -10,18 +10,34 @@ def block(block_type, content_type, items):
     return result
 
 
-def audio_definition(name, flags, length, source_offset=0, timestamp_low=0):
+def audio_definition(name, flags, length, source_offset=0):
     encoded = name.encode("utf-8")
     payload = bytearray(struct.pack("<I", len(encoded)) + encoded)
-    if flags in (0x0000, 0x0001):
-        payload.extend(struct.pack("<H", flags) + b"\x30\x44\x00")
-        payload.extend(length.to_bytes(3, "little") + bytes([timestamp_low]))
-    elif flags in (0x2001, 0x3001):
-        payload.extend(struct.pack("<H", flags) + b"\x30\x44\x08")
-        payload.extend(source_offset.to_bytes(3, "little"))
-        payload.extend(length.to_bytes(3, "little"))
-    else:
+    source_width = {
+        0x0000: 0,
+        0x0001: 0,
+        0x2000: 2,
+        0x2001: 2,
+        0x3000: 3,
+        0x3001: 3,
+        0x4001: 4,
+    }.get(flags)
+    if source_width is None:
         raise AssertionError("Unsupported test flags")
+    if length <= 0xFF:
+        length_width = 1
+    elif length <= 0xFFFF:
+        length_width = 2
+    elif length <= 0xFFFFFF:
+        length_width = 3
+    else:
+        length_width = 4
+    selector = bytes([length_width << 4])
+    layout = bytes([(source_width << 4) | 0x04, 0x08])
+    payload.extend(struct.pack("<H", flags) + selector + layout)
+    if source_width:
+        payload.extend(source_offset.to_bytes(source_width, "little"))
+    payload.extend(length.to_bytes(length_width, "little"))
     return block(11, 0x2629, [block(1, 0x2628, [payload])])
 
 
@@ -47,11 +63,16 @@ def make_session(audio=(), groups=()):
 
 
 class GetClipsTests(unittest.TestCase):
-    def test_parent_and_virtual_24_bit_fields_are_decoded_exactly(self):
+    def test_parent_uint32_and_virtual_selected_widths_are_decoded_exactly(self):
         session = make_session(
             audio=[
-                audio_definition("PARENT", 0x0000, 48_000, timestamp_low=0xAB),
-                audio_definition("RIGHT", 0x3001, 24_000, source_offset=12_000),
+                audio_definition("PARENT", 0x0000, 17_280_000),
+                audio_definition(
+                    "RIGHT", 0x3001, 16_800_000, source_offset=480_000
+                ),
+                audio_definition(
+                    "LATE", 0x4001, 480_000, source_offset=16_800_000
+                ),
             ]
         )
 
@@ -61,16 +82,47 @@ class GetClipsTests(unittest.TestCase):
             {
                 "name": "PARENT",
                 "type": "parent",
-                "length": "00:00:01:00",
+                "length": "00:06:00:00",
                 "src_offset": "00:00:00:00",
             },
             {
                 "name": "RIGHT",
                 "type": "virtual",
-                "length": "00:00:00:12",
-                "src_offset": "00:00:00:06",
+                "length": "00:05:50:00",
+                "src_offset": "00:00:10:00",
+            },
+            {
+                "name": "LATE",
+                "type": "virtual",
+                "length": "00:00:10:00",
+                "src_offset": "00:05:50:00",
             },
         ])
+
+    def test_observed_compact_widths_and_parent_variants_are_decoded(self):
+        definitions = [
+            audio_definition("ZERO", 0x0001, 0x7F),
+            audio_definition("SRC16", 0x2001, 0x123456, source_offset=0x1234),
+            audio_definition("LEN16", 0x3001, 0x3456, source_offset=0x123456),
+            audio_definition("PARENT", 0x3000, 0x654321, source_offset=0x234567),
+        ]
+        session = make_session(audio=definitions)
+
+        decoded = [
+            session._decode_audio_clip_payload(item.items[0].items[0])
+            for item in definitions
+        ]
+
+        self.assertEqual(
+            [(item["flags"], item["src_offset"], item["length"]) for item in decoded],
+            [
+                (0x0001, 0, 0x7F),
+                (0x2001, 0x1234, 0x123456),
+                (0x3001, 0x123456, 0x3456),
+                (0x3000, 0x234567, 0x654321),
+            ],
+        )
+        self.assertEqual(session.get_clips()[-1]["type"], "parent")
 
     def test_clip_group_length_uses_verified_offset_plus_ten(self):
         session = make_session(groups=[group_definition("GROUP.grp", 96_000)])
@@ -83,6 +135,16 @@ class GetClipsTests(unittest.TestCase):
             "length": "00:00:02:00",
             "src_offset": "00:00:00:00",
         })
+
+    def test_unknown_audio_width_selector_is_rejected(self):
+        definition = audio_definition("CLIP", 0x0000, 48_000)
+        payload = definition.items[0].items[0]
+        name_length = struct.unpack_from("<I", payload, 0)[0]
+        payload[4 + name_length + 2] = 0x50
+        session = make_session(audio=[definition])
+
+        with self.assertRaisesRegex(ValueError, "width selector"):
+            session.get_clips()
 
     def test_inconsistent_container_count_is_rejected(self):
         session = make_session(audio=[audio_definition("CLIP", 0x0000, 100)])

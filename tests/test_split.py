@@ -14,13 +14,14 @@ def block(block_type, content_type, items, original_offset=-1):
 
 def clip_definition(name, clip_id, length=480_000):
     encoded = name.encode("utf-8")
+    selector = b"\x40" if length > 0xFFFFFF else b"\x30"
     clip_payload = bytearray(
         struct.pack("<I", len(encoded))
         + encoded
-        + b"\x00\x00\x30\x44\x00"
+        + b"\x00\x00" + selector + b"\x44\x00"
         + struct.pack("<I", length)
-        + struct.pack("<I", 0)
-        + struct.pack("<I", 0)
+        + struct.pack("<I", 0x67198E00)
+        + struct.pack("<I", 0x67198E00)
         + b"TAIL"
     )
     identity = bytearray(48)
@@ -131,6 +132,16 @@ class SplitClipTests(unittest.TestCase):
         count_offset = 4 + struct.unpack_from("<I", header, 0)[0]
         self.assertEqual(struct.unpack_from("<I", header, count_offset)[0], 2)
         self.assertEqual(playlist.items[-1], b"TRAILER!")
+        left_payload = next(
+            item.items[0] for item in definitions[-2].items
+            if isinstance(item, PTBlock) and item.content_type == 0x2628
+        )
+        left_name_length = struct.unpack_from("<I", left_payload, 0)[0]
+        left_offset = 4 + left_name_length
+        self.assertEqual(
+            left_payload[left_offset + 9:left_offset + 17],
+            bytes.fromhex("8e1967008e1967ff"),
+        )
 
     def test_existing_suffixes_advance_to_next_native_pair(self):
         session, clip_list, _ = make_session(existing_suffixes=(1, 2))
@@ -146,12 +157,37 @@ class SplitClipTests(unittest.TestCase):
             ["CLIP-03", "CLIP-04"],
         )
 
-    def test_24_bit_overflow_is_rejected_without_mutation(self):
-        session, _, _ = make_session(length=0xFFFFFF + 48_001)
+    def test_long_right_fragment_uses_verified_uint32_length_layout(self):
+        session, clip_list, _ = make_session(length=17_280_000)
+
+        session.split_clip("AUDIO TRACK", "CLIP", 0, 0, 10, 0)
+
+        definitions = [
+            item for item in clip_list.items
+            if isinstance(item, PTBlock) and item.content_type == 0x2629
+        ]
+        right_payload = next(
+            item.items[0] for item in definitions[-1].items
+            if isinstance(item, PTBlock) and item.content_type == 0x2628
+        )
+        name_length = struct.unpack_from("<I", right_payload, 0)[0]
+        offset = 4 + name_length
+        self.assertEqual(right_payload[offset:offset + 5], b"\x01\x30\x40\x44\x08")
+        self.assertEqual(
+            int.from_bytes(right_payload[offset + 5:offset + 8], "little"),
+            480_000,
+        )
+        self.assertEqual(
+            struct.unpack_from("<I", right_payload, offset + 8)[0],
+            16_800_000,
+        )
+
+    def test_source_offset_over_24_bits_is_rejected_without_mutation(self):
+        session, _, _ = make_session(length=17_280_000)
         before = copy.deepcopy(session.root_items)
 
-        with self.assertRaisesRegex(ValueError, "fit in 24 bits"):
-            session.split_clip("AUDIO TRACK", "CLIP", 0, 0, 1, 0)
+        with self.assertRaisesRegex(ValueError, "source offset.*24-bit"):
+            session.split_clip("AUDIO TRACK", "CLIP", 0, 5, 50, 0)
 
         self.assertEqual(
             [item.to_bytes(False, 20)[0] for item in session.root_items],

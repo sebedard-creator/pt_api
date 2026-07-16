@@ -23,6 +23,277 @@ def _coerce_string_path(value, parameter_name):
     return path
 
 
+def _scan_riff_wave_chunks(stream):
+    """Return validated RIFF/WAVE chunk payload offsets keyed by chunk ID."""
+    stream.seek(0, os.SEEK_END)
+    file_size = stream.tell()
+    stream.seek(0)
+    header = stream.read(12)
+    if len(header) != 12 or header[:4] != b"RIFF" or header[8:12] != b"WAVE":
+        raise ValueError("Source audio must be a little-endian RIFF/WAVE file.")
+    declared_size = struct.unpack_from("<I", header, 4)[0] + 8
+    if declared_size != file_size:
+        raise ValueError("RIFF/WAVE size does not match the physical file size.")
+
+    chunks = {}
+    position = 12
+    while position < file_size:
+        if position + 8 > file_size:
+            raise ValueError("Truncated RIFF/WAVE chunk header.")
+        stream.seek(position)
+        chunk_header = stream.read(8)
+        chunk_id = chunk_header[:4]
+        chunk_size = struct.unpack_from("<I", chunk_header, 4)[0]
+        payload_offset = position + 8
+        payload_end = payload_offset + chunk_size
+        padded_end = payload_end + (chunk_size & 1)
+        if payload_end > file_size or padded_end > file_size:
+            raise ValueError("Truncated RIFF/WAVE chunk payload.")
+        chunks.setdefault(chunk_id, []).append((payload_offset, chunk_size))
+        position = padded_end
+    if position != file_size:
+        raise ValueError("Invalid RIFF/WAVE chunk alignment.")
+    return chunks
+
+
+def _wave_pcm_format_signature(stream, chunks, label):
+    """Return the PCM fields that must match before replacing a data chunk."""
+    matches = chunks.get(b"fmt ", [])
+    if len(matches) != 1 or matches[0][1] < 16:
+        raise ValueError(f"{label} WAV requires one valid fmt chunk.")
+    offset, size = matches[0]
+    stream.seek(offset)
+    payload = stream.read(size)
+    if len(payload) != size:
+        raise ValueError(f"Truncated {label.lower()} WAV fmt chunk.")
+    audio_format, channels, sample_rate, byte_rate, block_align, bits = (
+        struct.unpack_from("<HHIIHH", payload, 0)
+    )
+    if audio_format == 0xFFFE:
+        if (
+            size < 40
+            or struct.unpack_from("<H", payload, 16)[0] < 22
+            or struct.unpack_from("<I", payload, 24)[0] != 1
+        ):
+            raise ValueError(f"{label} WAV must use PCM audio.")
+    elif audio_format != 1:
+        raise ValueError(f"{label} WAV must use PCM audio.")
+    return channels, sample_rate, byte_rate, block_align, bits
+
+
+def _replace_wave_data_chunk(destination_stream, destination_chunks, replacement_path):
+    """Copy compatible rendered PCM into a cloned Pro Tools WAV in place."""
+    destination_data = destination_chunks.get(b"data", [])
+    if len(destination_data) != 1:
+        raise ValueError("Destination Pro Tools WAV requires one data chunk.")
+    destination_signature = _wave_pcm_format_signature(
+        destination_stream, destination_chunks, "Destination"
+    )
+
+    with open(replacement_path, "rb") as replacement_stream:
+        replacement_chunks = _scan_riff_wave_chunks(replacement_stream)
+        replacement_data = replacement_chunks.get(b"data", [])
+        if len(replacement_data) != 1:
+            raise ValueError("Replacement WAV requires one data chunk.")
+        replacement_signature = _wave_pcm_format_signature(
+            replacement_stream, replacement_chunks, "Replacement"
+        )
+        if replacement_signature != destination_signature:
+            raise ValueError(
+                "Replacement WAV PCM format does not match the source WAV."
+            )
+        destination_offset, destination_size = destination_data[0]
+        replacement_offset, replacement_size = replacement_data[0]
+        if replacement_size != destination_size:
+            raise ValueError(
+                "Replacement WAV data size does not match the source WAV."
+            )
+
+        replacement_stream.seek(replacement_offset)
+        destination_stream.seek(destination_offset)
+        remaining = replacement_size
+        while remaining:
+            chunk = replacement_stream.read(min(1024 * 1024, remaining))
+            if not chunk:
+                raise ValueError("Truncated replacement WAV data chunk.")
+            destination_stream.write(chunk)
+            remaining -= len(chunk)
+
+
+def _clone_pro_tools_wave(
+    source_path,
+    temporary_path,
+    new_stem,
+    expected_source_time_reference,
+    new_time_reference,
+    replacement_audio_path=None,
+):
+    """Clone one verified Pro Tools WAV while assigning a new media identity."""
+    import datetime
+    import secrets
+    import shutil
+    import string
+
+    shutil.copyfile(source_path, temporary_path)
+    with open(temporary_path, "r+b") as stream:
+        chunks = _scan_riff_wave_chunks(stream)
+        required = {b"bext": 412, b"minf": 16, b"regn": 92, b"umid": 24}
+        selected = {}
+        for chunk_id, minimum_size in required.items():
+            matches = chunks.get(chunk_id, [])
+            if len(matches) != 1 or matches[0][1] < minimum_size:
+                label = chunk_id.decode("ascii")
+                raise ValueError(f"A unique verified {label} WAV chunk is required.")
+            selected[chunk_id] = matches[0]
+
+        bext_offset, _ = selected[b"bext"]
+        stream.seek(bext_offset + 288)
+        source_originator_reference = bytearray(stream.read(32))
+        if len(source_originator_reference) != 32:
+            raise ValueError("Invalid Pro Tools BWF originator-reference payload.")
+        stream.seek(bext_offset + 338)
+        source_time_reference_raw = stream.read(8)
+        if len(source_time_reference_raw) != 8:
+            raise ValueError("Invalid Pro Tools BWF time-reference payload.")
+        source_time_reference = struct.unpack("<Q", source_time_reference_raw)[0]
+        if source_time_reference != expected_source_time_reference:
+            raise ValueError(
+                "Source WAV time reference does not match the PTX clip definition."
+            )
+        stream.seek(bext_offset + 348)
+        source_umid = stream.read(64)
+        if len(source_umid) != 64 or not any(source_umid[:32]):
+            raise ValueError("Invalid Pro Tools BWF UMID payload.")
+        new_umid = bytearray(source_umid)
+        new_umid[17:20] = secrets.token_bytes(3)
+        new_umid[24:26] = secrets.token_bytes(2)
+        file_identifier = b"\x2a" + bytes(new_umid[16:24])
+
+        regn_offset, regn_size = selected[b"regn"]
+        stream.seek(regn_offset + 60)
+        source_name_length_raw = stream.read(1)
+        if len(source_name_length_raw) != 1:
+            raise ValueError("Invalid Pro Tools regn filename length.")
+        source_name_length = source_name_length_raw[0]
+        if 61 + source_name_length > regn_size:
+            raise ValueError("Truncated Pro Tools regn filename.")
+        stream.seek(regn_offset + 61)
+        source_stem = stream.read(source_name_length)
+        try:
+            decoded_source_stem = source_stem.decode("utf-8", "strict")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Source WAV regn stem must be valid UTF-8.") from exc
+        expected_source_stem = os.path.splitext(os.path.basename(source_path))[0]
+        try:
+            new_stem_bytes = new_stem.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("New WAV stem must be valid UTF-8.") from exc
+        replace_regn_stem = decoded_source_stem == expected_source_stem
+        if replace_regn_stem:
+            if len(new_stem_bytes) != source_name_length:
+                raise ValueError(
+                    "New WAV stem must have the same UTF-8 byte length as the source."
+                )
+            if decoded_source_stem == new_stem:
+                raise ValueError("New WAV stem must differ from the source stem.")
+
+        stream.seek(regn_offset + 44)
+        regn_time_references = stream.read(16)
+        if len(regn_time_references) != 16:
+            raise ValueError(
+                "Source WAV regn time references do not match its BWF time reference."
+            )
+        first_regn_reference, second_regn_reference = struct.unpack(
+            "<QQ", regn_time_references
+        )
+        if (
+            first_regn_reference == source_time_reference
+            and second_regn_reference == source_time_reference
+        ):
+            regn_reference_mode = "duplicated"
+        elif (
+            first_regn_reference == 0
+            and second_regn_reference == source_time_reference
+        ):
+            regn_reference_mode = "production"
+        else:
+            raise ValueError(
+                "Source WAV regn time references do not match its BWF time reference."
+            )
+
+        new_media_token = None
+        if 61 + source_name_length <= 76:
+            stream.seek(regn_offset + 76)
+            first_source_pointer = stream.read(8)
+            stream.seek(regn_offset + 84)
+            second_source_pointer = stream.read(8)
+            if (
+                len(first_source_pointer) != 8
+                or len(second_source_pointer) != 8
+                or first_source_pointer != second_source_pointer
+            ):
+                raise ValueError("Invalid Pro Tools regn media token pair.")
+            first_source_token = first_source_pointer[:4]
+            new_media_token = secrets.token_bytes(4)
+            while new_media_token == first_source_token:
+                new_media_token = secrets.token_bytes(4)
+
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        filetime_epoch = datetime.datetime(1601, 1, 1, tzinfo=datetime.timezone.utc)
+        filetime = int((now_utc - filetime_epoch).total_seconds() * 10_000_000)
+        rounded_filetime = filetime - (filetime % 10_000_000)
+        prior_filetime = max(0, rounded_filetime - 10_000_000)
+        local_now = datetime.datetime.now()
+        alphabet = string.ascii_letters + string.digits
+        source_originator_reference[6:10] = "".join(
+            secrets.choice(alphabet) for _ in range(4)
+        ).encode("ascii")
+
+        stream.seek(bext_offset + 288)
+        stream.write(source_originator_reference)
+        stream.seek(bext_offset + 320)
+        stream.write(local_now.strftime("%Y-%m-%d%H:%M:%S").encode("ascii"))
+        stream.seek(bext_offset + 338)
+        stream.write(struct.pack("<Q", new_time_reference))
+        stream.seek(bext_offset + 348)
+        stream.write(new_umid)
+
+        minf_offset, _ = selected[b"minf"]
+        stream.seek(minf_offset)
+        stream.write(struct.pack("<Q", filetime))
+
+        stream.seek(regn_offset + 11)
+        stream.write(file_identifier)
+        stream.seek(regn_offset + 44)
+        if regn_reference_mode == "duplicated":
+            stream.write(struct.pack("<QQ", new_time_reference, new_time_reference))
+        else:
+            stream.write(struct.pack("<QQ", 0, new_time_reference))
+        if replace_regn_stem:
+            stream.seek(regn_offset + 61)
+            stream.write(new_stem_bytes)
+        if new_media_token is not None:
+            stream.seek(regn_offset + 76)
+            stream.write(new_media_token)
+            stream.seek(regn_offset + 84)
+            stream.write(new_media_token)
+
+        umid_offset, _ = selected[b"umid"]
+        stream.seek(umid_offset + 7)
+        stream.write(file_identifier)
+
+        if replacement_audio_path is not None:
+            _replace_wave_data_chunk(stream, chunks, replacement_audio_path)
+
+    return {
+        "file_identifier": file_identifier,
+        "umid": bytes(new_umid),
+        "rounded_filetime": rounded_filetime,
+        "prior_filetime": prior_filetime,
+        "filetime": filetime,
+    }
+
+
 def _validate_ptx_header(data):
     """Validate the unencrypted 20-byte PTX envelope before body processing."""
     if not isinstance(data, (bytes, bytearray)):
@@ -727,34 +998,44 @@ class ProToolsSession:
             raise ValueError("Invalid UTF-8 clip name.") from exc
 
         flags = struct.unpack_from("<H", payload, attribute_offset)[0]
-        if flags == 0x0000:
-            if attribute_offset + 9 > len(payload):
-                raise ValueError("Truncated 32-bit parent clip length.")
-            source_offset = 0
-            # The following timestamp begins immediately after the 24-bit
-            # length, so the fourth byte read by UInt32 belongs to that field.
-            length = struct.unpack_from("<I", payload, attribute_offset + 5)[0] & 0x00FFFFFF
-        elif flags == 0x0001:
-            if attribute_offset + 9 > len(payload):
-                raise ValueError("Truncated 32-bit virtual clip length.")
-            source_offset = 0
-            length = struct.unpack_from("<I", payload, attribute_offset + 5)[0] & 0x00FFFFFF
-        elif flags == 0x4001:
-            if attribute_offset + 13 > len(payload):
-                raise ValueError("Truncated 32-bit source-offset clip payload.")
-            source_offset = struct.unpack_from("<I", payload, attribute_offset + 5)[0]
-            length = struct.unpack_from("<I", payload, attribute_offset + 9)[0]
-        elif flags in (0x2001, 0x3001):
-            if attribute_offset + 11 > len(payload):
-                raise ValueError("Truncated 24-bit source-offset clip payload.")
-            source_offset = int.from_bytes(
-                payload[attribute_offset + 5:attribute_offset + 8], "little"
+        if attribute_offset + 5 > len(payload):
+            raise ValueError("Truncated 0x2628 clip layout header.")
+        width_selector = payload[attribute_offset + 2]
+        width_by_selector = {
+            0x10: 1,
+            0x20: 2,
+            0x30: 3,
+            0x40: 4,
+        }
+        if width_selector not in width_by_selector:
+            raise ValueError(
+                f"Unsupported 0x2628 width selector: 0x{width_selector:02x}."
             )
-            length = int.from_bytes(
-                payload[attribute_offset + 8:attribute_offset + 11], "little"
-            )
-        else:
+        source_width_by_flags = {
+            0x0000: 0,
+            0x0001: 0,
+            0x2000: 2,
+            0x2001: 2,
+            0x3000: 3,
+            0x3001: 3,
+            0x4001: 4,
+        }
+        if flags not in source_width_by_flags:
             raise ValueError(f"Unsupported 0x2628 clip flags: 0x{flags:04x}.")
+
+        source_width = source_width_by_flags[flags]
+        length_width = width_by_selector[width_selector]
+        fields_offset = attribute_offset + 5
+        fields_end = fields_offset + source_width + length_width
+        if fields_end > len(payload):
+            raise ValueError("Truncated source-offset/length clip payload.")
+        source_offset = int.from_bytes(
+            payload[fields_offset:fields_offset + source_width], "little"
+        ) if source_width else 0
+        length_offset = fields_offset + source_width
+        length = int.from_bytes(
+            payload[length_offset:length_offset + length_width], "little"
+        )
 
         return {
             "name": name,
@@ -833,6 +1114,163 @@ class ProToolsSession:
         return disk_files, metadata_files
 
     @staticmethod
+    def _decode_1004_filename_payload(payload):
+        """Decode the verified ordered WAV records from one 0x103a payload."""
+        if not isinstance(payload, (bytes, bytearray)) or len(payload) < 17:
+            raise ValueError("Invalid 0x103a physical-filename payload.")
+        if payload[4] != 0x01:
+            raise ValueError("Unsupported 0x103a physical-filename header.")
+        folder_length = struct.unpack_from("<I", payload, 9)[0]
+        folder_start = 13
+        folder_end = folder_start + folder_length
+        records_start = folder_end + 4
+        if records_start > len(payload):
+            raise ValueError("Truncated 0x103a Audio Files header.")
+        try:
+            folder_name = payload[folder_start:folder_end].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Invalid UTF-8 0x103a folder name.") from exc
+        if folder_name != "Audio Files":
+            raise ValueError("Unsupported 0x103a physical-filename folder.")
+
+        names = []
+        position = records_start
+        record_prefix = b"\x02\x00\x00\x00\x00"
+        while position + 13 <= len(payload) and payload[position:position + 5] == record_prefix:
+            name_length = struct.unpack_from("<I", payload, position + 5)[0]
+            name_start = position + 9
+            name_end = name_start + name_length
+            suffix_end = name_end + 4
+            if suffix_end > len(payload) or payload[name_end:suffix_end] != b"EVAW":
+                raise ValueError("Invalid 0x103a WAV filename record.")
+            try:
+                name = payload[name_start:name_end].decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("Invalid UTF-8 physical WAV filename.") from exc
+            if not name or "\x00" in name:
+                raise ValueError("Invalid physical WAV filename.")
+            names.append(name)
+            position = suffix_end
+        return names, position
+
+    @staticmethod
+    def _decode_1004_catalog_trailer(payload, position, physical_count):
+        """Validate the structural 0x103a tail and return its counter offsets."""
+        if not isinstance(payload, (bytes, bytearray)):
+            raise ValueError("Invalid 0x103a catalog trailer payload.")
+        if (
+            isinstance(position, bool)
+            or not isinstance(position, int)
+            or position < 0
+            or position + 5 > len(payload)
+            or payload[position:position + 5] != b"\x00\xff\xff\xff\xff"
+        ):
+            raise ValueError("Unsupported 0x103a catalog trailer layout.")
+        if (
+            isinstance(physical_count, bool)
+            or not isinstance(physical_count, int)
+            or physical_count < 0
+            or physical_count > 0xFFFFFFFF
+        ):
+            raise ValueError("Invalid 0x103a physical-media count.")
+
+        counter_offsets = []
+        cursor = position + 5
+        expected_counter = physical_count + 1
+        while True:
+            if cursor + 4 > len(payload):
+                raise ValueError("Truncated 0x103a catalog trailer node.")
+            label_length = struct.unpack_from("<I", payload, cursor)[0]
+            label_start = cursor + 4
+            label_end = label_start + label_length
+            if label_end + 4 > len(payload):
+                raise ValueError("Truncated 0x103a catalog trailer label.")
+            try:
+                label = payload[label_start:label_end].decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("Invalid UTF-8 0x103a catalog trailer label.") from exc
+            if not label or "\x00" in label:
+                raise ValueError("Invalid 0x103a catalog trailer label.")
+
+            if (
+                label_end + 4 == len(payload)
+                and payload[label_end:label_end + 4] == b"\x00\x00\x00\x00"
+            ):
+                if not counter_offsets:
+                    raise ValueError(
+                        "A 0x103a catalog trailer requires at least one parent node."
+                    )
+                return counter_offsets
+
+            counter_offset = label_end + 5
+            if (
+                counter_offset + 4 > len(payload)
+                or payload[label_end + 4] != 0x01
+            ):
+                raise ValueError("Unsupported 0x103a catalog trailer node.")
+            counter = struct.unpack_from("<I", payload, counter_offset)[0]
+            if expected_counter > 0xFFFFFFFF or counter != expected_counter:
+                raise ValueError("Inconsistent 0x103a relink counters.")
+            counter_offsets.append(counter_offset)
+            expected_counter += 1
+            cursor = counter_offset + 4
+
+    def _validated_physical_audio_catalog(self):
+        """Return the unique verified 0x1004 media catalog used for relinking."""
+        roots = self._root_blocks(0x1004)
+        if len(roots) != 1:
+            raise ValueError("A unique root 0x1004 media catalog is required.")
+        root = roots[0]
+        if (
+            not root.items
+            or not isinstance(root.items[0], (bytes, bytearray))
+            or len(root.items[0]) < 4
+        ):
+            raise ValueError("Invalid 0x1004 media-entry counter.")
+        entries = [
+            item for item in root.items
+            if isinstance(item, PTBlock) and item.content_type == 0x1003
+        ]
+        declared = struct.unpack_from("<I", root.items[0], 0)[0]
+        if declared != len(entries):
+            raise ValueError(
+                f"Inconsistent 0x1004 media count: declared={declared}, "
+                f"actual={len(entries)}."
+            )
+        for index, entry in enumerate(entries):
+            if (
+                not entry.items
+                or not isinstance(entry.items[0], (bytes, bytearray))
+                or len(entry.items[0]) != 4
+                or struct.unpack_from("<I", entry.items[0], 0)[0] != index + 1
+            ):
+                raise ValueError("Invalid 0x1003 media-entry ordinal.")
+
+        candidates = []
+        for item in root.items:
+            if (
+                isinstance(item, PTBlock)
+                and item.content_type == 0x103a
+                and item.items
+                and isinstance(item.items[0], (bytes, bytearray))
+            ):
+                try:
+                    names, insertion_offset = self._decode_1004_filename_payload(
+                        item.items[0]
+                    )
+                except ValueError:
+                    continue
+                if len(names) == len(entries):
+                    candidates.append((item, names, insertion_offset))
+        if len(candidates) != 1:
+            raise ValueError("A unique ordered 0x103a WAV filename catalog is required.")
+        name_block, names, insertion_offset = candidates[0]
+        ordered_names = names
+        if len({name.casefold() for name in ordered_names}) != len(ordered_names):
+            raise ValueError("Duplicate physical WAV filename in 0x103a catalog.")
+        return root, entries, name_block, ordered_names, insertion_offset
+
+    @staticmethod
     def _match_physical_filename(clip_name, disk_files, metadata_files):
         """Resolve a virtual clip name without inventing a filename."""
         import os
@@ -902,7 +1340,7 @@ class ProToolsSession:
                 info = self._decode_audio_clip_payload(payload_blocks[0].items[0])
                 clips.append({
                     "name": info["name"],
-                    "type": "parent" if info["flags"] == 0x0000 else "virtual",
+                    "type": "parent" if not info["flags"] & 0x0001 else "virtual",
                     "length": engine.samples_to_timecode(info["length"]),
                     "src_offset": engine.samples_to_timecode(info["src_offset"]),
                 })
@@ -948,8 +1386,10 @@ class ProToolsSession:
                 })
         return clips
 
-    def get_timeline_clips(self):
-        """Return validated audio and fade events in global timeline order."""
+    def get_timeline_clips(self, include_fades=True):
+        """Return validated timeline events, optionally limiting the result to audio."""
+        if not isinstance(include_fades, bool):
+            raise TypeError("include_fades must be a boolean.")
         clip_lists = self._root_blocks(0x262a)
         if not clip_lists:
             return []
@@ -975,6 +1415,7 @@ class ProToolsSession:
             )
 
         clip_dict = {}
+        definition_by_clip = {}
         for clip_id, definition in enumerate(definitions):
             payload_blocks = [
                 item for item in definition.items
@@ -989,20 +1430,40 @@ class ProToolsSession:
             clip_dict[clip_id] = self._decode_audio_clip_payload(
                 payload_blocks[0].items[0]
             )
+            definition_by_clip[clip_id] = definition
 
         events = self._validated_main_timeline_events()
-        _, _, fade_bindings = self._validated_fade_geometry_bindings(events)
-        geometry_by_event = {
-            id(entry[1]): geometry
-            for entry, _, geometry in fade_bindings
-        }
+        if include_fades:
+            _, _, fade_bindings = self._validated_fade_geometry_bindings(events)
+            geometry_by_event = {
+                id(entry[1]): geometry
+                for entry, _, geometry in fade_bindings
+            }
+        else:
+            geometry_by_event = {}
         disk_files, metadata_files = self._physical_audio_filenames()
-        physical_by_clip = {
-            clip_id: self._match_physical_filename(
+        try:
+            _, _, _, ordered_physical_names, _ = (
+                self._validated_physical_audio_catalog()
+            )
+        except ValueError:
+            ordered_physical_names = []
+        physical_by_clip = {}
+        for clip_id, info in clip_dict.items():
+            exact_name = None
+            try:
+                _, (_, _, media_record) = self._validated_2629_fixed_records(
+                    definition_by_clip[clip_id]
+                )
+            except ValueError:
+                media_record = None
+            if media_record is not None:
+                media_index = struct.unpack_from("<I", media_record, 96)[0]
+                if media_index < len(ordered_physical_names):
+                    exact_name = ordered_physical_names[media_index]
+            physical_by_clip[clip_id] = exact_name or self._match_physical_filename(
                 info["name"], disk_files, metadata_files
             )
-            for clip_id, info in clip_dict.items()
-        }
 
         track_names = {
             id(playlist): name
@@ -1032,6 +1493,8 @@ class ProToolsSession:
         for playlist, event, _, payload in events:
             event_type = payload[15]
             if event_type not in (0x01, 0x03):
+                continue
+            if event_type == 0x01 and not include_fades:
                 continue
             # Clip Group macro IDs occupy an independent namespace and can
             # numerically collide with ordinary 0x262a IDs. They are not audio
@@ -1745,7 +2208,7 @@ class ProToolsSession:
             bytes(item) for item in event.items
             if isinstance(item, (bytes, bytearray))
         )
-        if secondary_payload == b"\x00\x01\x01":
+        if secondary_payload in (b"\x00\x01\x01", b"\x01\x01\x01"):
             return "audio"
         if secondary_payload == b"\x00\x00\x01":
             return "clip_group"
@@ -2020,6 +2483,527 @@ class ProToolsSession:
         target_b2628.items[0] = new_payload
         return 1
 
+    def _validated_2629_fixed_records(self, definition):
+        """Reassemble the two fixed records around the 0x4403 child."""
+        if not isinstance(definition, PTBlock) or definition.content_type != 0x2629:
+            raise ValueError("A 0x2629 clip definition is required.")
+        name_positions = [
+            index for index, item in enumerate(definition.items)
+            if isinstance(item, PTBlock) and item.content_type == 0x2628
+        ]
+        metadata_positions = [
+            index for index, item in enumerate(definition.items)
+            if isinstance(item, PTBlock) and item.content_type == 0x4403
+        ]
+        if len(name_positions) != 1 or len(metadata_positions) != 1:
+            raise ValueError("Invalid 0x2629 fixed-record structure.")
+        name_position = name_positions[0]
+        metadata_position = metadata_positions[0]
+        if metadata_position <= name_position + 1:
+            raise ValueError("Invalid 0x2629 fixed-record ordering.")
+
+        def serialize_items(items):
+            payload = bytearray()
+            for item in items:
+                if isinstance(item, PTBlock):
+                    serialized, _ = item.to_bytes(self.is_bigendian, 0)
+                    payload.extend(serialized)
+                elif isinstance(item, (bytes, bytearray)):
+                    payload.extend(item)
+                else:
+                    raise ValueError("Invalid item in a 0x2629 fixed record.")
+            return payload
+
+        identity_start = name_position + 1
+        identity_end = metadata_position
+        media_start = metadata_position + 1
+        media_end = len(definition.items)
+        identity = serialize_items(definition.items[identity_start:identity_end])
+        media = serialize_items(definition.items[media_start:media_end])
+        if len(identity) != 48 or len(media) != 104:
+            raise ValueError(
+                "A verified 48-byte identity and 104-byte media record are required."
+            )
+        return (
+            (identity_start, identity_end, identity),
+            (media_start, media_end, media),
+        )
+
+    def relink_clip(
+        self,
+        track_name,
+        clip_name,
+        placement_start_samples,
+        new_clip_name,
+        source_audio_path,
+        new_audio_path,
+        replacement_audio_path=None,
+    ):
+        """Clone one WAV identity and relink one exact placement to it."""
+        original_root_items = copy.deepcopy(self.root_items)
+        original_removed_offsets = list(getattr(self, "_removed_offsets", []))
+        try:
+            return self._relink_clip_impl(
+                track_name,
+                clip_name,
+                placement_start_samples,
+                new_clip_name,
+                source_audio_path,
+                new_audio_path,
+                replacement_audio_path,
+            )
+        except Exception:
+            self.root_items = original_root_items
+            self._removed_offsets = original_removed_offsets
+            raise
+
+    def _relink_clip_impl(
+        self,
+        track_name,
+        clip_name,
+        placement_start_samples,
+        new_clip_name,
+        source_audio_path,
+        new_audio_path,
+        replacement_audio_path,
+    ):
+        import tempfile
+        import uuid
+
+        for value, label in (
+            (track_name, "Track name"),
+            (clip_name, "Clip name"),
+            (new_clip_name, "New clip name"),
+        ):
+            if not isinstance(value, str):
+                raise TypeError(f"{label} must be a string.")
+            if not value:
+                raise ValueError(f"{label} must be non-empty.")
+            if "\x00" in value:
+                raise ValueError(f"{label} cannot contain a NUL character.")
+        if (
+            isinstance(placement_start_samples, bool)
+            or not isinstance(placement_start_samples, int)
+        ):
+            raise TypeError("placement_start_samples must be an integer.")
+        if placement_start_samples < 0 or placement_start_samples > 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("placement_start_samples must fit UInt64.")
+        if placement_start_samples > 0xFFFFFFFF:
+            raise ValueError(
+                "The verified relink clip timestamp must fit UInt32."
+            )
+
+        try:
+            new_clip_name_bytes = new_clip_name.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("New clip name must be valid UTF-8.") from exc
+        if len(new_clip_name_bytes) > 0xFFFFFFFF:
+            raise ValueError("New clip name is too long for the PTX format.")
+
+        source_audio_path = os.path.abspath(
+            _coerce_string_path(source_audio_path, "source_audio_path")
+        )
+        new_audio_path = os.path.abspath(
+            _coerce_string_path(new_audio_path, "new_audio_path")
+        )
+        if replacement_audio_path is not None:
+            replacement_audio_path = os.path.abspath(
+                _coerce_string_path(
+                    replacement_audio_path, "replacement_audio_path"
+                )
+            )
+            if not os.path.isfile(replacement_audio_path):
+                raise FileNotFoundError(
+                    "Replacement WAV does not exist: "
+                    f"{replacement_audio_path}"
+                )
+        if not os.path.isfile(source_audio_path):
+            raise FileNotFoundError(f"Source WAV does not exist: {source_audio_path}")
+        destination_dir = os.path.dirname(new_audio_path)
+        if not os.path.isdir(destination_dir):
+            raise FileNotFoundError(
+                f"New WAV directory does not exist: {destination_dir}"
+            )
+        if os.path.normcase(source_audio_path) == os.path.normcase(new_audio_path):
+            raise ValueError("New WAV path must differ from the source WAV path.")
+        if os.path.exists(new_audio_path):
+            raise FileExistsError(f"New WAV already exists: {new_audio_path}")
+        source_filename = os.path.basename(source_audio_path)
+        new_filename = os.path.basename(new_audio_path)
+        if not source_filename.lower().endswith(".wav") or not new_filename.lower().endswith(".wav"):
+            raise ValueError("Relinking currently supports WAV files only.")
+        source_stem = os.path.splitext(source_filename)[0]
+        new_stem = os.path.splitext(new_filename)[0]
+        try:
+            source_stem_bytes = source_stem.encode("utf-8")
+            new_stem_bytes = new_stem.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("Physical WAV stems must be valid UTF-8.") from exc
+        if len(new_stem_bytes) != len(source_stem_bytes):
+            raise ValueError(
+                "New WAV stem must have the same UTF-8 byte length as the source."
+            )
+
+        clip_id = self._resolve_unique_clip_id(clip_name)
+        clip_list = self._root_blocks(0x262a)[0]
+        definitions = [
+            item for item in clip_list.items
+            if isinstance(item, PTBlock) and item.content_type == 0x2629
+        ]
+        if len(definitions) > 0xFFFFFFFF:
+            raise OverflowError("New clip ID exceeds UInt32.")
+        for definition_id, definition in enumerate(definitions):
+            info = self._audio_clip_info_by_id(definition_id)
+            if definition_id != clip_id and info["name"] == new_clip_name:
+                raise ValueError(
+                    f"Clip name '{new_clip_name}' already exists in the session."
+                )
+        source_definition = definitions[clip_id]
+        source_name_blocks = [
+            child for child in source_definition.items
+            if isinstance(child, PTBlock) and child.content_type == 0x2628
+        ]
+        if (
+            len(source_name_blocks) != 1
+            or not source_name_blocks[0].items
+            or not isinstance(source_name_blocks[0].items[0], (bytes, bytearray))
+        ):
+            raise ValueError("Invalid source 0x2628 relink payload.")
+        source_clip_payload = source_name_blocks[0].items[0]
+        source_clip_name_length = struct.unpack_from(
+            "<I", source_clip_payload, 0
+        )[0]
+        source_attributes = 4 + source_clip_name_length
+        source_clip_info = self._decode_audio_clip_payload(source_clip_payload)
+        patch_root_timestamps = False
+        if (
+            source_attributes + 16 <= len(source_clip_payload)
+            and source_clip_payload[source_attributes:source_attributes + 5]
+            == b"\x00\x00\x30\x44\x00"
+        ):
+            source_timestamp_offset = source_attributes + 8
+            first_source_timestamp = struct.unpack_from(
+                "<I", source_clip_payload, source_timestamp_offset
+            )[0]
+            second_source_timestamp = struct.unpack_from(
+                "<I", source_clip_payload, source_timestamp_offset + 4
+            )[0]
+            if first_source_timestamp != second_source_timestamp:
+                raise ValueError("Invalid root-audio 0x2628 time-reference pair.")
+            source_time_reference = first_source_timestamp
+            new_media_time_reference = placement_start_samples
+            patch_root_timestamps = True
+        else:
+            source_width_by_flags = {
+                0x0001: 0,
+                0x2001: 2,
+                0x3001: 3,
+                0x4001: 4,
+            }
+            length_width_by_selector = {
+                0x10: 1,
+                0x20: 2,
+                0x30: 3,
+                0x40: 4,
+            }
+            source_flags = source_clip_info["flags"]
+            source_width = source_width_by_flags.get(source_flags)
+            width_selector = (
+                source_clip_payload[source_attributes + 2]
+                if source_attributes + 5 <= len(source_clip_payload)
+                else None
+            )
+            length_width = length_width_by_selector.get(width_selector)
+            expected_layout_marker = ((source_flags >> 8) & 0xF0) | 0x04
+            if (
+                source_width is None
+                or length_width is None
+                or source_clip_payload[source_attributes + 3]
+                != expected_layout_marker
+                or source_clip_payload[source_attributes + 4] != 0x08
+            ):
+                raise ValueError(
+                    "Relinking requires a verified root or production-virtual "
+                    "0x2628 layout."
+                )
+            embedded_reference_offset = (
+                source_attributes + 5 + source_width + length_width
+            )
+            if embedded_reference_offset + 4 > len(source_clip_payload):
+                raise ValueError(
+                    "Truncated production-virtual 0x2628 time reference."
+                )
+            embedded_reference = struct.unpack_from(
+                "<I", source_clip_payload, embedded_reference_offset
+            )[0]
+            if embedded_reference < source_clip_info["src_offset"]:
+                raise ValueError(
+                    "Invalid production-virtual 0x2628 time reference."
+                )
+            source_time_reference = (
+                embedded_reference - source_clip_info["src_offset"]
+            )
+            new_media_time_reference = source_time_reference
+        _, (_, _, media_record) = self._validated_2629_fixed_records(
+            source_definition
+        )
+        source_media_index = struct.unpack_from("<I", media_record, 96)[0]
+
+        catalog, media_entries, name_block, physical_names, name_insert = (
+            self._validated_physical_audio_catalog()
+        )
+        if source_media_index >= len(media_entries):
+            raise ValueError("Clip media index is outside the 0x1004 catalog.")
+        if physical_names[source_media_index].casefold() != source_filename.casefold():
+            raise ValueError(
+                "source_audio_path does not match the clip's physical WAV entry."
+            )
+        if any(name.casefold() == new_filename.casefold() for name in physical_names):
+            raise ValueError(f"Physical WAV '{new_filename}' already exists in the session.")
+        new_media_index = len(media_entries)
+        if new_media_index > 0xFFFFFFFF:
+            raise OverflowError("Verified clip media indexes are limited to UInt32.")
+        try:
+            new_filename_bytes = new_filename.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("New physical WAV filename must be valid UTF-8.") from exc
+        if len(new_filename_bytes) > 0xFFFFFFFF:
+            raise ValueError("New physical WAV filename is too long.")
+
+        matching_events = []
+        for playlist, visible_track_name, events in self._validated_main_playlists():
+            if visible_track_name != track_name:
+                continue
+            for event in events:
+                payload_block = next(
+                    child for child in event.items
+                    if isinstance(child, PTBlock) and child.content_type == 0x104f
+                )
+                payload = payload_block.items[0]
+                if self._audio_timeline_event_kind(event, payload) != "audio":
+                    continue
+                event_clip_id = struct.unpack_from("<I", payload, 2)[0]
+                event_start = struct.unpack_from("<Q", payload, 7)[0]
+                if event_clip_id == clip_id and event_start == placement_start_samples:
+                    matching_events.append(payload_block)
+        if len(matching_events) != 1:
+            raise ValueError(
+                "Relink target must resolve exactly one placement on the requested track."
+            )
+
+        descriptor = None
+        temporary_path = None
+        try:
+            descriptor, temporary_path = tempfile.mkstemp(
+                prefix=f".{new_filename}.", suffix=".tmp", dir=destination_dir
+            )
+            os.close(descriptor)
+            descriptor = None
+            identity = _clone_pro_tools_wave(
+                source_audio_path,
+                temporary_path,
+                new_stem,
+                source_time_reference,
+                new_media_time_reference,
+                replacement_audio_path,
+            )
+
+            source_media_entry = media_entries[source_media_index]
+            new_media_entry = copy.deepcopy(source_media_entry)
+            self._wipe_offsets_recursive(new_media_entry)
+            ordinal_payload = bytearray(new_media_entry.items[0])
+            struct.pack_into("<I", ordinal_payload, 0, new_media_index + 1)
+            new_media_entry.items[0] = ordinal_payload
+
+            media_info_blocks = [
+                child for child in new_media_entry.items
+                if isinstance(child, PTBlock) and child.content_type == 0x1001
+            ]
+            media_detail_blocks = [
+                child for child in new_media_entry.items
+                if isinstance(child, PTBlock) and child.content_type == 0x2106
+            ]
+            if len(media_info_blocks) != 1 or len(media_detail_blocks) != 1:
+                raise ValueError("Invalid 0x1003 relink media template.")
+            media_info = media_info_blocks[0]
+            if (
+                len(media_info.items) != 1
+                or not isinstance(media_info.items[0], (bytes, bytearray))
+                or len(media_info.items[0]) != 31
+            ):
+                raise ValueError("Invalid 0x1001 relink media identity.")
+            media_info_payload = bytearray(media_info.items[0])
+            media_info_payload[22:31] = identity["file_identifier"]
+            media_info.items[0] = media_info_payload
+
+            media_detail = media_detail_blocks[0]
+            detail_headers = [
+                (index, item) for index, item in enumerate(media_detail.items)
+                if isinstance(item, (bytes, bytearray)) and len(item) in (142, 151)
+            ]
+            detail_tails = [
+                (index, item) for index, item in enumerate(media_detail.items)
+                if isinstance(item, (bytes, bytearray)) and len(item) == 58
+            ]
+            if len(detail_headers) != 1 or len(detail_tails) != 1:
+                raise ValueError("Invalid 0x2106 relink media template.")
+            header_index, detail_header = detail_headers[0]
+            detail_header = bytearray(detail_header)
+            if len(detail_header) == 151:
+                time_reference_offset = 100
+                second_filetime_offset = 105
+                uuid_offset = 135
+            else:
+                time_reference_offset = 91
+                second_filetime_offset = 96
+                uuid_offset = 126
+            struct.pack_into(
+                "<Q", detail_header, 29, identity["rounded_filetime"]
+            )
+            struct.pack_into(
+                "<I",
+                detail_header,
+                time_reference_offset,
+                new_media_time_reference,
+            )
+            struct.pack_into(
+                "<Q",
+                detail_header,
+                second_filetime_offset,
+                identity["prior_filetime"],
+            )
+            detail_header[uuid_offset:uuid_offset + 16] = uuid.uuid4().bytes
+            media_detail.items[header_index] = detail_header
+            tail_index, detail_tail = detail_tails[0]
+            detail_tail = bytearray(detail_tail)
+            detail_tail[18:50] = identity["umid"][:32]
+            media_detail.items[tail_index] = detail_tail
+
+            name_payload = bytearray(name_block.items[0])
+            top_count = struct.unpack_from("<I", name_payload, 0)[0]
+            nested_count = struct.unpack_from("<I", name_payload, 5)[0]
+            trailer_count_offsets = self._decode_1004_catalog_trailer(
+                name_payload, name_insert, new_media_index
+            )
+            trailer_depth = len(trailer_count_offsets)
+            if (
+                top_count != new_media_index + trailer_depth + 2
+                or nested_count != new_media_index + trailer_depth + 1
+            ):
+                raise ValueError("Inconsistent 0x103a relink counters.")
+            if (
+                top_count == 0xFFFFFFFF
+                or nested_count == 0xFFFFFFFF
+                or any(
+                    struct.unpack_from("<I", name_payload, offset)[0]
+                    == 0xFFFFFFFF
+                    for offset in trailer_count_offsets
+                )
+            ):
+                raise OverflowError("0x103a physical-filename count exceeds UInt32.")
+            struct.pack_into("<I", name_payload, 0, top_count + 1)
+            struct.pack_into("<I", name_payload, 5, nested_count + 1)
+            for offset in trailer_count_offsets:
+                trailer_count = struct.unpack_from("<I", name_payload, offset)[0]
+                struct.pack_into("<I", name_payload, offset, trailer_count + 1)
+            filename_record = bytearray(b"\x02\x00\x00\x00\x00")
+            filename_record.extend(struct.pack("<I", len(new_filename_bytes)))
+            filename_record.extend(new_filename_bytes)
+            filename_record.extend(b"EVAW")
+            name_payload[name_insert:name_insert] = filename_record
+            name_block.items[0] = name_payload
+
+            catalog_count = bytearray(catalog.items[0])
+            struct.pack_into("<I", catalog_count, 0, new_media_index + 1)
+            catalog.items[0] = catalog_count
+            last_media_position = max(
+                index for index, item in enumerate(catalog.items)
+                if isinstance(item, PTBlock) and item.content_type == 0x1003
+            )
+            catalog.items.insert(last_media_position + 1, new_media_entry)
+
+            new_definition = copy.deepcopy(source_definition)
+            self._wipe_offsets_recursive(new_definition)
+            identity_span, media_span = self._validated_2629_fixed_records(
+                new_definition
+            )
+            identity_start, identity_end, clip_identity = identity_span
+            media_start, media_end, cloned_record = media_span
+
+            cloned_record = bytearray(cloned_record)
+            struct.pack_into("<I", cloned_record, 96, new_media_index)
+            new_definition.items[media_start:media_end] = [cloned_record]
+
+            clip_identity = bytearray(clip_identity)
+            struct.pack_into("<I", clip_identity, 0, len(definitions))
+            clip_identity[23:39] = uuid.uuid4().bytes
+            new_definition.items[identity_start:identity_end] = [clip_identity]
+
+            name_blocks = [
+                child for child in new_definition.items
+                if isinstance(child, PTBlock) and child.content_type == 0x2628
+            ]
+            if (
+                len(name_blocks) != 1
+                or not name_blocks[0].items
+                or not isinstance(name_blocks[0].items[0], (bytes, bytearray))
+            ):
+                raise ValueError("Invalid relink 0x2628 clip payload.")
+            source_name_payload = name_blocks[0].items[0]
+            source_name_length = struct.unpack_from("<I", source_name_payload, 0)[0]
+            source_tail = source_name_payload[4 + source_name_length:]
+            new_name_payload = bytearray(
+                4 + len(new_clip_name_bytes) + len(source_tail)
+            )
+            struct.pack_into("<I", new_name_payload, 0, len(new_clip_name_bytes))
+            new_name_payload[4:4 + len(new_clip_name_bytes)] = new_clip_name_bytes
+            new_name_payload[4 + len(new_clip_name_bytes):] = source_tail
+            if patch_root_timestamps:
+                new_timestamp_offset = 4 + len(new_clip_name_bytes) + 8
+                struct.pack_into(
+                    "<I",
+                    new_name_payload,
+                    new_timestamp_offset,
+                    placement_start_samples,
+                )
+                struct.pack_into(
+                    "<I",
+                    new_name_payload,
+                    new_timestamp_offset + 4,
+                    placement_start_samples,
+                )
+            name_blocks[0].items[0] = new_name_payload
+
+            clip_count_payload = bytearray(clip_list.items[0])
+            struct.pack_into("<I", clip_count_payload, 0, len(definitions) + 1)
+            clip_list.items[0] = clip_count_payload
+            last_definition_position = max(
+                index for index, item in enumerate(clip_list.items)
+                if isinstance(item, PTBlock) and item.content_type == 0x2629
+            )
+            clip_list.items.insert(last_definition_position + 1, new_definition)
+
+            target_event_payload = bytearray(matching_events[0].items[0])
+            struct.pack_into("<I", target_event_payload, 2, len(definitions))
+            matching_events[0].items[0] = target_event_payload
+
+            os.replace(temporary_path, new_audio_path)
+            temporary_path = None
+            return {
+                "clip_id": len(definitions),
+                "clip_name": new_clip_name,
+                "physical_index": new_media_index,
+                "physical_filename": new_filename,
+            }
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if temporary_path is not None:
+                try:
+                    os.remove(temporary_path)
+                except FileNotFoundError:
+                    pass
+
     def duplicate_clip(self, clip_name, hh, mm, ss, ff, mute=False):
         """Atomically duplicate one unambiguous visible audio placement."""
         original_root_items = copy.deepcopy(self.root_items)
@@ -2223,13 +3207,21 @@ class ProToolsSession:
         if offset + 17 > len(pl_orig):
             raise ValueError("Invalid root 0x2628 clip payload.")
         
-        # Ensure it is a 32-bit root clip format (00 00 or 01 00 followed by 30 44 00)
+        # Pro Tools uses selector 0x30 for ordinary roots and 0x40 when the
+        # UInt32 length needs its fourth byte. Both keep the timestamps at +9.
         hdr = pl_orig[offset:offset+5]
-        if hdr not in (b"\x00\x00\x30\x44\x00", b"\x01\x00\x30\x44\x00"):
-            raise ValueError("Clip is already a split or has unsupported format (needs 32-bit root format).")
+        if hdr not in (
+            b"\x00\x00\x30\x44\x00",
+            b"\x00\x00\x40\x44\x00",
+            b"\x01\x00\x30\x44\x00",
+        ):
+            raise ValueError(
+                "Clip is already a split or has an unsupported root layout."
+            )
             
         orig_length = struct.unpack_from("<I", pl_orig, offset+5)[0]
-        orig_ts1 = struct.unpack_from("<I", pl_orig, offset+9)[0]
+        orig_time_1 = bytes(pl_orig[offset+10:offset+13])
+        orig_time_2 = bytes(pl_orig[offset+14:offset+17])
         
         # 3. Find the track and event on the timeline
         track_maps = self._root_blocks(0x1054)
@@ -2331,9 +3323,9 @@ class ProToolsSession:
             
         relative_cut_samples = cut_samples - event_start_samples
         rem_length = orig_length - relative_cut_samples
-        if relative_cut_samples > 0xFFFFFF or rem_length > 0xFFFFFF:
+        if relative_cut_samples > 0xFFFFFF:
             raise ValueError(
-                "Split source offset and both resulting lengths must fit in 24 bits."
+                "Split source offset must fit in the verified 24-bit field."
             )
         if cut_samples > 0xFFFFFFFF:
             raise ValueError("Split timestamp exceeds the 32-bit 0x2628 timestamp range.")
@@ -2367,14 +3359,15 @@ class ProToolsSession:
         pl_01.extend(struct.pack("<I", len(new_name_01)))
         pl_01.extend(new_name_01)
         pl_01.extend(b"\x01\x00\x30\x44\x08") # Header
-        # 24-bit length
+        # UInt32 field; the verified source-offset constraint currently keeps
+        # this left-fragment length within 24 bits.
         pl_01.append(relative_cut_samples & 0xFF)
         pl_01.append((relative_cut_samples >> 8) & 0xFF)
         pl_01.append((relative_cut_samples >> 16) & 0xFF)
         pl_01.append(0x00)
         pl_01[-1] = (relative_cut_samples >> 24) & 0xFF
-        pl_01.extend(struct.pack("<I", orig_ts1))
-        pl_01.extend(struct.pack("<I", orig_ts1 | 0xFF000000))
+        pl_01.extend(orig_time_1 + b"\x00")
+        pl_01.extend(orig_time_2 + b"\xff")
         pl_01.extend(b"\xff\xff\xff\xff\xff\xff\xff\xfe") # 8 bytes padding
         # The "rest" after padding must have metadata zeroed out for sub-clips.
         # Parent's rest = pl_orig[offset+17:] contains UUID bytes that must NOT be copied.
@@ -2400,17 +3393,17 @@ class ProToolsSession:
         pl_02 = bytearray()
         pl_02.extend(struct.pack("<I", len(new_name_02)))
         pl_02.extend(new_name_02)
-        pl_02.extend(b"\x01\x30\x30\x44\x08")
+        right_length_width = 3 if rem_length <= 0xFFFFFF else 4
+        right_width_selector = b"\x30" if right_length_width == 3 else b"\x40"
+        pl_02.extend(b"\x01\x30" + right_width_selector + b"\x44\x08")
         
         # 24-bit offset
         pl_02.append(relative_cut_samples & 0xFF)
         pl_02.append((relative_cut_samples >> 8) & 0xFF)
         pl_02.append((relative_cut_samples >> 16) & 0xFF)
         
-        # 24-bit length
-        pl_02.append(rem_length & 0xFF)
-        pl_02.append((rem_length >> 8) & 0xFF)
-        pl_02.append((rem_length >> 16) & 0xFF)
+        # Selector 0x30 carries a UInt24 length; selector 0x40 carries UInt32.
+        pl_02.extend(rem_length.to_bytes(right_length_width, "little"))
         
         # 32-bit TS1 and TS2 — these are TIMELINE ABSOLUTE timestamps,
         # NOT internal clip offsets. Must use orig_abs_ts (from 0x104f) + relative_cut_samples.
@@ -2463,8 +3456,7 @@ class ProToolsSession:
         # Now patch clip -02's ts1/ts2 with the correct TIMELINE absolute timestamp
         pl_02_patched = bytearray(b2628_02.items[0])
         nlen_02 = struct.unpack_from("<I", pl_02_patched, 0)[0]
-        # ts1 and ts2 are at offset name_len + 4 + 5 + 3 + 3 = name_len + 15
-        ts_offset = 4 + nlen_02 + 5 + 3 + 3  # after name + header + src_offset_24 + length_24
+        ts_offset = 4 + nlen_02 + 5 + 3 + right_length_width
         struct.pack_into("<I", pl_02_patched, ts_offset, cut_abs_ts)
         struct.pack_into("<I", pl_02_patched, ts_offset + 4, cut_abs_ts)
         b2628_02.items[0] = bytes(pl_02_patched)
@@ -3526,7 +4518,7 @@ class ProToolsSession:
                     pass
 
     def create_subclip(self, orig_clip_id, new_name, src_offset, length):
-        """Create one validated 24-bit virtual clip definition."""
+        """Create one validated virtual clip definition."""
         import uuid
 
         if isinstance(orig_clip_id, bool) or not isinstance(orig_clip_id, int):
@@ -3542,8 +4534,16 @@ class ProToolsSession:
             raise TypeError("Sub-clip source offset and length must be integers.")
         if src_offset < 0 or length <= 0:
             raise ValueError("Sub-clip source offset must be >= 0 and length must be > 0.")
-        if src_offset > 0x00FFFFFF or length > 0x00FFFFFF:
-            raise ValueError("Trimmed sub-clips are limited to 24-bit values.")
+        if src_offset > 0xFFFFFFFF or length > 0xFFFFFFFF:
+            raise ValueError("Sub-clip source offset and length must fit UInt32.")
+        if src_offset == 0 and length > 0x00FFFFFF:
+            raise ValueError(
+                "The zero-offset long sub-clip layout has not been verified."
+            )
+        if src_offset > 0x00FFFFFF and length > 0x00FFFFFF:
+            raise ValueError(
+                "The combined UInt32 source-offset/length layout has not been verified."
+            )
 
         clip_roots = self._root_blocks(0x262a)
         if len(clip_roots) != 1:
@@ -3605,13 +4605,13 @@ class ProToolsSession:
         pl.extend(new_name_enc)
 
         if src_offset > 0:
-            pl.extend(b"\x01\x30\x30\x44\x08")
-            pl.append(src_offset & 0xFF)
-            pl.append((src_offset >> 8) & 0xFF)
-            pl.append((src_offset >> 16) & 0xFF)
-            pl.append(length & 0xFF)
-            pl.append((length >> 8) & 0xFF)
-            pl.append((length >> 16) & 0xFF)
+            source_width = 3 if src_offset <= 0x00FFFFFF else 4
+            length_width = 3 if length <= 0x00FFFFFF else 4
+            source_flag = b"\x30" if source_width == 3 else b"\x40"
+            length_selector = b"\x30" if length_width == 3 else b"\x40"
+            pl.extend(b"\x01" + source_flag + length_selector + b"\x44\x08")
+            pl.extend(src_offset.to_bytes(source_width, "little"))
+            pl.extend(length.to_bytes(length_width, "little"))
             pl.extend(b"\x00" * 8)
             pl.extend(b"\xff\xff\xff\xff\xff\xff\xff\xff")
             rest = bytearray()
@@ -3722,8 +4722,38 @@ class ProToolsSession:
             updated_payload = bytearray(source_payload)
             struct.pack_into("<I", updated_payload, 2, new_clip_id)
             if trim_start:
+                new_start_samples = start_samples + amount_samples
+                if new_start_samples > 0xFFFFFFFF:
+                    raise ValueError(
+                        "Trim start timestamp exceeds the UInt32 0x2628 range."
+                    )
+                new_definitions = [
+                    item for item in clip_root.items
+                    if isinstance(item, PTBlock) and item.content_type == 0x2629
+                ]
+                new_definition = new_definitions[new_clip_id]
+                new_b2628 = next(
+                    item for item in new_definition.items
+                    if isinstance(item, PTBlock) and item.content_type == 0x2628
+                )
+                new_clip_payload = bytearray(new_b2628.items[0])
+                new_name_length = struct.unpack_from("<I", new_clip_payload, 0)[0]
+                attribute_offset = 4 + new_name_length
+                flags = struct.unpack_from("<H", new_clip_payload, attribute_offset)[0]
+                source_width = 4 if flags == 0x4001 else 3
+                length_width = (
+                    4 if new_clip_payload[attribute_offset + 2] == 0x40 else 3
+                )
+                timestamp_offset = (
+                    attribute_offset + 5 + source_width + length_width
+                )
                 struct.pack_into(
-                    "<Q", updated_payload, 7, start_samples + amount_samples
+                    "<II", new_clip_payload, timestamp_offset,
+                    new_start_samples, new_start_samples,
+                )
+                new_b2628.items[0] = bytes(new_clip_payload)
+                struct.pack_into(
+                    "<Q", updated_payload, 7, new_start_samples
                 )
             b104f.items[0] = bytes(updated_payload)
             direction = "start" if trim_start else "end"

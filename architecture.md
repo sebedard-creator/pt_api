@@ -31,17 +31,18 @@ Fichier PTX chiffré
     → parsing en arbre PTBlock
     → validation structurelle de la session
     → lectures ou mutations via ProToolsSession
+    → éventuellement, clonage atomique d'un WAV et nouvelle identité BWF/PTX
     → sérialisation et relocalisation des pointeurs
     → rechiffrement et remplacement atomique du fichier cible
 ```
 
-Le chargement produit un modèle mémoire déchiffré. Les opérations modifient ce modèle; aucune écriture n'a lieu avant l'appel explicite à `save()`.
+Le chargement produit un modèle mémoire déchiffré. Les opérations ordinaires modifient seulement ce modèle jusqu'à l'appel explicite à `save()`. Le relink physique est l'exception : il installe d'abord un clone WAV atomique — éventuellement avec le chunk PCM `data` d'un rendu strictement compatible — puis l'appelant sauvegarde séparément le PTX; cette frontière est explicite dans le contrat public.
 
 ## Composants principaux
 
 ### Entrées/sorties et chiffrement
 
-Les fonctions de chiffrement valident l'en-tête PTX, transforment une copie des données et préservent le tampon de l'appelant. Les chemins `str` et `os.PathLike` textuels sont normalisés; les erreurs système gardent leur type natif. Les écritures utilisent un fichier temporaire et `os.replace()`.
+Les fonctions de chiffrement valident l'en-tête PTX, transforment une copie des données et préservent le tampon de l'appelant. Les chemins `str` et `os.PathLike` textuels sont normalisés; les erreurs système gardent leur type natif. Les écritures PTX et le clonage physique d'un WAV utilisent un fichier temporaire et `os.replace()`.
 
 ### `PTBlock` et parseur
 
@@ -60,7 +61,7 @@ Les fonctions de chiffrement valident l'en-tête PTX, transforment une copie des
 - les métadonnées temporelles;
 - la liste des offsets de blocs supprimés qui devront être purgés à la sauvegarde.
 
-Les méthodes de lecture exposent pistes, marqueurs, clips et événements. Les méthodes de mutation couvrent les opérations audio documentées dans le README. Les validateurs communs résolvent les noms, compteurs, placements, géométries et dictionnaires avant toute écriture.
+Les méthodes de lecture exposent pistes, marqueurs, clips et événements. Les méthodes de mutation couvrent les opérations audio documentées dans le README, y compris le clonage/relink physique étroit d'un placement. Les validateurs communs résolvent les noms, compteurs, placements, géométries, catalogues média et dictionnaires avant toute écriture. La hiérarchie interne d'un catalogue PTX reste distincte de la résolution des chemins : l'application fournit les chemins WAV, normalement sous le dossier `Audio Files` associé à la session.
 
 ## Modèle de modification
 
@@ -68,7 +69,7 @@ Les mutations suivent trois règles générales :
 
 1. **Ciblage déterministe** : un nom ou placement ambigu est refusé; les espaces d'IDs audio, fade et Clip Group restent séparés.
 2. **Préservation binaire** : les zones inconnues et segments bruts sont conservés; aucun padding ou bloc n'est inventé hors d'un modèle validé.
-3. **Transaction mémoire** : une opération composée sauvegarde l'arbre courant et le restaure entièrement si une étape échoue.
+3. **Transaction contrôlée** : une opération composée sauvegarde l'arbre courant et le restaure entièrement si une étape échoue. Le relink supprime aussi son fichier temporaire; après son remplacement final réussi, le nouveau WAV appartient toutefois à l'appelant même si la sauvegarde PTX ultérieure échoue.
 
 Un bloc existant conserve son `original_offset`, utilisé pour relocaliser les pointeurs. Une nouvelle copie reçoit un offset neuf. Une suppression réelle enregistre d'abord tous les offsets descendants afin que les références correspondantes soient retirées proprement.
 

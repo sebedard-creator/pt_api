@@ -13,7 +13,8 @@ def make_block(block_type, content_type, items):
 def make_clip(name="CLIP", length=1_000, clip_id=0):
     name_bytes = name.encode("utf-8")
     payload = bytearray(struct.pack("<I", len(name_bytes)) + name_bytes)
-    payload.extend(b"\x00\x00\x30\x44\x08")
+    selector = b"\x40" if length > 0xFFFFFF else b"\x30"
+    payload.extend(b"\x00\x00" + selector + b"\x44\x00")
     payload.extend(struct.pack("<I", length))
     payload.extend(b"\x00" * 50)
 
@@ -34,7 +35,7 @@ def make_event(clip_id=0, timestamp=10_000, muted=False, event_type=0x03):
     return make_block(3, 0x1050, [b104f, bytearray(tail)])
 
 
-def make_session(muted=False, events=None):
+def make_session(muted=False, events=None, clip_length=1_000, event_timestamp=10_000):
     session = ProToolsSession.__new__(ProToolsSession)
     session.is_bigendian = False
     session.sample_rate = 48_000
@@ -44,9 +45,9 @@ def make_session(muted=False, events=None):
     clip_list = make_block(
         1,
         0x262A,
-        [bytearray(struct.pack("<I", 1)), make_clip()],
+        [bytearray(struct.pack("<I", 1)), make_clip(length=clip_length)],
     )
-    event = make_event(muted=muted)
+    event = make_event(timestamp=event_timestamp, muted=muted)
     if events is None:
         events = [event]
     track_name = b"TRACK"
@@ -135,13 +136,63 @@ class TrimmingTests(unittest.TestCase):
         self.assertEqual(struct.unpack_from("<H", payload, offset)[0], 0x0001)
         self.assertEqual(struct.unpack_from("<I", payload, offset + 5)[0], 900)
 
-    def test_trim_start_rejects_values_outside_24_bit_encoding(self):
+    def test_trim_start_uses_uint32_length_selector(self):
+        session, clip_list, event = make_session(clip_length=17_280_000)
+
+        session.trim_clip_start("CLIP", 480_000)
+
+        definitions = [
+            item for item in clip_list.items
+            if isinstance(item, PTBlock) and item.content_type == 0x2629
+        ]
+        payload = clip_payload(definitions[-1])
+        name_length = struct.unpack_from("<I", payload, 0)[0]
+        offset = 4 + name_length
+        self.assertEqual(payload[offset:offset + 5], b"\x01\x30\x40\x44\x08")
+        self.assertEqual(
+            int.from_bytes(payload[offset + 5:offset + 8], "little"), 480_000
+        )
+        self.assertEqual(struct.unpack_from("<I", payload, offset + 8)[0], 16_800_000)
+        self.assertEqual(
+            struct.unpack_from("<II", payload, offset + 12),
+            (490_000, 490_000),
+        )
+        self.assertEqual(struct.unpack_from("<Q", event_payload(event), 7)[0], 490_000)
+
+    def test_trim_start_uses_uint32_source_offset_flag(self):
+        session, clip_list, event = make_session(clip_length=17_280_000)
+
+        session.trim_clip_start("CLIP", 16_800_000)
+
+        definitions = [
+            item for item in clip_list.items
+            if isinstance(item, PTBlock) and item.content_type == 0x2629
+        ]
+        payload = clip_payload(definitions[-1])
+        name_length = struct.unpack_from("<I", payload, 0)[0]
+        offset = 4 + name_length
+        self.assertEqual(payload[offset:offset + 5], b"\x01\x40\x30\x44\x08")
+        self.assertEqual(struct.unpack_from("<I", payload, offset + 5)[0], 16_800_000)
+        self.assertEqual(
+            int.from_bytes(payload[offset + 9:offset + 12], "little"), 480_000
+        )
+        self.assertEqual(
+            struct.unpack_from("<II", payload, offset + 12),
+            (16_810_000, 16_810_000),
+        )
+        self.assertEqual(
+            struct.unpack_from("<Q", event_payload(event), 7)[0], 16_810_000
+        )
+
+    def test_unverified_subclip_width_combinations_are_rejected(self):
         session, _, _ = make_session()
 
-        with self.assertRaisesRegex(ValueError, "24-bit"):
-            session.create_subclip(0, "TOO_LONG", 1, 0x01000000)
-        with self.assertRaisesRegex(ValueError, "24-bit"):
-            session.create_subclip(0, "TOO_LONG", 0, 0x01000000)
+        with self.assertRaisesRegex(ValueError, "zero-offset long"):
+            session.create_subclip(0, "ZERO_LONG", 0, 0x01000000)
+        with self.assertRaisesRegex(ValueError, "combined UInt32"):
+            session.create_subclip(0, "BOTH_LONG", 0x01000000, 0x01000000)
+        with self.assertRaisesRegex(ValueError, "fit UInt32"):
+            session.create_subclip(0, "OFFSET_OVERFLOW", 0x100000000, 1)
 
     def test_create_subclip_rejects_invalid_utf8_without_mutation(self):
         session, clip_list, _ = make_session()
@@ -151,23 +202,6 @@ class TrimmingTests(unittest.TestCase):
             session.create_subclip(0, "Bad\ud800Name", 0, 100)
 
         self.assertEqual(clip_list.to_bytes(False, 100)[0], original)
-
-    def test_parent_length_masks_the_following_timestamp_byte(self):
-        session, clip_list, _ = make_session()
-        parent_payload = clip_payload(clip_list.items[1])
-        name_len = struct.unpack_from("<I", parent_payload, 0)[0]
-        parent_payload[4 + name_len + 8] = 0xAB
-
-        session.trim_clip_end("CLIP", 100)
-
-        definitions = [
-            item for item in clip_list.items
-            if isinstance(item, PTBlock) and item.content_type == 0x2629
-        ]
-        payload = clip_payload(definitions[-1])
-        new_name_len = struct.unpack_from("<I", payload, 0)[0]
-        offset = 4 + new_name_len
-        self.assertEqual(struct.unpack_from("<I", payload, offset + 5)[0], 900)
 
     def test_start_then_end_trim_composes_on_the_virtual_clip(self):
         session, clip_list, event = make_session()

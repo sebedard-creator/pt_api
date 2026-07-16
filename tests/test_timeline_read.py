@@ -13,25 +13,44 @@ def block(block_type, content_type, items):
 def definition(name, length=1_000, flags=0x0000, src_offset=0):
     encoded = name.encode("utf-8")
     payload = bytearray(struct.pack("<I", len(encoded)) + encoded)
-    if flags in (0x0000, 0x0001):
-        payload.extend(struct.pack("<H", flags) + b"\x30\x44\x00")
-        payload.extend(struct.pack("<I", length))
-    elif flags in (0x2001, 0x3001):
-        payload.extend(struct.pack("<H", flags) + b"\x30\x44\x08")
-        payload.extend(src_offset.to_bytes(3, "little"))
-        payload.extend(length.to_bytes(3, "little"))
-    else:
+    source_width = {
+        0x0000: 0,
+        0x0001: 0,
+        0x2000: 2,
+        0x2001: 2,
+        0x3000: 3,
+        0x3001: 3,
+        0x4001: 4,
+    }.get(flags)
+    if source_width is None:
         raise AssertionError("Unsupported test flag")
+    if length <= 0xFF:
+        length_width = 1
+    elif length <= 0xFFFF:
+        length_width = 2
+    elif length <= 0xFFFFFF:
+        length_width = 3
+    else:
+        length_width = 4
+    selector = bytes([length_width << 4])
+    layout = bytes([(source_width << 4) | 0x04, 0x08])
+    payload.extend(struct.pack("<H", flags) + selector + layout)
+    if source_width:
+        payload.extend(src_offset.to_bytes(source_width, "little"))
+    payload.extend(length.to_bytes(length_width, "little"))
     return block(11, 0x2629, [block(1, 0x2628, [payload])])
 
 
-def event(clip_id, timestamp, event_type=0x03, muted=False):
+def event(clip_id, timestamp, event_type=0x03, muted=False, secondary_prefix=0):
     payload = bytearray(35)
     payload[0] = 1 if muted else 0
     struct.pack_into("<I", payload, 2, clip_id)
     struct.pack_into("<Q", payload, 7, timestamp)
     payload[15] = event_type
-    tail = b"\x00\x01\x01" if event_type == 0x03 else b"\x01\x01\x01"
+    tail = (
+        bytes([secondary_prefix, 0x01, 0x01])
+        if event_type == 0x03 else b"\x01\x01\x01"
+    )
     return block(3, 0x1050, [block(3, 0x104F, [payload]), bytearray(tail)])
 
 
@@ -94,14 +113,8 @@ class TimelineReadTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["clip_name"], "SECOND")
 
-    def test_parent_length_does_not_consume_first_timestamp_byte(self):
-        parent = definition("PARENT", length=0x345678)
-        payload = next(
-            child.items[0] for child in parent.items
-            if isinstance(child, PTBlock) and child.content_type == 0x2628
-        )
-        name_length = struct.unpack_from("<I", payload, 0)[0]
-        payload[4 + name_length + 8] = 0xAB
+    def test_parent_length_uses_all_four_uint32_bytes(self):
+        parent = definition("PARENT", length=0x01345678)
         session = make_session(
             [parent],
             [playlist("TRACK", [event(0, 100)])],
@@ -110,7 +123,7 @@ class TimelineReadTests(unittest.TestCase):
 
         result = session.get_timeline_clips()
 
-        self.assertEqual(result[0]["length_samples"], 0x345678)
+        self.assertEqual(result[0]["length_samples"], 0x01345678)
 
     def test_clip_group_macro_is_not_mislabeled_as_colliding_audio_id(self):
         macro = event(0, 100)
@@ -122,6 +135,18 @@ class TimelineReadTests(unittest.TestCase):
         )
 
         self.assertEqual(session.get_timeline_clips(), [])
+
+    def test_observed_alternate_audio_secondary_prefix_is_supported(self):
+        session = make_session(
+            [definition("ORDINARY")],
+            [playlist("TRACK", [event(0, 100, secondary_prefix=1)])],
+            geometries=None,
+        )
+
+        result = session.get_timeline_clips()
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["clip_name"], "ORDINARY")
 
     def test_fade_extents_use_native_geometry_instead_of_parent_length(self):
         fade_in = bytearray(22)
@@ -199,6 +224,33 @@ class TimelineReadTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "geometry counts do not match"):
             session.get_timeline_clips()
+
+    def test_audio_only_read_skips_unneeded_fade_validation(self):
+        session = make_session(
+            [definition("CLIP")],
+            [
+                playlist(
+                    "TRACK",
+                    [event(0, 100), event(0, 200, event_type=0x01)],
+                )
+            ],
+            [],
+        )
+
+        result = session.get_timeline_clips(include_fades=False)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["clip_name"], "CLIP")
+
+    def test_include_fades_must_be_boolean(self):
+        session = make_session(
+            [definition("CLIP")],
+            [playlist("TRACK", [event(0, 100)])],
+            geometries=None,
+        )
+
+        with self.assertRaisesRegex(TypeError, "include_fades"):
+            session.get_timeline_clips(include_fades=1)
 
     def test_duplicate_geometry_id_is_rejected(self):
         fade_in = bytearray(22)
