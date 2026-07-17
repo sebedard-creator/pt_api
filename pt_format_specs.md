@@ -1,6 +1,6 @@
 # Spécifications binaires du format Pro Tools (`.ptx`)
 
-*(Spécification normative de `pt_api` 1.3.7; sessions de référence produites par Pro Tools Ultimate 2024.3.1 à 23.98, 24 et 29.97df fps.)*
+*(Spécification normative de `pt_api` 1.3.8; sessions de référence produites par Pro Tools Ultimate 2024.3.1 à 23.98, 24 et 29.97df fps.)*
 
 Ce document décrit exactement les structures que le code courant lit, valide, modifie et sérialise. Une structure dite « observée » provient des sessions de référence; une structure dite « prise en charge » possède un chemin explicite dans `pt_api.py`. Les zones non interprétées sont conservées telles quelles et ne doivent pas être déduites par heuristique.
 
@@ -194,7 +194,7 @@ Le payload secondaire brut direct de `0x1050` distingue les namespaces :
 
 | Type | `block_type` du `0x104f` créé | Queue secondaire |
 |---|---:|---|
-| Placement audio | observé/recopié | `00 01 01`, ou la variante observée `01 01 01` lorsque `0x104f[15] == 0x03` |
+| Placement audio | observé/recopié; `0x0a` dans le builder audio | `00 01 01`, ou la variante observée `01 01 01` lorsque `0x104f[15] == 0x03` |
 | Macro Clip Group | observé/recopié | `00 00 01` |
 | Fondu | `0x0a` | `01 01 01` |
 
@@ -234,6 +234,8 @@ Le sélecteur indépendant à `A+2` donne la largeur de la longueur : `0x10` = U
 Les trois premiers octets doivent être distingués sans ambiguïté : `01 30 40` signifie flag UInt16 `0x3001`, puis sélecteur de longueur UInt32 `0x40`; `01 40 30` signifie le véritable flag UInt16 `0x4001`, puis sélecteur de longueur UInt24 `0x30`. Tout autre flag audio — notamment `0x4000`, non observé — ou sélecteur est rejeté. La valeur maximale d'un champ UInt8 est `255`, celle d'un UInt16 `65 535`, celle d'un UInt24 `16 777 215` et celle d'un UInt32 `4 294 967 295`.
 
 Le lecteur accepte toute combinaison observée de la matrice ci-dessus. Le writer demeure volontairement plus restreint : il ne produit que les layouts explicitement décrits dans les sections Split et Trimming/sous-clips.
+
+Le parent issu de l'import mono-float utilise une variante distincte vérifiée : `00 00 30 04 00` à partir de `A`, suivie de la longueur UInt24 à `A+5` et d'une unique référence temporelle UInt32 à `A+8`. `build_audio_session()` produit seulement cette variante, avec `src_offset=0`, un nom explicite ou, par défaut, le stem physique suivi de `.A1`; il refuse une longueur supérieure à `0xFFFFFF` ou une référence temporelle BWF supérieure à UInt32.
 
 Une définition clonable contient aussi un segment d'identité brut de 48 octets dans `0x2629` :
 
@@ -405,6 +407,69 @@ Mutation WAV :
 
 La mutation de l'arbre PTX est transactionnelle. Une erreur avant le remplacement final supprime le temporaire et restaure l'arbre. Après succès, le WAV existe déjà mais la session n'est encore qu'en mémoire : l'appelant doit exécuter `save()` et nettoyer le WAV lui-même si cette sauvegarde ultérieure échoue. Le retour est un dictionnaire contenant le nouvel ID de clip, son nom, l'index physique et le nom du WAV.
 
+### 6.5 Construction d'une session audio depuis un template
+
+`build_audio_session(template_ptx_path, clip_specs, output_session_directory, session_name=None)` produit un dossier autonome contenant un PTX et son sous-dossier `Audio Files`. Cette fonction de module est le seul authoring de session complet exposé; elle ne construit pas une session à partir de zéro, mais remplace et clone les structures d'un template Pro Tools strictement validé.
+
+L'API est volontairement indépendante des conventions métier des applications clientes. Elle ne déduit ni piste, ni ordre, ni regroupement à partir des noms de fichiers. Le manifeste ordonné `clip_specs` constitue l'unique source de vérité pour ces décisions.
+
+#### Contrat du template
+
+Le template doit respecter simultanément les invariants suivants :
+
+- session little-endian, `sample_rate == 48 000` et `frame_rate_enum == 0x09` (23,976 non-drop);
+- au moins une playlist visible; tous les noms de pistes visibles sont uniques et l'arbre entier est dépourvu de `0x1050`, y compris dans les timelines cachées;
+- exactement une définition directe `0x2629` sous l'unique `0x262a`, sans placement, utilisant le parent importé `00 00 30 04 00`;
+- exactement un média direct `0x1003` sous l'unique catalogue `0x1004`, un seul filename physique ordonné et un lien média de 104 octets dont l'index UInt32 à `+96` vaut zéro;
+- `0x1001` plat de 15 octets : sample rate UInt32 `48 000` à `+0`, canaux `1` à `+4`, bits `32` à `+5`, durée UInt24 à `+6`, cinq octets nuls à `+9` et code float `0x03` à `+14`;
+- un seul `0x2106` contenant exactement un header brut de 142 octets et une queue brute de 58 octets;
+- un catalogue de noms `0x103a` conforme à 5.3, avec suffixe `EVAW` ou nul et au moins un nœud hiérarchique.
+
+Le builder ne crée, ne supprime et ne renomme aucune piste. Chaque piste demandée par le manifeste doit correspondre exactement à une piste visible existante. Les pistes du template qui ne sont pas utilisées restent présentes et vides. Le nombre de pistes du template et le nombre de pistes ciblées ne sont pas limités à une valeur métier particulière.
+
+#### Manifeste ordonné et contrat des WAV
+
+`clip_specs` est un itérable non vide de mappings. L'objet lui-même ne peut être une chaîne, un chemin, des octets ou un mapping unique. Chaque descripteur contient :
+
+| Champ | Présence | Contrat |
+|---|---|---|
+| `audio_path` | requis | Chemin vers le WAV source. |
+| `track_name` | requis | Nom exact, UTF-8, non vide et sans NUL d'une piste visible du template. |
+| `physical_filename` | optionnel | Basename `.wav` utilisé dans `Audio Files` et les catalogues PTX; par défaut, basename de `audio_path`. Aucun chemin n'est permis. |
+| `clip_name` | optionnel | Nom UTF-8 dans la Clip List; par défaut, stem de `physical_filename` suivi de `.A1`. |
+| `placement_start_samples` | optionnel | Timestamp absolu UInt64 du placement; par défaut, référence temporelle BWF du WAV. Les booléens ne sont pas des entiers acceptables. |
+
+L'ordre d'itération est conservé exactement dans le manifeste retourné, les catalogues média, la Clip List et l'ajout des événements. Les basenames physiques et les noms de clips doivent être uniques sans tenir compte de la casse. Une application cliente peut donc choisir librement son tri, ses regroupements et sa stratégie d'affectation des pistes avant l'appel.
+
+Chaque source doit être un RIFF/WAVE little-endian. Le format audio accepté est strictement WAVE_EXTENSIBLE `0xFFFE`, sous-format IEEE float `00000003-0000-0010-8000-00AA00389B71`, mono, 48 kHz, 32 bits, `byte_rate=192 000`, `block_align=4` et `valid_bits=32`. Un seul `fmt ` d'au moins 40 octets, un seul `fact` d'au moins 4 octets, un seul `data` non vide et un seul `bext` d'au moins 412 octets sont requis. Le compteur UInt32 de `fact` doit égaler `data_size / 4`; cette durée doit tenir sur UInt24. La référence temporelle UInt64 à `bext+338` doit tenir sur UInt32. Les 32 premiers octets du basic UMID à `bext+348` ne peuvent être tous nuls.
+
+Des événements d'une même piste peuvent se chevaucher. Chaque nouveau `0x1050` est ajouté après ceux déjà créés sur cette piste, dans l'ordre des descripteurs; un événement ultérieur est donc le dernier dans la priorité de spotting. Aucun trim, crossfade, mixage, déplacement ou changement automatique de piste n'est appliqué. Le format créé est un `0x1050` de `block_type=0x03`, contenant un `0x104f` de 35 octets (`block_type=0x0a`), ID UInt32 à `+2`, timestamp UInt64 à `+7`, type `0x03` à `+15`, constante `FE FF 00 00 00 00` à `+16`, huit `FF` à `+22`, puis la queue secondaire `00 01 01`. Lors du premier placement, le trailer brut `01 00` encore concaténé au header de la playlist vide est séparé et replacé après les événements comme dans la référence native.
+
+`placement_start_samples` ne réécrit pas l'identité temporelle du média. La référence BWF demeure encodée dans `0x2106` et dans le parent `0x2628`; seul le timestamp UInt64 du placement `0x104f` reçoit la valeur explicite. Ainsi, un même fichier garde son identité BWF même lorsqu'une application choisit de le placer ailleurs dans la timeline.
+
+#### Mutation des catalogues et identités
+
+Le média et la définition prototypes sont réutilisés pour le premier fichier; les suivants sont clonés avec tous leurs `original_offset` effacés. Pour l'ordinal zéro-based `i` :
+
+- le `0x1003` reçoit l'ordinal one-based `i+1`; son `0x1001+6` reçoit la durée UInt24;
+- le header `0x2106` reçoit un FILETIME courant à `+29`, la référence temporelle BWF UInt32 à `+91`, un second FILETIME une seconde plus tôt à `+96` et un nouvel UUID à `+126..+141`;
+- la queue `0x2106+18..+49` reçoit les 32 octets du basic UMID BWF;
+- le `0x2629` reçoit l'ID `i`, un nouvel UUID à `identity+23..+38`, l'index média UInt32 `i` à `media_link+96`, le `clip_name`, la durée UInt24 et la référence temporelle BWF;
+- les enregistrements fixes `identity` et `media_link` peuvent avoir été scindés par un faux bloc vide fortuit. Ils sont réassemblés puis normalisés à exactement 48 et 104 octets. Le span `media_link`, situé après l'identité, doit être remplacé en premier; normaliser d'abord l'identité déplacerait les indices d'items et pourrait concaténer l'ancien et le nouveau lien en un record invalide de 208 octets;
+- les compteurs `0x1004` et `0x262a` deviennent `N`; les `N` entrées sont contiguës et dans l'ordre du manifeste;
+- tous les filename records `0x103a` sont reconstruits avec les `physical_filename` dans l'ordre du manifeste, en conservant le suffixe du prototype. Pour `N` médias et `K` nœuds, les compteurs sont recalculés directement à `N+K+2`, `N+K+1` et `N+1..N+K`;
+- chaque playlist ciblée reçoit ses événements dans l'ordre relatif du manifeste. Aucun enregistrement `0x0002` n'est ajouté pour les nouveaux blocs, conformément aux comparaisons natives.
+
+#### Transaction de fichiers et retour
+
+Le dossier parent de `output_session_directory` doit exister et le dossier cible doit être absent, y compris sous forme de lien cassé. Le nom de session optionnel est un basename sans séparateur ni NUL; l'extension `.ptx` est ajoutée si nécessaire. Sans nom explicite, le basename du dossier cible est utilisé.
+
+La fonction valide toutes les sources, tous les descripteurs et le modèle, puis mute le modèle en mémoire avant de créer un dossier temporaire frère. Elle y crée `Audio Files`, copie chaque WAV avec `shutil.copyfile()` sans modifier un seul octet, sauvegarde le PTX, le recharge, puis vérifie les pistes ciblées, le catalogue, la Clip List, les placements, les records fixes 48/104 octets, les IDs de définition et chaque index média UInt32. Le dossier complet est publié par un seul `os.replace()` vers une destination encore absente. Une erreur supprime seulement le dossier temporaire exact; aucun fichier existant n'est écrasé.
+
+Le builder ne génère ni `DGDA`, ni `minf`, ni `regn`. Les sources doivent déjà fournir le BWF/UMID requis; les comparaisons natives disponibles montrent que Pro Tools préserve les chunks et échantillons d'origine avant d'ajouter ces trois chunks. La validation automatisée garantit que les WAV copiés sont byte-for-byte identiques aux sources. La sortie corrigée à deux médias a été ouverte, lue, sauvegardée et rouverte avec succès dans Pro Tools. Le cycle natif a conservé deux entrées physiques distinctes, leurs longueurs, les records fixes 48/104 octets, les IDs/index `0`/`1`, les timestamps, l'overlap d'un échantillon et les hashes des WAV.
+
+Le retour est un dictionnaire compatible JSON : `session_path`, `audio_files_directory`, `track_count`, la liste `tracks` des noms distincts ciblés dans l'ordre de première utilisation et la liste `clips`. Chaque clip donne son ordre, ses chemins source/destination, son filename physique, son nom de Clip List, sa piste, sa référence BWF, son début de placement, sa longueur et sa fin en échantillons.
+
 ## 7. Fondus et crossfades
 
 ### 7.1 Dictionnaire `0x2630`
@@ -574,11 +639,12 @@ L'opération complète est transactionnelle. Sans racine `0x262c`, `delete_clip_
 
 ## 12. Limites fonctionnelles consolidées
 
-- Édition de sessions PTX existantes seulement; aucune création complète de session.
+- Édition de sessions PTX existantes seulement; aucune création complète depuis zéro. Le seul authoring de session est le builder audio générique fondé sur un template natif strict.
 - Payloads métier little-endian seulement.
 - Conversions temporelles limitées à 24, 23.976 non-drop et 29.97 Drop Frame.
 - Audio et fondus seulement sur la timeline. MIDI, contrôleurs continus, pistes/clips vidéo, Inserts, Sends, routing I/O, Pan, Mute automation et automation de plugins ne sont pas pris en charge.
-- Aucune création/suppression/renommage/réorganisation de pistes, import/export audio général ou suppression arbitraire de définitions/événements. Le seul relink pris en charge est le clonage WAV exact décrit en 6.4.
+- Aucune création/suppression/renommage/réorganisation de pistes, import/export audio général ou suppression arbitraire de définitions/événements. Les deux exceptions étroites sont le clonage WAV exact décrit en 6.4 et le peuplement audio par manifeste d'un template compatible décrit en 6.5.
+- Le builder audio 6.5 reste limité aux sessions 48 kHz/23,976 et aux WAV mono WAVE_EXTENSIBLE IEEE float 32 bits munis des métadonnées BWF/UMID requises. Il ne choisit ni ordre, ni regroupement, ni piste à partir d'une convention de filename; ces politiques appartiennent aux applications clientes.
 - Pas de création de Clip Group; dissolution limitée au cas simple documenté.
 - `create_subclip()` et les trims produisent les combinaisons vérifiées offset UInt24/longueur UInt32 (`01 30 40`) et offset UInt32/longueur UInt24 (`01 40 30`). Ils rejettent encore un sous-clip virtuel d'offset nul et de longueur supérieure à UInt24, ainsi que la combinaison offset UInt32/longueur UInt32, faute de référence Pro Tools. Le split accepte les racines courtes et longues vérifiées et une longueur droite UInt32, mais la coupe relative reste limitée à UInt24 tant que le layout du fragment gauche d'un split tardif n'a pas été observé.
 - Move, duplicate, split et trims refusent les placements avec fondus attachés; la duplication ne clone pas les fades.
@@ -591,9 +657,9 @@ L'opération complète est transactionnelle. Sans racine `0x262c`, `delete_clip_
 
 ## 13. Catalogue exhaustif des erreurs
 
-La portée d'« exhaustif » est la suivante : toutes les familles d'échecs explicitement détectées ou propagées par `pt_api.py` 1.3.7, ainsi que tous les messages Pro Tools consignés dans le corpus et l'historique des essais du projet. Elle ne prétend pas recenser les messages possibles de toutes les versions de Pro Tools.
+La portée d'« exhaustif » est la suivante : toutes les familles d'échecs explicitement détectées ou propagées par `pt_api.py` 1.3.8, ainsi que tous les messages Pro Tools consignés dans le corpus et l'historique des essais du projet. Elle ne prétend pas recenser les messages possibles de toutes les versions de Pro Tools.
 
-Le source courant contient 443 instructions `raise` : 375 `ValueError`, 36 `TypeError`, 8 `NotImplementedError`, 9 `OverflowError`, 5 `FileNotFoundError`, 1 `FileExistsError`, 1 `OSError` et 8 relances nues de l'exception originale.
+Le source courant contient 525 instructions `raise` : 444 `ValueError`, 44 `TypeError`, 8 `NotImplementedError`, 9 `OverflowError`, 8 `FileNotFoundError`, 3 `FileExistsError`, 1 `OSError` et 8 relances nues de l'exception originale.
 
 ### 13.1 Messages observés dans Pro Tools
 
@@ -608,12 +674,13 @@ Le source courant contient 443 instructions `raise` : 375 `ValueError`, 36 `Type
 
 | Exception | Conditions exhaustives par famille |
 |---|---|
-| `TypeError` | Chemin non path-like ou résolu en `bytes`; tampon non `bytes`/`bytearray`; enum/composants/timecode/timestamp/index non entiers; paramètres `mute`/endianness/`include_fades` non booléens; champs `PTBlock` ou `base_offset` du mauvais type; item d'arbre non `bytes`/`bytearray`/`PTBlock`; nom attendu non `str`; gain/volume non convertibles en réel; offset/longueur de sous-clip ou montant de trim non entier; type/forme de fade non `str`. |
+| `TypeError` | Chemin non path-like ou résolu en `bytes`; tampon non `bytes`/`bytearray`; enum/composants/timecode/timestamp/index non entiers; paramètres `mute`/endianness/`include_fades` non booléens; champs `PTBlock` ou `base_offset` du mauvais type; item d'arbre non `bytes`/`bytearray`/`PTBlock`; nom attendu non `str`; gain/volume non convertibles en réel; offset/longueur de sous-clip ou montant de trim non entier; type/forme de fade non `str`; `clip_specs` non itérable ou fourni comme une chaîne, des octets, un chemin ou un mapping unique; descripteur individuel non mapping; `track_name`, `physical_filename` ou `clip_name` non `str`; `placement_start_samples` non entier ou booléen; `session_name` non `str`/`None`. |
 | `ValueError` — enveloppe et temps | Chemin vide; fichier/en-tête trop court; signature/version/endianness/mode XOR invalide; delta XOR introuvable; sample rate non fini, non positif ou hors UInt32; cadence inconnue; composant/timecode/drop-frame invalide; sample négatif; conversion temporelle non représentable. |
 | `ValueError` — arbre, parsing et sauvegarde | `block_type`, `content_type`, tailles ou offsets hors bornes; profondeur >128; cycle; `original_offset` dupliqué; `0x0001` absent/invalide/mal placé; `0x0002` absent/dupliqué/non final/non EOF/non plat/vide; liaison `0x0001→0x0002` fausse; record/suffixe/compteur de série `0x0002` invalide; cible de pointeur inconnue; relocalisations chevauchantes; métadonnées `0x1028`/`0x204d` absentes, dupliquées ou tronquées. |
 | `ValueError` — pistes et événements | Racines `0x1054` ambiguës; compteurs `0x1054`/`0x1052` incohérents; header, nom UTF-8, compteur ou structure `0x1050→0x104f` invalide; queue audio inconnue; ID de clip timeline inconnu; piste/placement absent ou ambigu; timestamp cible hors champ de stockage. |
 | `ValueError` — clips et noms | `0x262a`/`0x262c` ambigu, compteur ou définition invalide; `0x2628` tronqué, nom UTF-8 invalide, flag audio/groupe inconnu ou sélecteur de largeur autre que `0x10`/`0x20`/`0x30`/`0x40`; clip absent/ambigu; nouveau nom vide, NUL, non UTF-8, trop long ou déjà présent; ID source inconnu; modèle `0x2629` sans unique identité 48 octets; offset/longueur de sous-clip direct négatif, nul ou hors UInt32; layout offset nul/longueur UInt32 ou offset UInt32/longueur UInt32 non vérifié. |
 | `ValueError` — média physique et relink | RIFF/WAVE invalide, big-endian, tronqué, de taille ou d'alignement incohérent; chunk `bext`/`minf`/`regn`/`umid` absent, dupliqué ou trop court; `fmt ` ou `data` du clone/rendu absent, dupliqué ou tronqué; rendu autre que PCM/WAVE_EXTENSIBLE PCM, format PCM incompatible ou taille `data` différente; UMID, stem complet ou abrégé, paire de tokens ou références temporelles `bext`/`regn` invalides ou non concordantes avec le PTX; basename source différent du catalogue PTX ou du stem `regn`; chemin source et destination identiques; extension autre que `.wav`; stems non UTF-8, identiques ou de longueurs UTF-8 différentes; catalogue `0x1004`/`0x103a`, compteurs, noms, ordinaux ou index média invalides/ambigus; suffixe d'enregistrement WAV inconnu ou mélange des variantes `EVAW`/nulle; queue `0x103a` tronquée, sans nœud parent, avec libellé vide/NUL/non UTF-8, marqueur inconnu, terminaison invalide ou compteurs non conformes à `N+1..N+K`, `N+K+2`, `N+K+1`; nouveau nom physique déjà catalogué ou trop long; enregistrements fixes `0x2629` de 48/104 octets impossibles à réassembler ou mal ordonnés; `0x1001`, modèle `0x2106` standard ou de production (142/151 octets), ou `0x2628` absent, ambigu, tronqué ou de layout inconnu; layout source autre que le parent/racine ou virtuel de production vérifié; référence virtuelle non concordante avec le BWF et l'offset source; timestamp relink hors UInt32; nouvelle définition de clip en collision; placement exact absent ou ambigu. |
+| `ValueError` — builder audio | Manifeste vide; descripteur sans `audio_path` ou `track_name`; nom de piste, filename physique ou nom de clip vide/NUL/non UTF-8; `physical_filename` contenant un chemin ou n'ayant pas l'extension `.wav`; filename physique ou nom de clip dupliqué sans tenir compte de la casse; placement négatif, hors UInt64 ou dont la fin dépasse UInt64; RIFF invalide; `fmt `/`fact`/`data`/`bext` absent, dupliqué, tronqué ou trop court; format autre que WAVE_EXTENSIBLE float mono 48 kHz/32 bits; byte rate, block align, valid bits ou GUID incompatibles; `data` vide/non aligné; `fact` différent de la durée; durée hors UInt24; référence BWF hors UInt32; basic UMID nul; template autre que 48 kHz/enum `0x09`, sans piste visible, noms de pistes dupliqués, piste demandée absente, contenant un événement de timeline visible ou caché, prototype/catalogue non unique, lien média non zéro, `0x1001` autre que 15 octets, `0x2106` autre que 142/58 ou parent autre que `00 00 30 04 00`; catalogue/playlist/clone incohérent; racine ou nombre de définitions générées incohérent; record fixe autre que 48/104 octets; ID de définition ou index média différent de son ordinal; nom de session vide/NUL ou contenant un séparateur; rechargement généré ne concordant pas avec le manifeste. |
 | `ValueError` — opérations de montage | Aucun placement visible; plusieurs placements; cut hors du clip ou partagé par plusieurs occurrences; source de split hors layout racine vérifié; coupe/offset source relatif hors UInt24; timestamp de coupe ou nouveau timestamp de Start Trim hors UInt32; payload audio non 35 octets; montant de trim nul/négatif/trop grand; composant d'image invalide ou label Drop Frame interdit. Toute opération transactionnelle restaure l'état avant de relancer l'erreur. |
 | `ValueError` — fondus | `0x2630` absent/dupliqué; compteur ou payload `0x262f` invalide; nombre d'événements et géométries différent; ID inconnu/dupliqué; taille géométrique autre que 22/26/27/34; association audio absente/ambiguë; début calculé négatif; durée nulle pour crossfade ou >UInt16; type/forme invalide; clip de durée nulle; cible hors clip/ambiguë; fade dépassant les bornes ou déjà existant. |
 | `ValueError` — marqueurs | Session sans playlist principale; règle `0x2030` absente/dupliquée/mal formée; compteur incohérent; payload `0x2077`, longueur ou UTF-8 invalide; index dupliqué/hors `1..65535`; timestamp hors Int64; nom NUL/non UTF-8/trop long; modèle ou zone UUID interne invalide. |
@@ -622,7 +689,7 @@ Le source courant contient 443 instructions `raise` : 375 `ValueError`, 36 `Type
 | `ValueError` — Clip Groups | Nom vide/groupe absent; racines, compteurs, noms UTF-8 ou métadonnées `0x262c`/`0x2428`/`0x2424`/`0x2426` incohérents; playlist cachée vide/mal formée; macro ou index de nom non concordant. |
 | `NotImplementedError` | Exactement huit refus explicites : session contenant plus d'un Clip Group; groupe contenant plus d'une piste; groupe imbriqué/fade/événement non audio; groupe placé zéro ou plusieurs fois au lieu d'une; move avec fade attaché; duplicate avec fade attaché; split avec fade attaché; trim avec fade attaché. |
 | `OverflowError` | Offset de bloc sérialisé hors UInt32; payload `PTBlock` hors champ de taille UInt32; bloc dépassant l'espace fichier UInt32; timestamp restauré d'un groupe hors UInt64; nouvel index de point Clip Gain hors Int32 signé; nouvel ID de clip, index média de relink ou compteurs de noms physiques hors UInt32. |
-| `FileNotFoundError` | Fichier d'entrée absent (propagé nativement); dossier de destination inexistant pour `xor_session()`/`save()`; WAV source ou WAV de remplacement absent, ou dossier du nouveau WAV inexistant pour `relink_clip()`. |
-| `FileExistsError` | Le chemin du nouveau WAV demandé à `relink_clip()` existe déjà; aucun écrasement n'est permis. |
+| `FileNotFoundError` | Fichier d'entrée absent (propagé nativement); dossier de destination inexistant pour `xor_session()`/`save()`; WAV source ou WAV de remplacement absent, ou dossier du nouveau WAV inexistant pour `relink_clip()`; template/WAV source du builder absent ou parent du dossier de livraison inexistant. |
+| `FileExistsError` | Le chemin du nouveau WAV demandé à `relink_clip()` existe déjà; le dossier cible du builder existe avant l'appel ou apparaît pendant la génération. Aucun écrasement n'est permis. |
 | `PermissionError` et autres `OSError` natifs | Erreur d'ouverture/lecture/création/remplacement du système de fichiers; elles conservent leur sous-type. La recherche facultative dans `Audio Files` est la seule exception : ses `OSError` sont absorbées et la résolution continue avec `0x1004`. |
 | `OSError` explicite | Écriture chiffrée plus courte que la taille attendue. Le fichier temporaire est supprimé et la destination existante reste intacte. |

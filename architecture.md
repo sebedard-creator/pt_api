@@ -38,6 +38,21 @@ Fichier PTX chiffré
 
 Le chargement produit un modèle mémoire déchiffré. Les opérations ordinaires modifient seulement ce modèle jusqu'à l'appel explicite à `save()`. Le relink physique est l'exception : il installe d'abord un clone WAV atomique — éventuellement avec le chunk PCM `data` d'un rendu strictement compatible — puis l'appelant sauvegarde séparément le PTX; cette frontière est explicite dans le contrat public.
 
+Le builder de session audio constitue un second flux de haut niveau, volontairement étroit mais indépendant de l'application cliente :
+
+```text
+template.ptx + manifeste ordonné de WAV/pistes
+    → validation complète du template, des descripteurs et des WAV
+    → conservation de l'ordre fourni par le client
+    → remplacement/clonage du média-prototype et des définitions de clips
+    → spotting BWF ou explicite dans les pistes existantes, overlap conservé
+    → copie byte-for-byte des WAV dans Audio Files
+    → sauvegarde puis rechargement sémantique du PTX temporaire
+    → renommage atomique du dossier de session complet
+```
+
+Contrairement au relink, `build_audio_session()` possède toute la transaction de livraison. Le dossier cible doit être absent; un échec supprime uniquement le répertoire temporaire créé par la fonction et ne publie aucun résultat partiel.
+
 ## Composants principaux
 
 ### Entrées/sorties et chiffrement
@@ -62,6 +77,25 @@ Les fonctions de chiffrement valident l'en-tête PTX, transforment une copie des
 - la liste des offsets de blocs supprimés qui devront être purgés à la sauvegarde.
 
 Les méthodes de lecture exposent pistes, marqueurs, clips et événements. Les méthodes de mutation couvrent les opérations audio documentées dans le README, y compris le clonage/relink physique étroit d'un placement. Les validateurs communs résolvent les noms, compteurs, placements, géométries, catalogues média et dictionnaires avant toute écriture. La hiérarchie interne d'un catalogue PTX reste distincte de la résolution des chemins : l'application fournit les chemins WAV, normalement sous le dossier `Audio Files` associé à la session.
+
+### Builder de session audio
+
+`build_audio_session()` est une façade de module au-dessus de `ProToolsSession`. Elle n'est pas un moteur général de création de sessions : elle exige un modèle natif 48 kHz/23,976 avec au moins une playlist visible, aucun événement de timeline visible ou caché et un média-prototype importé. Les helpers privés inspectent le RIFF/BWF, valident le manifeste ordonné, réécrivent le catalogue `0x1004`/`0x103a`, les entrées `0x1003`, les définitions `0x2629` et les événements `0x1050`, puis utilisent le pipeline `save()` existant.
+
+La séparation des responsabilités est stricte :
+
+- le client décide de l'ordre, de la piste cible, du nom de clip et, facultativement, du filename livré;
+- le BWF décide de la référence média et du timestamp de placement par défaut;
+- un override explicite décide uniquement du timestamp de l'événement, sans falsifier la référence BWF;
+- le chunk `data` décide de la durée;
+- l'UMID BWF décide de l'identité média PTX;
+- le template fournit exclusivement les structures opaques et constantes déjà produites par Pro Tools.
+
+Les WAV livrés ne sont jamais réencodés ni enrichis par l'API. Ils sont copiés tels quels; les blocs `DGDA`, `minf` et `regn` ajoutés par Pro Tools ne sont pas reproduits par supposition.
+
+Les deux records fixes d'une définition `0x2629` sont réassemblés lorsqu'une séquence fortuite a été parsée comme un bloc vide. La normalisation procède du span le plus tardif vers le plus ancien afin que la réduction d'un span scindé ne décale jamais l'index du suivant. Le rechargement de la livraison exige ensuite exactement 48 octets d'identité, 104 octets de lien média et un ID/index correspondant à l'ordinal de chaque clip.
+
+Ce flux a été validé de bout en bout dans Pro Tools avec deux médias BWF distincts placés sur la même piste et se chevauchant d'un échantillon. Après sauvegarde et réouverture natives, les deux catalogues, définitions, liens physiques, longueurs et placements sont restés sémantiquement identiques.
 
 ## Modèle de modification
 
@@ -94,6 +128,7 @@ Avant l'écriture, les invariants structurels et temporels sont revalidés. Apr�
 - Les nouvelles fonctions doivent réutiliser les validateurs et mécanismes transactionnels communs.
 - La bibliothèque n'écrit pas dans `stdout`; les diagnostics facultatifs passent par le logger `pt_api`.
 - Toute nouvelle disposition binaire doit être confirmée par une session Pro Tools de référence avant d'être déclarée prise en charge.
+- Le builder audio doit rester limité au template et au WAV float validés; élargir les largeurs, formats, fréquences ou cadences exige de nouvelles références natives.
 
 ## Validation et évolution
 

@@ -29,6 +29,7 @@ dist/
 /virtual_relink_before/
 /test_6min_audio/
 /relink_before/
+/pfx_import_reference/
 
 # Ignorer les métadonnées macOS copiées avec les sessions
 ._*

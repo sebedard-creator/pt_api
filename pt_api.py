@@ -3,9 +3,16 @@ import logging
 import math
 import os
 import struct
+from collections.abc import Mapping
 
 
 logger = logging.getLogger(__name__)
+
+
+_TEMPLATE_AUDIO_IEEE_FLOAT_SUBFORMAT = bytes.fromhex(
+    "03000000 0000 1000 8000 00aa00389b71"
+)
+_WINDOWS_FILETIME_EPOCH = 116_444_736_000_000_000
 
 
 def _coerce_string_path(value, parameter_name):
@@ -54,6 +61,196 @@ def _scan_riff_wave_chunks(stream):
     if position != file_size:
         raise ValueError("Invalid RIFF/WAVE chunk alignment.")
     return chunks
+
+
+def _unique_wave_chunk(stream, chunks, chunk_id, minimum_size, label):
+    """Read one required RIFF chunk after validating its cardinality and size."""
+    matches = chunks.get(chunk_id, [])
+    if len(matches) != 1 or matches[0][1] < minimum_size:
+        raise ValueError(f"{label} WAV requires one valid {chunk_id.decode('ascii')} chunk.")
+    offset, size = matches[0]
+    stream.seek(offset)
+    payload = stream.read(size)
+    if len(payload) != size:
+        raise ValueError(f"Truncated {label.lower()} WAV {chunk_id.decode('ascii')} chunk.")
+    return payload
+
+
+def _inspect_template_audio_wave(file_path):
+    """Validate one WAV supported by the template-based audio writer."""
+    file_path = os.path.abspath(_coerce_string_path(file_path, "audio_path"))
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"Audio WAV does not exist: {file_path}")
+
+    filename = os.path.basename(file_path)
+    if not filename.lower().endswith(".wav"):
+        raise ValueError("Template-based audio import supports WAV files only.")
+    stem = os.path.splitext(filename)[0]
+    if not stem or "\x00" in stem:
+        raise ValueError("Audio WAV stem must be non-empty and contain no NUL.")
+
+    with open(file_path, "rb") as stream:
+        chunks = _scan_riff_wave_chunks(stream)
+        fmt_payload = _unique_wave_chunk(
+            stream, chunks, b"fmt ", 40, "Audio source"
+        )
+        (
+            audio_format,
+            channels,
+            sample_rate,
+            byte_rate,
+            block_align,
+            bits_per_sample,
+        ) = struct.unpack_from("<HHIIHH", fmt_payload, 0)
+        if (
+            audio_format != 0xFFFE
+            or struct.unpack_from("<H", fmt_payload, 16)[0] < 22
+            or struct.unpack_from("<H", fmt_payload, 18)[0] != 32
+            or fmt_payload[24:40] != _TEMPLATE_AUDIO_IEEE_FLOAT_SUBFORMAT
+        ):
+            raise ValueError(
+                "Audio WAV must use 32-bit IEEE float WAVE_EXTENSIBLE audio."
+            )
+        if (
+            channels != 1
+            or sample_rate != 48_000
+            or byte_rate != 192_000
+            or block_align != 4
+            or bits_per_sample != 32
+        ):
+            raise ValueError("Audio WAV must be mono, 48 kHz and 32-bit float.")
+
+        data_matches = chunks.get(b"data", [])
+        if len(data_matches) != 1:
+            raise ValueError("Audio source WAV requires one data chunk.")
+        _, data_size = data_matches[0]
+        if data_size == 0 or data_size % block_align:
+            raise ValueError("Audio WAV data size must contain complete mono samples.")
+        length_samples = data_size // block_align
+        if length_samples > 0xFFFFFF:
+            raise ValueError(
+                "Audio WAV exceeds the verified UInt24 imported-clip length."
+            )
+
+        fact_payload = _unique_wave_chunk(
+            stream, chunks, b"fact", 4, "Audio source"
+        )
+        if struct.unpack_from("<I", fact_payload, 0)[0] != length_samples:
+            raise ValueError("Audio WAV fact sample count does not match its data chunk.")
+
+        bext_payload = _unique_wave_chunk(
+            stream, chunks, b"bext", 412, "Audio source"
+        )
+        bwf_time_reference = struct.unpack_from("<Q", bext_payload, 338)[0]
+        if bwf_time_reference > 0xFFFFFFFF:
+            raise ValueError(
+                "Audio BWF time reference exceeds the verified UInt32 PTX layout."
+            )
+        umid = bytes(bext_payload[348:412])
+        if len(umid) != 64 or not any(umid[:32]):
+            raise ValueError("Audio BWF requires a non-empty 32-byte basic UMID.")
+
+    try:
+        filename.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("Audio WAV filename must be valid UTF-8.") from exc
+
+    return {
+        "source_path": file_path,
+        "source_filename": filename,
+        "length_samples": length_samples,
+        "bwf_time_reference": bwf_time_reference,
+        "umid": umid,
+    }
+
+
+def _prepare_template_audio_clips(clip_specs):
+    """Validate an ordered iterable of generic template-audio descriptors."""
+    if isinstance(clip_specs, (str, bytes, os.PathLike, Mapping)):
+        raise TypeError("clip_specs must be an iterable of descriptor mappings.")
+    try:
+        specs = list(clip_specs)
+    except TypeError as exc:
+        raise TypeError("clip_specs must be an iterable of descriptor mappings.") from exc
+    if not specs:
+        raise ValueError("At least one audio clip descriptor is required.")
+
+    prepared = []
+    track_names = []
+    for order, spec in enumerate(specs, start=1):
+        if not isinstance(spec, Mapping):
+            raise TypeError("Each clip descriptor must be a mapping.")
+        if "audio_path" not in spec or "track_name" not in spec:
+            raise ValueError(
+                "Each clip descriptor requires audio_path and track_name."
+            )
+        metadata = _inspect_template_audio_wave(spec["audio_path"])
+
+        track_name = spec["track_name"]
+        if not isinstance(track_name, str):
+            raise TypeError("Descriptor track_name must be a string.")
+        if not track_name or "\x00" in track_name:
+            raise ValueError("Descriptor track_name must be non-empty and contain no NUL.")
+
+        physical_filename = spec.get(
+            "physical_filename", metadata["source_filename"]
+        )
+        if not isinstance(physical_filename, str):
+            raise TypeError("Descriptor physical_filename must be a string.")
+        if (
+            not physical_filename
+            or "\x00" in physical_filename
+            or os.path.basename(physical_filename) != physical_filename
+            or not physical_filename.lower().endswith(".wav")
+        ):
+            raise ValueError(
+                "Descriptor physical_filename must be one .wav basename without NUL."
+            )
+
+        default_clip_name = f"{os.path.splitext(physical_filename)[0]}.A1"
+        clip_name = spec.get("clip_name", default_clip_name)
+        if not isinstance(clip_name, str):
+            raise TypeError("Descriptor clip_name must be a string.")
+        if not clip_name or "\x00" in clip_name:
+            raise ValueError("Descriptor clip_name must be non-empty and contain no NUL.")
+
+        placement_start = spec.get(
+            "placement_start_samples", metadata["bwf_time_reference"]
+        )
+        if isinstance(placement_start, bool) or not isinstance(placement_start, int):
+            raise TypeError("placement_start_samples must be an integer.")
+        if placement_start < 0 or placement_start > 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("placement_start_samples must fit UInt64.")
+        placement_end = placement_start + metadata["length_samples"]
+        if placement_end > 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("Audio placement end exceeds UInt64.")
+
+        try:
+            track_name.encode("utf-8")
+            physical_filename.encode("utf-8")
+            clip_name.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("Descriptor text fields must be valid UTF-8.") from exc
+
+        metadata.update({
+            "order": order,
+            "track": track_name,
+            "physical_filename": physical_filename,
+            "clip_name": clip_name,
+            "start_samples": placement_start,
+            "end_samples": placement_end,
+        })
+        prepared.append(metadata)
+        if track_name not in track_names:
+            track_names.append(track_name)
+
+    filename_keys = [item["physical_filename"].casefold() for item in prepared]
+    if len(set(filename_keys)) != len(filename_keys):
+        raise ValueError("Output WAV basenames must be unique case-insensitively.")
+    clip_keys = [item["clip_name"].casefold() for item in prepared]
+    if len(set(clip_keys)) != len(clip_keys):
+        raise ValueError("Generated clip names must be unique case-insensitively.")
+    return prepared, track_names
 
 
 def _wave_pcm_format_signature(stream, chunks, label):
@@ -2542,6 +2739,466 @@ class ProToolsSession:
             (media_start, media_end, media),
         )
 
+    def _validated_audio_import_template(self):
+        """Return the native structures required by template-based audio import."""
+        if self.sample_rate != 48_000 or self.frame_rate_enum != 0x09:
+            raise ValueError(
+                "Audio-import template must use 48 kHz and frame-rate enum "
+                "0x09 (23.976)."
+            )
+
+        playlists = self._validated_main_playlists()
+        playlist_names = [name for _, name, _ in playlists]
+        if not playlist_names:
+            raise ValueError("Audio-import template requires at least one track.")
+        if len(set(playlist_names)) != len(playlist_names):
+            raise ValueError("Audio-import template track names must be unique.")
+        if any(events for _, _, events in playlists):
+            raise ValueError(
+                "Audio-import template playlists must contain no timeline events."
+            )
+        all_timeline_events = [
+            event
+            for root in self._content_root_items()
+            if isinstance(root, PTBlock)
+            for event in root.get_all_blocks(0x1050)
+        ]
+        if all_timeline_events:
+            raise ValueError(
+                "Audio-import template must contain no visible or hidden "
+                "timeline events."
+            )
+
+        clip_lists = self._root_blocks(0x262A)
+        if len(clip_lists) != 1:
+            raise ValueError("Audio-import template requires one 0x262a clip list.")
+        clip_list = clip_lists[0]
+        definitions = [
+            item for item in clip_list.items
+            if isinstance(item, PTBlock) and item.content_type == 0x2629
+        ]
+        if (
+            not clip_list.items
+            or not isinstance(clip_list.items[0], (bytes, bytearray))
+            or len(clip_list.items[0]) < 4
+            or struct.unpack_from("<I", clip_list.items[0], 0)[0] != 1
+            or len(definitions) != 1
+        ):
+            raise ValueError(
+                "Audio-import template must contain exactly one imported "
+                "prototype clip."
+            )
+        prototype_definition = definitions[0]
+        name_blocks = [
+            item for item in prototype_definition.items
+            if isinstance(item, PTBlock) and item.content_type == 0x2628
+        ]
+        if (
+            len(name_blocks) != 1
+            or not name_blocks[0].items
+            or not isinstance(name_blocks[0].items[0], (bytes, bytearray))
+        ):
+            raise ValueError("Invalid audio-import prototype 0x2628 definition.")
+        prototype_payload = name_blocks[0].items[0]
+        if len(prototype_payload) < 4:
+            raise ValueError("Truncated audio-import prototype 0x2628 definition.")
+        prototype_name_length = struct.unpack_from("<I", prototype_payload, 0)[0]
+        attributes = 4 + prototype_name_length
+        if (
+            attributes + 12 > len(prototype_payload)
+            or prototype_payload[attributes:attributes + 5]
+            != b"\x00\x00\x30\x04\x00"
+        ):
+            raise ValueError(
+                "Audio-import template requires the verified imported-parent "
+                "0x2628 layout."
+            )
+        _, (_, _, prototype_media_link) = self._validated_2629_fixed_records(
+            prototype_definition
+        )
+        if struct.unpack_from("<I", prototype_media_link, 96)[0] != 0:
+            raise ValueError(
+                "Audio-import prototype clip must reference media index zero."
+            )
+
+        catalog, entries, name_block, names, _ = (
+            self._validated_physical_audio_catalog()
+        )
+        if len(entries) != 1 or len(names) != 1:
+            raise ValueError(
+                "Audio-import template must contain exactly one imported "
+                "prototype medium."
+            )
+        prototype_media = entries[0]
+        media_info_blocks = [
+            item for item in prototype_media.items
+            if isinstance(item, PTBlock) and item.content_type == 0x1001
+        ]
+        detail_blocks = [
+            item for item in prototype_media.items
+            if isinstance(item, PTBlock) and item.content_type == 0x2106
+        ]
+        if len(media_info_blocks) != 1 or len(detail_blocks) != 1:
+            raise ValueError("Invalid audio-import prototype 0x1003 medium.")
+        media_info = self._serialize_fixed_record_items(
+            media_info_blocks[0].items,
+            "Invalid audio-import prototype 0x1001 format record.",
+        )
+        if (
+            len(media_info) != 15
+            or struct.unpack_from("<I", media_info, 0)[0] != 48_000
+            or media_info[4] != 1
+            or media_info[5] != 32
+            or media_info[9:14] != b"\x00" * 5
+            or media_info[14] != 0x03
+        ):
+            raise ValueError(
+                "Audio-import prototype must use the verified mono 48 kHz "
+                "float 0x1001 layout."
+            )
+        detail = detail_blocks[0]
+        detail_headers = [
+            item for item in detail.items
+            if isinstance(item, (bytes, bytearray)) and len(item) == 142
+        ]
+        detail_tails = [
+            item for item in detail.items
+            if isinstance(item, (bytes, bytearray)) and len(item) == 58
+        ]
+        if len(detail_headers) != 1 or len(detail_tails) != 1:
+            raise ValueError(
+                "Audio-import prototype requires the verified 142/58-byte "
+                "0x2106 layout."
+            )
+
+        return {
+            "playlists": {name: playlist for playlist, name, _ in playlists},
+            "clip_list": clip_list,
+            "prototype_definition": prototype_definition,
+            "catalog": catalog,
+            "name_block": name_block,
+            "prototype_media": prototype_media,
+        }
+
+    def _configure_imported_audio_media_entry(
+        self, media_entry, metadata, media_index, filetime
+    ):
+        """Patch one cloned native media record for a validated source WAV."""
+        import uuid
+
+        if (
+            not media_entry.items
+            or not isinstance(media_entry.items[0], (bytes, bytearray))
+            or len(media_entry.items[0]) != 4
+        ):
+            raise ValueError("Invalid audio-import prototype media ordinal.")
+        ordinal = bytearray(media_entry.items[0])
+        struct.pack_into("<I", ordinal, 0, media_index + 1)
+        media_entry.items[0] = ordinal
+
+        media_info_blocks = [
+            item for item in media_entry.items
+            if isinstance(item, PTBlock) and item.content_type == 0x1001
+        ]
+        detail_blocks = [
+            item for item in media_entry.items
+            if isinstance(item, PTBlock) and item.content_type == 0x2106
+        ]
+        if len(media_info_blocks) != 1 or len(detail_blocks) != 1:
+            raise ValueError("Invalid audio-import media clone structure.")
+
+        media_info_block = media_info_blocks[0]
+        media_info = self._serialize_fixed_record_items(
+            media_info_block.items,
+            "Invalid audio-import media-clone 0x1001 record.",
+        )
+        if len(media_info) != 15:
+            raise ValueError("Invalid audio-import media-clone 0x1001 size.")
+        media_info[6:9] = metadata["length_samples"].to_bytes(3, "little")
+        media_info_block.items = [media_info]
+
+        detail = detail_blocks[0]
+        detail_headers = [
+            (index, item) for index, item in enumerate(detail.items)
+            if isinstance(item, (bytes, bytearray)) and len(item) == 142
+        ]
+        detail_tails = [
+            (index, item) for index, item in enumerate(detail.items)
+            if isinstance(item, (bytes, bytearray)) and len(item) == 58
+        ]
+        if len(detail_headers) != 1 or len(detail_tails) != 1:
+            raise ValueError("Invalid audio-import media-clone 0x2106 layout.")
+        header_index, header_raw = detail_headers[0]
+        header = bytearray(header_raw)
+        struct.pack_into("<Q", header, 29, filetime)
+        struct.pack_into("<I", header, 91, metadata["bwf_time_reference"])
+        struct.pack_into("<Q", header, 96, max(0, filetime - 10_000_000))
+        header[126:142] = uuid.uuid4().bytes
+        detail.items[header_index] = header
+
+        tail_index, tail_raw = detail_tails[0]
+        tail = bytearray(tail_raw)
+        tail[18:50] = metadata["umid"][:32]
+        detail.items[tail_index] = tail
+
+    def _configure_imported_audio_clip_definition(
+        self, definition, metadata, clip_id, media_index
+    ):
+        """Patch one cloned native parent definition and its physical link."""
+        import uuid
+
+        identity_span, media_span = self._validated_2629_fixed_records(definition)
+        identity_start, identity_end, identity_raw = identity_span
+        media_start, media_end, media_raw = media_span
+
+        identity = bytearray(identity_raw)
+        struct.pack_into("<I", identity, 0, clip_id)
+        identity[23:39] = uuid.uuid4().bytes
+
+        media_link = bytearray(media_raw)
+        struct.pack_into("<I", media_link, 96, media_index)
+        # Replace the later span first. Either fixed record may contain bytes
+        # that the generic parser represented as a false empty PTBlock; in
+        # that case normalizing the identity first would shift the saved media
+        # indices and append a second 104-byte record instead of replacing it.
+        definition.items[media_start:media_end] = [media_link]
+        definition.items[identity_start:identity_end] = [identity]
+
+        name_blocks = [
+            item for item in definition.items
+            if isinstance(item, PTBlock) and item.content_type == 0x2628
+        ]
+        if (
+            len(name_blocks) != 1
+            or not name_blocks[0].items
+            or not isinstance(name_blocks[0].items[0], (bytes, bytearray))
+        ):
+            raise ValueError("Invalid audio-import clip-clone 0x2628 definition.")
+        name_block = name_blocks[0]
+        source_payload = name_block.items[0]
+        source_name_length = struct.unpack_from("<I", source_payload, 0)[0]
+        source_attributes = 4 + source_name_length
+        if (
+            source_attributes + 12 > len(source_payload)
+            or source_payload[source_attributes:source_attributes + 5]
+            != b"\x00\x00\x30\x04\x00"
+        ):
+            raise ValueError(
+                "Invalid audio-import clip-clone imported-parent layout."
+            )
+        source_tail = source_payload[source_attributes:]
+        clip_name = metadata["clip_name"].encode("utf-8")
+        payload = bytearray(struct.pack("<I", len(clip_name)) + clip_name)
+        payload.extend(source_tail)
+        attributes = 4 + len(clip_name)
+        payload[attributes + 5:attributes + 8] = metadata[
+            "length_samples"
+        ].to_bytes(3, "little")
+        struct.pack_into(
+            "<I", payload, attributes + 8, metadata["bwf_time_reference"]
+        )
+        name_block.items = [payload]
+
+    def _replace_imported_audio_catalog_filenames(self, name_block, filenames):
+        """Replace the prototype filename record and rebuild native counters."""
+        if not filenames:
+            raise ValueError("Audio-import filename catalog cannot be empty.")
+        payload = bytearray(name_block.items[0])
+        current_names, insertion_offset = self._decode_1004_filename_payload(
+            payload
+        )
+        if len(current_names) != 1:
+            raise ValueError(
+                "Audio-import template filename catalog must contain one prototype."
+            )
+        counter_offsets = self._decode_1004_catalog_trailer(
+            payload, insertion_offset, 1
+        )
+        folder_length = struct.unpack_from("<I", payload, 9)[0]
+        records_start = 13 + folder_length + 4
+        record_suffix = bytes(payload[insertion_offset - 4:insertion_offset])
+        if record_suffix not in (b"EVAW", b"\x00" * 4):
+            raise ValueError("Invalid audio-import template WAV filename suffix.")
+
+        prefix = bytearray(payload[:records_start])
+        trailer = bytearray(payload[insertion_offset:])
+        count = len(filenames)
+        depth = len(counter_offsets)
+        struct.pack_into("<I", prefix, 0, count + depth + 2)
+        struct.pack_into("<I", prefix, 5, count + depth + 1)
+        for index, absolute_offset in enumerate(counter_offsets, start=1):
+            relative_offset = absolute_offset - insertion_offset
+            struct.pack_into("<I", trailer, relative_offset, count + index)
+
+        records = bytearray()
+        for filename in filenames:
+            encoded = filename.encode("utf-8")
+            records.extend(b"\x02\x00\x00\x00\x00")
+            records.extend(struct.pack("<I", len(encoded)))
+            records.extend(encoded)
+            records.extend(record_suffix)
+        name_block.items = [prefix + records + trailer]
+
+    def _append_imported_audio_event(self, playlist, clip_id, start_samples):
+        """Append one native audio event in caller-defined spotting order."""
+        if (
+            not playlist.items
+            or not isinstance(playlist.items[0], (bytes, bytearray))
+            or len(playlist.items[0]) < 8
+        ):
+            raise ValueError("Invalid audio-import playlist header.")
+        header = bytearray(playlist.items[0])
+        name_length = struct.unpack_from("<I", header, 0)[0]
+        count_offset = 4 + name_length
+        header_end = count_offset + 4
+        if header_end > len(header):
+            raise ValueError("Truncated audio-import playlist event counter.")
+        current_events = [
+            item for item in playlist.items
+            if isinstance(item, PTBlock) and item.content_type == 0x1050
+        ]
+        current_count = struct.unpack_from("<I", header, count_offset)[0]
+        if current_count != len(current_events):
+            raise ValueError("Inconsistent audio-import playlist event count.")
+
+        inline_trailer = header[header_end:]
+        if inline_trailer:
+            if current_events:
+                raise ValueError(
+                    "Unsupported inline trailer in a populated audio-import playlist."
+                )
+            playlist.items[0] = header[:header_end]
+            playlist.items.append(bytearray(inline_trailer))
+            header = bytearray(playlist.items[0])
+
+        for item in playlist.items[1:]:
+            if isinstance(item, PTBlock) and item.content_type != 0x1050:
+                raise ValueError(
+                    "Unsupported non-audio block in an audio-import playlist."
+                )
+            if not isinstance(item, (PTBlock, bytes, bytearray)):
+                raise ValueError("Invalid audio-import playlist item.")
+
+        payload = bytearray(35)
+        struct.pack_into("<I", payload, 2, clip_id)
+        struct.pack_into("<Q", payload, 7, start_samples)
+        payload[15] = 0x03
+        payload[16:22] = b"\xfe\xff\x00\x00\x00\x00"
+        payload[22:30] = b"\xff" * 8
+        payload_block = PTBlock(0x0A, 0x104F, 37)
+        payload_block.items = [payload]
+        event = PTBlock(0x03, 0x1050, 49)
+        event.items = [payload_block, bytearray(b"\x00\x01\x01")]
+
+        insert_at = 1
+        for index, item in enumerate(playlist.items[1:], start=1):
+            if isinstance(item, PTBlock) and item.content_type == 0x1050:
+                insert_at = index + 1
+            else:
+                break
+        playlist.items.insert(insert_at, event)
+        struct.pack_into("<I", header, count_offset, current_count + 1)
+        playlist.items[0] = header
+
+    def _populate_audio_import_template(self, prepared):
+        """Replace one validated prototype with caller-ordered audio media."""
+        import time
+
+        if not prepared:
+            raise ValueError("At least one prepared audio source is required.")
+        template = self._validated_audio_import_template()
+        unknown_tracks = [
+            item["track"] for item in prepared
+            if item["track"] not in template["playlists"]
+        ]
+        if unknown_tracks:
+            raise ValueError(
+                f"Audio-import target track not found in template: "
+                f"{unknown_tracks[0]!r}."
+            )
+        media_template = copy.deepcopy(template["prototype_media"])
+        definition_template = copy.deepcopy(template["prototype_definition"])
+        base_filetime = _WINDOWS_FILETIME_EPOCH + time.time_ns() // 100
+
+        media_entries = []
+        definitions = []
+        for index, metadata in enumerate(prepared):
+            if index == 0:
+                media_entry = template["prototype_media"]
+                definition = template["prototype_definition"]
+            else:
+                media_entry = copy.deepcopy(media_template)
+                definition = copy.deepcopy(definition_template)
+                self._wipe_offsets_recursive(media_entry)
+                self._wipe_offsets_recursive(definition)
+            self._configure_imported_audio_media_entry(
+                media_entry, metadata, index, base_filetime + index
+            )
+            self._configure_imported_audio_clip_definition(
+                definition, metadata, index, index
+            )
+            media_entries.append(media_entry)
+            definitions.append(definition)
+
+        catalog = template["catalog"]
+        media_positions = [
+            index for index, item in enumerate(catalog.items)
+            if isinstance(item, PTBlock) and item.content_type == 0x1003
+        ]
+        if len(media_positions) != 1:
+            raise ValueError(
+                "Audio-import template media insertion point is ambiguous."
+            )
+        media_position = media_positions[0]
+        catalog.items[media_position:media_position + 1] = media_entries
+        catalog_count = bytearray(catalog.items[0])
+        struct.pack_into("<I", catalog_count, 0, len(media_entries))
+        catalog.items[0] = catalog_count
+        self._replace_imported_audio_catalog_filenames(
+            template["name_block"],
+            [item["physical_filename"] for item in prepared],
+        )
+
+        clip_list = template["clip_list"]
+        definition_positions = [
+            index for index, item in enumerate(clip_list.items)
+            if isinstance(item, PTBlock) and item.content_type == 0x2629
+        ]
+        if len(definition_positions) != 1:
+            raise ValueError(
+                "Audio-import template clip insertion point is ambiguous."
+            )
+        definition_position = definition_positions[0]
+        clip_list.items[
+            definition_position:definition_position + 1
+        ] = definitions
+        clip_count = bytearray(clip_list.items[0])
+        struct.pack_into("<I", clip_count, 0, len(definitions))
+        clip_list.items[0] = clip_count
+
+        playlists = template["playlists"]
+        for clip_id, metadata in enumerate(prepared):
+            self._append_imported_audio_event(
+                playlists[metadata["track"]],
+                clip_id,
+                metadata["start_samples"],
+            )
+
+        return [
+            {
+                "order": item["order"],
+                "source_path": item["source_path"],
+                "physical_filename": item["physical_filename"],
+                "clip_name": item["clip_name"],
+                "track": item["track"],
+                "bwf_time_reference": item["bwf_time_reference"],
+                "start_samples": item["start_samples"],
+                "length_samples": item["length_samples"],
+                "end_samples": item["end_samples"],
+            }
+            for item in prepared
+        ]
+
     def relink_clip(
         self,
         track_name,
@@ -4781,6 +5438,185 @@ class ProToolsSession:
             self.root_items = original_root_items
             self._removed_offsets = original_removed_offsets
             raise
+
+
+def _validate_generated_audio_session(session, prepared, template_tracks):
+    """Verify the saved PTX semantically before publishing its directory."""
+    if session.get_tracks() != template_tracks:
+        raise ValueError("Generated audio session has an unexpected track layout.")
+    expected_names = [item["physical_filename"] for item in prepared]
+    if session._validated_physical_audio_catalog()[3] != expected_names:
+        raise ValueError("Generated physical-media catalog is inconsistent.")
+
+    clips = session.get_clips()
+    if [clip["name"] for clip in clips] != [
+        item["clip_name"] for item in prepared
+    ]:
+        raise ValueError("Generated audio Clip List is inconsistent.")
+    clip_roots = session._root_blocks(0x262A)
+    if len(clip_roots) != 1:
+        raise ValueError("Generated audio clip-definition root is inconsistent.")
+    definitions = [
+        item for item in clip_roots[0].items
+        if isinstance(item, PTBlock) and item.content_type == 0x2629
+    ]
+    if len(definitions) != len(prepared):
+        raise ValueError("Generated audio clip-definition count is inconsistent.")
+    for expected_index, definition in enumerate(definitions):
+        identity_span, media_span = session._validated_2629_fixed_records(
+            definition
+        )
+        identity = identity_span[2]
+        media_link = media_span[2]
+        if (
+            struct.unpack_from("<I", identity, 0)[0] != expected_index
+            or struct.unpack_from("<I", media_link, 96)[0] != expected_index
+        ):
+            raise ValueError(
+                "Generated audio clip identity/media index is inconsistent."
+            )
+
+    timeline = session.get_timeline_clips()
+    if len(timeline) != len(prepared) or any(item["is_fade"] for item in timeline):
+        raise ValueError("Generated audio timeline event count is inconsistent.")
+    expected = {
+        item["clip_name"]: (
+            item["track"],
+            item["start_samples"],
+            item["length_samples"],
+            item["physical_filename"],
+        )
+        for item in prepared
+    }
+    actual = {
+        item["clip_name"]: (
+            item["track"],
+            item["start_samples"],
+            item["length_samples"],
+            item["physical_filename"],
+        )
+        for item in timeline
+    }
+    if actual != expected:
+        raise ValueError("Generated audio timeline placements are inconsistent.")
+
+
+def build_audio_session(
+    template_ptx_path,
+    clip_specs,
+    output_session_directory,
+    session_name=None,
+):
+    """Build one self-contained PTX/Audio Files directory atomically.
+
+    The source WAV bytes are copied unchanged. The PTX is created from one
+    verified template containing exactly one imported prototype in the Clip
+    List and empty timeline playlists. Each descriptor supplies audio_path and
+    track_name; its input order defines spotting/overlap priority.
+    """
+    import shutil
+    import tempfile
+
+    template_ptx_path = os.path.abspath(
+        _coerce_string_path(template_ptx_path, "template_ptx_path")
+    )
+    if not os.path.isfile(template_ptx_path):
+        raise FileNotFoundError(
+            f"Audio-session template does not exist: {template_ptx_path}"
+        )
+    if not template_ptx_path.lower().endswith(".ptx"):
+        raise ValueError("Audio-session template path must use the .ptx extension.")
+
+    output_session_directory = os.path.abspath(
+        _coerce_string_path(
+            output_session_directory, "output_session_directory"
+        )
+    )
+    output_parent = os.path.dirname(output_session_directory)
+    if not os.path.isdir(output_parent):
+        raise FileNotFoundError(
+            f"Audio-session output parent directory does not exist: {output_parent}"
+        )
+    if os.path.lexists(output_session_directory):
+        raise FileExistsError(
+            f"Audio-session output directory already exists: "
+            f"{output_session_directory}"
+        )
+
+    if session_name is None:
+        session_filename = os.path.basename(output_session_directory) + ".ptx"
+    else:
+        if not isinstance(session_name, str):
+            raise TypeError("session_name must be a string or None.")
+        if not session_name or "\x00" in session_name:
+            raise ValueError("session_name must be non-empty and contain no NUL.")
+        if os.path.basename(session_name) != session_name or any(
+            separator and separator in session_name
+            for separator in (os.sep, os.altsep, "/", "\\")
+        ):
+            raise ValueError("session_name must be a filename, not a path.")
+        session_filename = session_name
+        if not session_filename.lower().endswith(".ptx"):
+            session_filename += ".ptx"
+    if session_filename.casefold() == ".ptx":
+        raise ValueError("session_name must include a basename before .ptx.")
+
+    prepared, target_tracks = _prepare_template_audio_clips(clip_specs)
+    session = ProToolsSession(template_ptx_path)
+    template_tracks = session.get_tracks()
+    clip_manifest = session._populate_audio_import_template(prepared)
+
+    temporary_directory = tempfile.mkdtemp(
+        prefix=f".{os.path.basename(output_session_directory)}.",
+        suffix=".tmp",
+        dir=output_parent,
+    )
+    try:
+        temporary_audio_directory = os.path.join(
+            temporary_directory, "Audio Files"
+        )
+        os.mkdir(temporary_audio_directory)
+        for item in prepared:
+            destination = os.path.join(
+                temporary_audio_directory, item["physical_filename"]
+            )
+            shutil.copyfile(item["source_path"], destination)
+
+        temporary_session_path = os.path.join(
+            temporary_directory, session_filename
+        )
+        session.save(temporary_session_path)
+        verification = ProToolsSession(temporary_session_path)
+        _validate_generated_audio_session(
+            verification, prepared, template_tracks
+        )
+
+        if os.path.lexists(output_session_directory):
+            raise FileExistsError(
+                f"Audio-session output directory appeared during generation: "
+                f"{output_session_directory}"
+            )
+        os.replace(temporary_directory, output_session_directory)
+        temporary_directory = None
+    finally:
+        if temporary_directory is not None:
+            shutil.rmtree(temporary_directory)
+
+    final_audio_directory = os.path.join(
+        output_session_directory, "Audio Files"
+    )
+    for item in clip_manifest:
+        item["output_audio_path"] = os.path.join(
+            final_audio_directory, item["physical_filename"]
+        )
+    return {
+        "session_path": os.path.join(output_session_directory, session_filename),
+        "audio_files_directory": final_audio_directory,
+        "track_count": len(target_tracks),
+        "tracks": target_tracks,
+        "clips": clip_manifest,
+    }
+
 
 if __name__ == "__main__":
     # Test loading and saving a session without modification (bit-perfect test)

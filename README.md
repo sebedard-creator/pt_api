@@ -18,7 +18,7 @@ Input and output paths may be strings or `os.PathLike` objects such as `pathlib.
 
 ## API Capabilities
 
-The supported public surface is divided between the high-level `ProToolsSession` editing API and a small low-level binary/timecode API.
+The supported public surface is divided between the high-level `ProToolsSession` editing API, a template-based audio-session builder, and a small low-level binary/timecode API.
 
 ### High-level session API
 
@@ -46,6 +46,41 @@ The supported public surface is divided between the high-level `ProToolsSession`
 | | `add_volume_node(track_name, hh, mm, ss, ff, db_value)` | Adds or replaces a volume node on the resolved track after validating the complete `0x260a` envelope. |
 | **Clip Groups** | `delete_clip_group(group_name)` | Transactionally dissolves one supported simple Clip Group, restores its component clips and repairs affected pointers. |
 
+### Template-based audio-session builder
+
+| Function | Description |
+|---|---|
+| `build_audio_session(template_ptx_path, clip_specs, output_session_directory, session_name=None)` | Atomically creates a self-contained PTX plus `Audio Files` directory from a native template and an ordered iterable of audio descriptors. Every descriptor targets an existing template track; the function creates the physical-media catalog, Clip List and timeline placements. |
+
+```python
+from pathlib import Path
+from pt_api import build_audio_session
+
+clips = [
+    {"audio_path": Path("Renders") / "cloth_001.wav", "track_name": "Cloth"},
+    {
+        "audio_path": Path("Renders") / "prop_001.wav",
+        "track_name": "Props",
+        "clip_name": "Hero prop",
+        "placement_start_samples": 1_824_829_006,
+    },
+]
+
+result = build_audio_session(
+    "template.ptx",
+    clips,
+    Path("Delivery") / "Scene_001",
+    session_name="Scene_001",
+)
+
+print(result["session_path"])
+print(result["track_count"], result["tracks"])
+```
+
+Each descriptor requires `audio_path` and `track_name`. Optional `physical_filename`, `clip_name` and `placement_start_samples` fields rename the delivered media/clip or override the timeline placement. Descriptor order is preserved exactly and therefore defines spotting and overlap priority. When no placement override is supplied, the BWF time reference is used.
+
+The output directory must not already exist; its parent must exist. The function validates every input and the template before creating a temporary directory, copies every source WAV byte-for-byte, saves and reloads the generated PTX, and publishes the complete directory with one final same-volume rename. The returned JSON-compatible dictionary contains the final paths, the number/list of template tracks actually targeted, and one manifest entry per clip.
+
 ### Low-level public API
 
 | Object or function | Methods / behavior |
@@ -61,7 +96,7 @@ The supported public surface is divided between the high-level `ProToolsSession`
 
 ### Session and format support
 
-- **Existing sessions only:** `ProToolsSession` edits structurally valid existing PTX files; it does not create a complete session from scratch.
+- **Template-based authoring only:** `ProToolsSession` edits structurally valid existing PTX files and does not create a complete session from scratch. `build_audio_session()` is the sole specialized authoring path; it transforms one narrowly validated native template.
 - **Validated application/version scope:** Reference files were produced by Pro Tools Ultimate 2024.3.1. Unknown PTX revisions may contain layouts that this reverse-engineered implementation deliberately rejects.
 - **Little-endian payloads only:** A session declaring big-endian mode is rejected before block parsing. Only generic block headers understand both byte orders; editing payloads have been validated only as little-endian.
 - **Frame rates:** Timecode conversion supports only enum `0x01` (24 fps), `0x09` (23.976 fps) and `0x05` (29.97 Drop Frame). An intact unknown enum can be preserved by a no-op load/save, but operations requiring time conversion reject it.
@@ -69,11 +104,24 @@ The supported public surface is divided between the high-level `ProToolsSession`
 - **Recognized clip layouts:** Audio definition flags `0x0000`, `0x0001`, `0x2000`, `0x2001`, `0x3000`, `0x3001` and `0x4001`, plus the verified Clip Group flag `0x5000`, are decoded. The flag's low bit classifies a parent (`0`) or virtual (`1`) audio definition; its high nibble selects a zero-, 16-, 24- or 32-bit source offset. The following selector byte `0x10`, `0x20`, `0x30` or `0x40` independently selects an 8-, 16-, 24- or 32-bit length. Thus `01 30 40` is flag `0x3001` plus a UInt32-length selector, whereas `01 40 30` is the genuine flag `0x4001` plus a UInt24-length selector. Unobserved flags, including `0x4000`, and other width selectors are rejected.
 - **Physical audio filenames:** `get_timeline_clips()` uses the exact indexed `0x1004`/`0x103a` catalog when the verified layout is present. Otherwise it falls back to matching `.wav`, `.aif` and `.aiff` candidates by name in the session's `Audio Files` folder and then in `0x1004`; `physical_filename` is `None` when no unique fallback match exists.
 
+### Template-based session building
+
+- **Application-neutral manifest:** The API contains no filename grouping, sorting or track-allocation policy. A caller supplies an ordered iterable of descriptor mappings. `audio_path` and `track_name` are mandatory; `physical_filename`, `clip_name` and `placement_start_samples` are optional. This keeps application-specific naming conventions outside the reusable binary API.
+- **Template contract:** The template must be 48 kHz / frame-rate enum `0x09` (23.976), contain at least one uniquely named visible track, contain no visible or hidden timeline event, and contain exactly one Pro Tools-imported mono-float prototype in both the Clip List and physical-media catalog. The verified prototype uses `0x1001` length 15, `0x2106` lengths 142/58 and imported-parent marker `00 00 30 04 00`.
+- **Source WAV contract:** Physical source filenames may use any valid `.wav` basename. Audio must be mono 48 kHz, 32-bit IEEE-float WAVE_EXTENSIBLE with consistent `fmt `, `fact`, `data` and BWF `bext` chunks. Duration is read from `data`, media identity/reference from the BWF basic UMID/time reference, and the default placement from that BWF reference.
+- **Caller-defined order and tracks:** Descriptors are processed in their supplied order without sorting. `track_name` must exactly match an existing template playlist; any number of existing tracks may be targeted. `track_count` and `tracks` report the distinct targets in first-use order.
+- **Independent media and placement time:** `placement_start_samples` may override the event position without changing the BWF media reference encoded in `0x2106` and `0x2628`. Without an override, both values are the BWF reference.
+- **Overlap policy:** Multiple descriptors may target the same track and overlap by any duration. Each new event is appended after prior events in descriptor order; no trim, crossfade, mixing or automatic track change is performed.
+- **Verified bounds:** Each duration and `fact` count must fit the observed UInt24 imported-parent layout (`1..16,777,215`). Each BWF time reference must fit UInt32. Physical filenames and generated `.A1` clip names must be unique case-insensitively.
+- **Audio preservation:** Source WAV contents are copied unchanged. The builder does not synthesize Pro Tools' optional/cache chunks such as `DGDA`, `minf` or `regn`; the PTX identity is derived from the existing BWF UMID and timing fields. The native comparison shows that Pro Tools preserves all original chunks and samples before appending its own metadata.
+- **No track authoring:** The builder populates existing empty playlists but does not create, delete, rename or reorder tracks. Unused template tracks remain present and empty.
+- **Validation status:** PTX generation, encrypted reload, catalog/Clip List/timeline semantics, exact 48/104-byte fixed records and media indexes, false-block reassembly, explicit placement overrides, arbitrary existing track names/counts, exact WAV hashes and same-track overlap are covered automatically. The corrected two-media session was also opened, played, saved and reopened successfully in Pro Tools; both distinct media, lengths, indexes, timestamps and the one-sample overlap survived unchanged.
+
 ### Targeting and general editing
 
 - **Exact names:** Clip and track operations use exact names. Duplicate matching names are treated as ambiguous and rejected.
 - **Audio focus:** Timeline editing supports audio clips and fades. MIDI regions/controllers, video tracks/clips, Inserts, Sends, I/O routing, Pan automation, Mute automation and plugin automation are not supported. `mute_clip()` changes the static event mute flag; it does not write Mute automation.
-- **No general session authoring:** The API does not create, delete, rename or reorder tracks; perform general import/export; or arbitrarily delete Clip Bin definitions and timeline events. Relinking is limited to the exact WAV-clone operation documented below. Only the editing operations listed in the capability table are implemented.
+- **No general session authoring:** Outside the specialized template-driven audio builder, the API does not create, delete, rename or reorder tracks; perform unrestricted import/export; or arbitrarily delete Clip Bin definitions and timeline events. Relinking is limited to the exact WAV-clone operation documented below. Only the operations listed in the capability tables are implemented.
 - **Clip Group macros are not audio placements:** Group macros use a separate ID namespace and are ignored by ordinary audio read/mute/move/split/duplicate/trim/fade operations even when their numeric ID collides with a clip ID.
 - **Attached fades:** `move_clip()`, `duplicate_clip()`, `split_clip()`, `trim_clip_start()` and `trim_clip_end()` reject a placement with attached fades. Duplication does not clone fade geometry.
 - **Ambiguous placements:** Move, duplicate and trim require exactly one visible placement of the named clip. Split also requires one placement on the named track spanning the cut. `mute_clip()` is the exception: it intentionally updates all visible audio placements of the uniquely named clip.

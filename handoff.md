@@ -1,17 +1,18 @@
-# Handoff — état au 15 juillet 2026
+# Handoff — état au 17 juillet 2026
 
 Ce document sert à reprendre le développement de `pt_api` sans perdre les connaissances acquises pendant l’audit. Il ne remplace ni la spécification technique ni les tests.
 
 ## État de reprise
 
 - Version courante : `1.3.8`.
-- L’audit fonctionnel et structurel entrepris sur cette version est terminé.
-- La suite automatisée compte 166 tests et passe intégralement.
-- Les principales écritures ont été ouvertes et vérifiées manuellement dans Pro Tools à partir des sessions de référence.
+- L’audit fonctionnel et structurel général est terminé; la nouvelle voie générique de construction de session audio est validée de bout en bout dans Pro Tools avec la sortie corrigée `08`.
+- La suite automatisée compte 178 tests et passe intégralement avec les avertissements traités comme des erreurs.
+- Toutes les écritures ont été ouvertes et vérifiées manuellement dans Pro Tools à partir des sessions de référence. Le test `05` a confirmé les WAV BWF vierges. Le test `06` a ouvert avec les deux régions, puis sa sauvegarde a révélé un lien média fixe dupliqué. Le test corrigé `08` s'est ouvert, a joué, s'est sauvegardé et s'est rouvert normalement sans alerte; les deux médias sont restés distincts.
 - `README.md`, `pt_format_specs.md`, `architecture.md` et `changelog.md` ont été resynchronisés avec le code.
 - Le relink parent/racine, virtuel à offset nul et virtuel à offset non nul est validé de bout en bout dans Pro Tools. La session OttoAlign2 confirme la structure à trois niveaux internes (`VIDEO`, `Exports`, `test ottoalign`) et 177 fichiers; ces libellés sont des métadonnées PTX, jamais des chemins sur disque. Le traitement complet de production a créé 388 identités média indépendantes et la session résultante s'est ouverte et a joué correctement.
 - Une seconde production OttoAlign2 de 71 médias utilise des suffixes nuls dans tout son catalogue `0x103a`; un seul `0x1001` de 31 octets y contient un faux bloc vide. Après réassemblage, 226 des 236 placements ont été relinkés, 10 ont été ignorés normalement, le catalogue final compte 297 médias, tous les WAV sont présents et la sauvegarde no-op est bit-perfect.
-- Les bases comparatives originales de l’utilisateur sont conservées localement et ignorées par Git. Les sorties générées, diagnostics obsolètes, builds et caches ont été supprimés après validation.
+- `build_audio_session()` transforme désormais un template natif compatible en livraison PTX/`Audio Files` à partir d'un manifeste ordonné explicite. Chaque descripteur choisit son WAV et sa piste existante, avec filename physique, nom de clip et placement facultatifs. L’API n’impose aucune convention de nommage, de tri, de regroupement ou de nombre de pistes. Le placement BWF est utilisé par défaut et les WAV restent byte-for-byte identiques.
+- Les bases comparatives originales de l’utilisateur sont conservées localement et ignorées par Git. Les sorties diagnostiques `05` à `08`, les builds et les caches ont été supprimés après validation; leurs résultats causaux sont consignés ci-dessous.
 - `handoff.md` est versionné avec le projet afin que chaque clone dispose de l’état de reprise courant.
 
 ## Sources de vérité
@@ -47,10 +48,10 @@ Le projet est un module Python autonome, compatible Python 3.8+, sans dépendanc
 
 Les contrôles suivants ont été réussis sur la version courante :
 
-- 166 tests automatisés, y compris les entrées malformées, les restaurations après erreur, le relink virtuel, le remplacement PCM compatible, les deux suffixes de nom physique `EVAW`/nul, la queue média hiérarchique à plusieurs niveaux, les faux blocs dans les identités `0x1001` et enregistrements fixes `0x2629`, et un index média supérieur à 255;
+- 178 tests automatisés, y compris les entrées malformées, les restaurations après erreur, le relink virtuel, le remplacement PCM compatible, les deux suffixes de nom physique `EVAW`/nul, la queue média hiérarchique à plusieurs niveaux, les faux blocs dans les identités `0x1001` et enregistrements fixes `0x2629`, la non-duplication du lien média après réassemblage, un index média supérieur à 255, l'inspection WAVE_EXTENSIBLE float, l’ordre explicite des descripteurs, les overrides de noms et de placement, les overlaps, le rejet d'une timeline cachée non vide, le ciblage de trois pistes et la construction complète sur le corpus natif;
 - exécution de la suite avec les avertissements Python traités comme des erreurs;
 - compatibilité syntaxique Python 3.8;
-- construction PEP 517 du paquet `pt_api-1.3.7-py3-none-any.whl`;
+- construction PEP 517 du paquet `pt_api-1.3.8-py3-none-any.whl`;
 - absence de sortie parasite sur `stdout` dans l’API;
 - sauvegarde sans modification bit-perfect sur neuf bases/références réelles :
   - `test_session.ptx`;
@@ -83,6 +84,20 @@ Les essais v1 à v5 ont progressivement éliminé plusieurs divergences réelles
 - `relink_before/relink_before.ptx` : deux placements partageant `Audio 1_01.wav`; base comparative du relink physique, ensuite resauvegardée sans modification dans Pro Tools pour contrôler les champs volatils d'un Save As ordinaire.
 - `relink_before/relink_after.ptx` : session Pro Tools où le second placement a été relinké vers `Audio 1_02.wav`.
 - `virtual_relink_before/` : paire comparative de deux placements virtuels sur deux médias et références après relink gauche/droite; source de la validation des offsets virtuels nuls et non nuls.
+- `pfx_import_reference/00_template` : modèle initial à deux pistes et média Pro Tools classique; il n'est pas le prototype du builder float.
+- `pfx_import_reference/01_A_imported_cliplist` : template structurel du builder, avec un média float BWF importé dans la Clip List et aucune région sur la timeline.
+- `pfx_import_reference/02_A_spotted_PFX01` : placement natif du premier média selon sa référence temporelle BWF.
+- `pfx_import_reference/03_B_imported_cliplist` : ajout natif comparatif du second média au catalogue et à la Clip List.
+- `pfx_import_reference/04_B_spotted_PFX02` : événement natif comparatif sur une autre playlist.
+- `pfx_import_reference/Source PFX` : WAV A/B vierges du corpus. Pro Tools en conserve tous les chunks et échantillons, ajuste la taille RIFF puis ajoute `DGDA`, `minf` et `regn`.
+- Validation historique `05` — sortie supprimée : copie du PTX natif déjà spotté de `02`, dont seul le WAV enrichi par Pro Tools avait été remplacé par sa source BWF vierge byte-for-byte. Ce cas a confirmé l'acceptation des sources sans `DGDA`/`minf`/`regn`, indépendamment du writer PTX.
+- Validation historique `06` — sortie supprimée : première sortie ouverte avec deux régions, puis sauvegardée par Pro Tools. Le message `Adjusted` sur le second clip a conduit au diagnostic : les deux définitions contenaient 208 octets après `0x4403` au lieu du record `media_link` natif de 104 octets. Pro Tools avait supprimé le second média du catalogue et relié son clip au premier.
+- Validation historique `07` — sortie supprimée : reproduction pré-correction de `06`, utilisée pour confirmer les deux records fautifs de 208 octets.
+- Validation historique `08` — sortie supprimée après réussite : les deux définitions possédaient avant et après sauvegarde une identité de 48 octets, un lien média de 104 octets et les IDs/index physiques `0`/`1`. Les positions `1 824 829 006`/`1 826 474 650`, les longueurs `1 645 645`/`4 038 035`, les deux filenames physiques et l'overlap exact d'un échantillon ont été conservés lors du cycle Pro Tools.
+
+Les noms historiques de ce dossier et de certaines pistes décrivent uniquement le corpus comparatif fourni. Ils ne font partie ni du contrat public, ni d’une convention reconnue par le builder.
+
+Les contrôles manuels `05` et `08` sont réussis. La comparaison sémantique du témoin et de la sauvegarde native `08` confirme les deux entrées de catalogue, les deux longueurs, les records 48/104, les IDs/index `0`/`1`, les timestamps et l'overlap d'un échantillon. Aucun fichier d'alerte n'a été produit et les deux WAV conservent leurs SHA-256 sources.
 
 Les fichiers préfixés par `._` sont des fichiers AppleDouble et ne sont pas des sessions PTX. Les sorties de validation peuvent être régénérées; seules les bases et paires comparatives originales doivent être conservées localement.
 
@@ -122,6 +137,10 @@ Ces points sont documentés et ne doivent pas être « simplifiés » sans nouve
 - La création de Clip Groups n’est pas exposée. La dissolution prise en charge est limitée au cas simple : un groupe, une piste et un placement non ambigu.
 - Seuls les PTX little-endian et les fréquences d’images explicitement listées dans `README.md` et `pt_format_specs.md` sont acceptés.
 - Les nouveaux blocs de fade peuvent être acceptés par Pro Tools sans nouvel enregistrement `0x0002`; ne pas inventer de pointeur absent des références observées.
+- Le builder audio préserve les WAV sources sans fabriquer `DGDA`, `minf` ou `regn`. Le PTX généré se recharge et tous les hashes audio concordent, mais seul le test manuel dédié établira si Pro Tools régénère ces chunks sans mettre le média offline.
+- Le builder ne crée, ne supprime et ne renomme aucune piste. Il peut cibler n’importe quel nombre de pistes visibles existantes et laisse les autres intactes; une nouvelle capacité de gestion des pistes exigerait une paire comparative native.
+- Le writer du builder est borné au parent importé `00 00 30 04 00`, donc longueur UInt24 et référence temporelle BWF UInt32. Un override de placement reste UInt64 dans l’événement et ne modifie pas cette identité média. Ne pas étendre les largeurs du parent sans référence d'import Pro Tools correspondante.
+- L'ordre, le regroupement et l'affectation des pistes sont des politiques clientes. Ne pas réintroduire dans l'API une inférence fondée sur un filename ou un usage applicatif particulier.
 
 ## Procédure d’une future révision
 
