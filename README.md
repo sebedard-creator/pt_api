@@ -1,10 +1,10 @@
-# pt_api 1.3.9
+# pt_api 1.4.0
 
 *(Reverse-engineered and tested against **Pro Tools Ultimate 2024.3.1** on sessions at **23.98, 24, and 29.97df fps**)*
 
 A standalone, dependency-free Python API for parsing, manipulating, and re-encrypting Pro Tools (`.ptx`) session files in place. 
 
-Version 1.3.9 adds a read-only relink preflight for known unsupported Premiere virtual-media layouts. OttoAlign2 uses it to leave those placements untouched and report them, while continuing with compatible placements.
+Version 1.4.0 adds `get_timeline_clip_groups()`, a dedicated read-only reader for every visible Clip Group occurrence, including repeated placements. It also includes the 1.3.9 relink preflight for known unsupported Premiere virtual-media layouts, which OttoAlign2 uses to leave those placements untouched and report them while continuing with compatible placements.
 
 > [!NOTE]
 > **Language Notice:** While this README is provided in English, please note that the underlying codebase, comments, and deep technical documentation (`architecture.md`, `pt_format_specs.md`, etc.) are written entirely in French.
@@ -32,6 +32,7 @@ The supported public surface is divided between the high-level `ProToolsSession`
 | | `get_markers()` | Returns validated markers with their index, name and timecode. |
 | | `get_clips()` | Describes all supported audio clips and Clip Groups in the Clip Bin. |
 | | `get_timeline_clips(include_fades=True)` | Returns chronological audio/fade events with track, clip, sample range, source offset, mute/fade state and best-effort physical filename. Passing `False` returns audio only and deliberately skips fade-geometry validation. |
+| | `get_timeline_clip_groups()` | Returns every main-timeline Clip Group macro placement, including repeated placements of the same group, with its independent group ID, name, track, sample range and timecodes. |
 | **Markers** | `add_marker(name, tc_samples, index=None)` | Adds a Memory Location / Marker at an absolute sample position after validating the complete visible track map. |
 | **Clip Operations** | `rename_clip(old_name, new_name)` | Renames one uniquely identified audio clip and rejects destination-name collisions. |
 | | `mute_clip(clip_name, mute=True)` | Mutes or unmutes every visible audio placement of the uniquely named clip. |
@@ -126,7 +127,7 @@ The output directory must not already exist; its parent must exist. The function
 - **Exact names:** Clip and track operations use exact names. Duplicate matching names are treated as ambiguous and rejected.
 - **Audio focus:** Timeline editing supports audio clips and fades. MIDI regions/controllers, video tracks/clips, Inserts, Sends, I/O routing, Pan automation, Mute automation and plugin automation are not supported. `mute_clip()` changes the static event mute flag; it does not write Mute automation.
 - **No general session authoring:** Outside the specialized template-driven audio builder, the API does not create, delete, rename or reorder tracks; perform unrestricted import/export; or arbitrarily delete Clip Bin definitions and timeline events. Relinking is limited to the exact WAV-clone operation documented below. Only the operations listed in the capability tables are implemented.
-- **Clip Group macros are not audio placements:** Group macros use a separate ID namespace and are ignored by ordinary audio read/mute/move/split/duplicate/trim/fade operations even when their numeric ID collides with a clip ID.
+- **Clip Group macros are not audio placements:** Group macros use a separate ID namespace and are ignored by ordinary audio read/mute/move/split/duplicate/trim/fade operations even when their numeric ID collides with a clip ID. `get_timeline_clip_groups()` is the dedicated read-only reader for their visible main-timeline occurrences; it reports every occurrence, including repeated placements.
 - **Attached fades:** `move_clip()`, `duplicate_clip()`, `split_clip()`, `trim_clip_start()` and `trim_clip_end()` reject a placement with attached fades. Duplication does not clone fade geometry.
 - **Ambiguous placements:** Move, duplicate and trim require exactly one visible placement of the named clip. Split also requires one placement on the named track spanning the cut. `mute_clip()` is the exception: it intentionally updates all visible audio placements of the uniquely named clip.
 
@@ -165,6 +166,7 @@ The native root, zero-offset virtual and nonzero-offset virtual relink paths wer
 
 ### Clip Groups
 
+- **Dedicated timeline reader:** `get_timeline_clip_groups()` validates the global `0x262c` definitions and main `0x1054` playlists, then returns every `00 00 01` macro sorted by `(start_samples, track)`. Each record includes `group_id`, `group_name`, `track`, `start_samples`, `length_samples`, `end_samples`, and their timecode counterparts. A macro that refers to an unknown group definition is rejected; the method makes no edits.
 - **Dissolve only:** Clip Groups can be read and dissolved, but not created. Creation remains disabled pending reverse-engineering of the `0x2428`/`0x2501` link.
 - **Simple layout only:** `delete_clip_group()` supports a session containing exactly one simple audio group, containing one track, placed exactly once. Multiple groups, multiple placements, nested groups, internal fades and non-audio events are rejected before mutation.
 

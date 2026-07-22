@@ -8,7 +8,7 @@ from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.3.9"
+__version__ = "1.4.0"
 
 
 _TEMPLATE_AUDIO_IEEE_FLOAT_SUBFORMAT = bytes.fromhex(
@@ -1590,6 +1590,101 @@ class ProToolsSession:
                     "src_offset": engine.samples_to_timecode(0),
                 })
         return clips
+
+    def get_timeline_clip_groups(self):
+        """Return every visible main-timeline Clip Group macro placement.
+
+        Clip Group IDs belong to the independent 0x262c namespace.  This
+        reader intentionally does not mix them into ``get_timeline_clips()``,
+        whose contract is limited to ordinary audio clips and fades.
+        """
+        group_roots = self._root_blocks(0x262c)
+        if not group_roots:
+            return []
+        if len(group_roots) != 1:
+            raise ValueError("Ambiguous session: multiple root 0x262c group lists.")
+        group_root = group_roots[0]
+        if (
+            not group_root.items
+            or not isinstance(group_root.items[0], (bytes, bytearray))
+            or len(group_root.items[0]) < 4
+        ):
+            raise ValueError("Invalid 0x262c group counter payload.")
+        definitions = [
+            item for item in group_root.items
+            if isinstance(item, PTBlock) and item.content_type == 0x262b
+        ]
+        declared = struct.unpack_from("<I", group_root.items[0], 0)[0]
+        if declared != len(definitions):
+            raise ValueError(
+                f"Inconsistent 0x262c group count: declared={declared}, "
+                f"actual={len(definitions)}."
+            )
+
+        groups_by_id = {}
+        for group_id, definition in enumerate(definitions):
+            payload_blocks = [
+                item for item in definition.items
+                if isinstance(item, PTBlock) and item.content_type == 0x2628
+            ]
+            if (
+                len(payload_blocks) != 1
+                or not payload_blocks[0].items
+                or not isinstance(payload_blocks[0].items[0], (bytes, bytearray))
+            ):
+                raise ValueError("Invalid 0x262b Clip Group definition.")
+            groups_by_id[group_id] = self._decode_clip_group_payload(
+                payload_blocks[0].items[0]
+            )
+
+        engine = TimecodeEngine(self.sample_rate, self.frame_rate_enum)
+        placements = []
+        for _, track_name, events in self._validated_main_playlists():
+            for event in events:
+                payload_blocks = [
+                    child for child in event.items
+                    if isinstance(child, PTBlock) and child.content_type == 0x104f
+                ]
+                if len(payload_blocks) != 1:
+                    raise ValueError("Invalid 0x1050 event structure.")
+                payload_block = payload_blocks[0]
+                if (
+                    not payload_block.items
+                    or not isinstance(payload_block.items[0], (bytes, bytearray))
+                    or len(payload_block.items[0]) < 16
+                ):
+                    raise ValueError("Invalid 0x104f event payload.")
+                payload = payload_block.items[0]
+                if payload[15] != 0x03:
+                    continue
+                if self._audio_timeline_event_kind(event, payload) != "clip_group":
+                    continue
+
+                group_id = struct.unpack_from("<I", payload, 2)[0]
+                if group_id not in groups_by_id:
+                    raise ValueError(
+                        "Timeline Clip Group macro references an unknown group ID."
+                    )
+                group = groups_by_id[group_id]
+                start_samples = struct.unpack_from("<Q", payload, 7)[0]
+                length_samples = group["length"]
+                end_samples = start_samples + length_samples
+                if end_samples > 0xFFFFFFFFFFFFFFFF:
+                    raise OverflowError("Clip Group placement end exceeds UInt64.")
+                placements.append({
+                    "group_id": group_id,
+                    "group_name": group["name"],
+                    "track": track_name,
+                    "start_samples": start_samples,
+                    "length_samples": length_samples,
+                    "end_samples": end_samples,
+                    "start_timecode": engine.samples_to_timecode(start_samples),
+                    "length_timecode": engine.samples_to_timecode(length_samples),
+                    "end_timecode": engine.samples_to_timecode(end_samples),
+                })
+
+        placements.sort(key=lambda item: (item["start_samples"], item["track"]))
+        return placements
 
     def get_timeline_clips(self, include_fades=True):
         """Return validated timeline events, optionally limiting the result to audio."""

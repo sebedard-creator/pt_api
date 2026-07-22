@@ -4,11 +4,11 @@ Ce document sert à reprendre le développement de `pt_api` sans perdre les conn
 
 ## État de reprise
 
-- Version courante : `1.3.9`.
+- Version courante : `1.4.0`.
 - **Blocage d'écriture Premiere, préflight sûr** : la lecture des headers `0x2106` de 169/173 octets et des marqueurs virtuels `0x3001/0x30` (`0x04`/`0x84`) est observée. Leur relink écrit n'est pas validé : les sorties `target4` ont toutes été refusées par Pro Tools avec `End of stream encountered`, y compris un contrôle utilisant un catalogue hybride créé nativement par Pro Tools. Un `Save Copy In…` du `target4` a copié le WAV mais conservé le header 173 octets, la signature Adobe Premiere et la géométrie virtuelle; il ne normalise donc pas ce cas. `get_relink_write_status()` détecte ce layout de façon observationnelle avant toute écriture et retourne `premiere_virtual_media`/173; OttoAlign2 peut donc conserver ces placements intacts, sans WAV ni suffixe `_ALIGNED`, et les documenter dans son rapport. Cela ne constitue pas un support du relink Premiere.
 - **Contournement validé** : `Consolidate Clip` dans Pro Tools transforme le clip concerné en parent natif avec header `0x2106` de 151 octets. OttoAlign2 a ensuite traité `target4_consolidated_reference.ptx`, créé `OA00000001.wav` et `target3_01_ALIGNED`; la sortie `target4_consolidated_otto.ptx` s'est ouverte correctement dans Pro Tools. Ce résultat valide le prétraitement par consolidation, pas l'écriture directe du layout hérité. Le témoin consolidé n'avait pas de handles supplémentaires; une consolidation élargie puis retrimmée reste à confirmer séparément si des handles sont requis.
 - L’audit fonctionnel et structurel général est terminé; la nouvelle voie générique de construction de session audio est validée de bout en bout dans Pro Tools avec la sortie corrigée `08`.
-- La suite automatisée compte 186 tests et passe intégralement. Elle inclut les deux préflights de relink virtuel, dont le rejet sans mutation d'un header `0x2106` de 173 octets.
+- La suite automatisée compte 189 tests et passe intégralement. Elle inclut les deux préflights de relink virtuel, dont le rejet sans mutation d'un header `0x2106` de 173 octets, ainsi que la lecture des occurrences de Clip Groups.
 - Toutes les écritures ont été ouvertes et vérifiées manuellement dans Pro Tools à partir des sessions de référence. Le test `05` a confirmé les WAV BWF vierges. Le test `06` a ouvert avec les deux régions, puis sa sauvegarde a révélé un lien média fixe dupliqué. Le test corrigé `08` s'est ouvert, a joué, s'est sauvegardé et s'est rouvert normalement sans alerte; les deux médias sont restés distincts.
 - `README.md`, `pt_format_specs.md`, `architecture.md` et `changelog.md` ont été resynchronisés avec le code.
 - Le relink parent/racine, virtuel à offset nul et virtuel à offset non nul **natif Pro Tools** est validé de bout en bout. Ces validations ne s'étendent pas aux définitions virtuelles importées de Premiere. Les libellés de catalogue (`VIDEO`, `Exports`, etc.) sont des métadonnées PTX, jamais des chemins sur disque.
@@ -50,10 +50,10 @@ Le projet est un module Python autonome, compatible Python 3.8+, sans dépendanc
 
 Les contrôles suivants ont été réussis sur la version courante :
 
-- 186 tests automatisés, y compris les entrées malformées, les restaurations après erreur, le relink virtuel, le préflight lecture seule du header Premiere variable, le remplacement PCM compatible, les deux suffixes de nom physique `EVAW`/nul, la queue média hiérarchique à plusieurs niveaux, les faux blocs dans les identités `0x1001` et enregistrements fixes `0x2629`, la non-duplication du lien média après réassemblage, un index média supérieur à 255, l'inspection WAVE_EXTENSIBLE float, l’ordre explicite des descripteurs, les overrides de noms et de placement, les overlaps, le rejet d'une timeline cachée non vide, le ciblage de trois pistes et la construction complète sur le corpus natif;
+- 189 tests automatisés, y compris les entrées malformées, les restaurations après erreur, le relink virtuel, le préflight lecture seule du header Premiere variable, le remplacement PCM compatible, les deux suffixes de nom physique `EVAW`/nul, la queue média hiérarchique à plusieurs niveaux, les faux blocs dans les identités `0x1001` et enregistrements fixes `0x2629`, la non-duplication du lien média après réassemblage, un index média supérieur à 255, l'inspection WAVE_EXTENSIBLE float, l’ordre explicite des descripteurs, les overrides de noms et de placement, les overlaps, le rejet d'une timeline cachée non vide, le ciblage de trois pistes, la lecture répétée de Clip Groups et la construction complète sur le corpus natif;
 - exécution de la suite avec les avertissements Python traités comme des erreurs;
 - compatibilité syntaxique Python 3.8;
-- métadonnées PEP 517 alignées sur `1.3.9`; la construction du wheel `pt_api-1.3.9-py3-none-any.whl` reste à exécuter dans l'environnement de release équipé de `build`/`wheel` (ces outils ne sont pas installés sur cette station);
+- métadonnées PEP 517 alignées sur `1.4.0`; la construction du wheel `pt_api-1.4.0-py3-none-any.whl` reste à exécuter dans l'environnement de release équipé de `build`/`wheel` (ces outils ne sont pas installés sur cette station);
 - absence de sortie parasite sur `stdout` dans l’API;
 - sauvegarde sans modification bit-perfect sur neuf bases/références réelles :
   - `test_session.ptx`;
@@ -114,6 +114,7 @@ Les fichiers préfixés par `._` sont des fichiers AppleDouble et ne sont pas de
 - Pour une suppression réelle, collecter les anciens offsets puis purger les références `0x0002` correspondantes.
 - Conserver le bloc `0x0002` unique, final et plat, avec ses compteurs et cibles cohérents.
 - Maintenir des espaces d’identifiants séparés pour l’audio, les Clip Groups et les fades.
+- `get_timeline_clip_groups()` est le lecteur en lecture seule des macros de groupe visibles : il associe la queue `00 00 01` aux définitions ordinales `0x262c`, retourne chaque occurrence avec piste, échantillons et timecodes, et reste volontairement distinct de `get_timeline_clips()`.
 - Exiger un ciblage non ambigu pour les noms et placements employés par une mutation.
 - Encadrer toute mutation composée et toute sauvegarde par une transaction en mémoire.
 - Produire la sortie par remplacement atomique et conserver la session en mémoire intacte en cas d’échec.
@@ -137,6 +138,7 @@ Ces points sont documentés et ne doivent pas être « simplifiés » sans nouve
 - L'identité média brute de 31 octets d'un `0x1001` peut subir le même faux découpage. La réassembler avant de remplacer `+22..+30`, puis normaliser seulement le clone en un payload brut.
 - Les noms physiques ordonnés du `0x103a` existent avec un suffixe `EVAW` ou quatre octets nuls selon la session. Exiger une variante uniforme et la recopier lors de l'insertion; ne jamais normaliser arbitrairement une session vers l'autre variante.
 - La création de Clip Groups n’est pas exposée. La dissolution prise en charge est limitée au cas simple : un groupe, une piste et un placement non ambigu.
+- La lecture des Clip Groups n'a pas cette limite de cardinalité : elle accepte plusieurs définitions et plusieurs occurrences. La session `Y:\SHARE TO NETWORK\test_timeline_clip_groups\test_timeline_clip_groups.ptx` a confirmé deux placements distincts de `GROUP_READ_TEST` sur `Audio 1`, lus avec le même ID ordinal, leur durée native et leurs positions/timecodes respectifs.
 - Seuls les PTX little-endian et les fréquences d’images explicitement listées dans `README.md` et `pt_format_specs.md` sont acceptés.
 - Les nouveaux blocs de fade peuvent être acceptés par Pro Tools sans nouvel enregistrement `0x0002`; ne pas inventer de pointeur absent des références observées.
 - Le builder audio préserve les WAV sources sans fabriquer `DGDA`, `minf` ou `regn`. Le PTX généré se recharge et tous les hashes audio concordent, mais seul le test manuel dédié établira si Pro Tools régénère ces chunks sans mettre le média offline.

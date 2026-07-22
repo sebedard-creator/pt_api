@@ -1,5 +1,10 @@
 # Pro Tools API - Changelog
 
+## v1.4.0 (Lecture des occurrences de Clip Groups) - 2026-07-22
+
+- **Lecture des occurrences de Clip Groups** : ajout de `ProToolsSession.get_timeline_clip_groups()`. Cette API en lecture seule parcourt les macros `00 00 01` de la timeline principale, les résout dans l'espace d'identifiants `0x262c` séparé de l'audio, puis retourne chaque occurrence avec groupe, piste, plage en échantillons et timecodes. Les occurrences répétées sont conservées et le résultat est trié par position puis piste.
+- **Contrat exécutable** : tests des occurrences répétées, de deux définitions homonymes distinguées par ID, du tri stable, des timecodes, de l'exclusion des événements audio et du rejet d'un ID de groupe inconnu. La suite compte maintenant 189 tests automatisés.
+
 ## v1.3.9 (Préflight sûr pour médias virtuels Premiere) - 2026-07-22
 
 - **Nouveau préflight public en lecture seule** : `ProToolsSession.get_relink_write_status(track_name, clip_name, placement_start_samples)` résout un placement audio exact et inspecte sa définition/média sans modifier l'arbre PTX, la table de pointeurs ni un WAV. Il distingue le média virtuel natif vérifié, le média non virtuel et les layouts non vérifiables.

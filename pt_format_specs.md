@@ -1,6 +1,6 @@
 # Spécifications binaires du format Pro Tools (`.ptx`)
 
-*(Spécification normative de `pt_api` 1.3.9; sessions de référence produites par Pro Tools Ultimate 2024.3.1 à 23.98, 24 et 29.97df fps, plus layouts Premiere Pro observés.)*
+*(Spécification normative de `pt_api` 1.4.0; sessions de référence produites par Pro Tools Ultimate 2024.3.1 à 23.98, 24 et 29.97df fps, plus layouts Premiere Pro observés.)*
 
 Ce document décrit exactement les structures que le code courant lit, valide, modifie et sérialise. Une structure dite « observée » provient des sessions de référence; une structure dite « prise en charge » possède un chemin explicite dans `pt_api.py`. Les zones non interprétées sont conservées telles quelles et ne doivent pas être déduites par heuristique.
 
@@ -199,6 +199,8 @@ Le payload secondaire brut direct de `0x1050` distingue les namespaces :
 | Fondu | `0x0a` | `01 01 01` |
 
 Une macro de groupe n'est jamais un clip audio, même si son ID numérique est égal à un ID de `0x262a`. Les événements d'autres types sont préservés mais ne sont pas retournés par `get_timeline_clips()`.
+
+`get_timeline_clip_groups()` est le lecteur public dédié aux macros visibles de la timeline principale. Il valide une unique racine `0x262c` (compteur UInt32 et `0x262b` directs), attribue l'ID de groupe par ordinal zéro-based dans cette liste, puis parcourt les playlists validées de la racine principale `0x1054`. Pour chaque événement `0x104f[15] == 0x03` dont la queue secondaire est exactement `00 00 01`, il lit l'ID UInt32 LE à `+2` et le timestamp UInt64 LE à `+7`; la durée provient du payload `0x2628` de la définition `0x262b` correspondante. Le résultat est trié par `(start_samples, track)` et contient chaque occurrence, y compris les placements répétés d'un même groupe : `group_id`, `group_name`, `track`, `start_samples`, `length_samples`, `end_samples`, `start_timecode`, `length_timecode`, `end_timecode`. Un ID de macro absent de `0x262c` est une incohérence rejetée. Cette méthode est strictement en lecture seule et ne modifie pas le contrat audio de `get_timeline_clips()`.
 
 `get_timeline_clips(include_fades=True)` retourne les événements audio et fondus triés par `(start_samples, track)`. La durée audio et le `src_offset` viennent de `0x2628`; la durée et le début d'un fondu viennent de sa géométrie. Les macros de groupes sont exclues. Sans racine `0x262a`, il retourne immédiatement `[]`.
 
@@ -618,7 +620,7 @@ Chaque nœud est `[timestamp UInt32][valeur Int16]`. La valeur est en déci-dB. 
 
 ## 11. Clip Groups
 
-La lecture des définitions est indépendante des clips audio : `0x262c` contient un compteur UInt32 et des `0x262b`; l'ID de groupe est leur ordinal. Les macros de timeline utilisent ce namespace, pas celui de `0x262a`.
+La lecture des définitions est indépendante des clips audio : `0x262c` contient un compteur UInt32 et des `0x262b`; l'ID de groupe est leur ordinal. Les macros de timeline utilisent ce namespace, pas celui de `0x262a`. Le lecteur `get_timeline_clip_groups()` accepte autant de définitions et de macros visibles que la session en contient; cette généralité de lecture ne relâche pas les contraintes étroites d'écriture de `delete_clip_group()`.
 
 La disposition prise en charge pour `delete_clip_group()` est volontairement étroite :
 
@@ -661,9 +663,9 @@ L'opération complète est transactionnelle. Sans racine `0x262c`, `delete_clip_
 
 ## 13. Catalogue exhaustif des erreurs
 
-La portée d'« exhaustif » est la suivante : toutes les familles d'échecs explicitement détectées ou propagées par `pt_api.py` 1.3.9, ainsi que tous les messages Pro Tools consignés dans le corpus et l'historique des essais du projet. Elle ne prétend pas recenser les messages possibles de toutes les versions de Pro Tools.
+La portée d'« exhaustif » est la suivante : toutes les familles d'échecs explicitement détectées ou propagées par `pt_api.py` 1.4.0, ainsi que tous les messages Pro Tools consignés dans le corpus et l'historique des essais du projet. Elle ne prétend pas recenser les messages possibles de toutes les versions de Pro Tools.
 
-Le source courant contient 539 instructions `raise` : 454 `ValueError`, 47 `TypeError`, 8 `NotImplementedError`, 10 `OverflowError`, 8 `FileNotFoundError`, 3 `FileExistsError`, 1 `OSError` et 8 relances nues de l'exception originale.
+Le source courant contient 547 instructions `raise` : 461 `ValueError`, 47 `TypeError`, 8 `NotImplementedError`, 11 `OverflowError`, 8 `FileNotFoundError`, 3 `FileExistsError`, 1 `OSError` et 8 relances nues de l'exception originale.
 
 ### 13.1 Messages observés dans Pro Tools
 
@@ -692,9 +694,9 @@ Le source courant contient 539 instructions `raise` : 454 `ValueError`, 47 `Type
 | `ValueError` — marqueurs | Session sans playlist principale; règle `0x2030` absente/dupliquée/mal formée; compteur incohérent; payload `0x2077`, longueur ou UTF-8 invalide; index dupliqué/hors `1..65535`; timestamp hors Int64; nom NUL/non UTF-8/trop long; modèle ou zone UUID interne invalide. |
 | `ValueError` — Clip Gain | Dictionnaire `0x2637` absent/dupliqué/mal formé; compteur/taille incohérent; index de définition hors dictionnaire; gain `NaN`/`+inf` ou hors Float32; payload de clip trop court. |
 | `ValueError` — Volume | Nom de piste vide/NUL/ambigu; association visible→`0x261c` impossible; `0x2619`, `0x260d` ou `0x260a` absent/ambigu/mal formé; magic, taille, padding, terminateur, compteur de nœuds ou segments incohérent; timestamps non strictement croissants; timestamp hors UInt32; valeur non finie ou hors Int16 déci-dB. |
-| `ValueError` — Clip Groups | Nom vide/groupe absent; racines, compteurs, noms UTF-8 ou métadonnées `0x262c`/`0x2428`/`0x2424`/`0x2426` incohérents; playlist cachée vide/mal formée; macro ou index de nom non concordant. |
+| `ValueError` — Clip Groups | Nom vide/groupe absent; racines, compteurs, noms UTF-8 ou métadonnées `0x262c`/`0x2428`/`0x2424`/`0x2426` incohérents; playlist cachée vide/mal formée; macro ou index de nom non concordant; macro visible `00 00 01` dont l'ID ordinal n'existe pas dans `0x262c`. |
 | `NotImplementedError` | Exactement huit refus explicites : session contenant plus d'un Clip Group; groupe contenant plus d'une piste; groupe imbriqué/fade/événement non audio; groupe placé zéro ou plusieurs fois au lieu d'une; move avec fade attaché; duplicate avec fade attaché; split avec fade attaché; trim avec fade attaché. |
-| `OverflowError` | Offset de bloc sérialisé hors UInt32; payload `PTBlock` hors champ de taille UInt32; bloc dépassant l'espace fichier UInt32; timestamp restauré d'un groupe hors UInt64; nouvel index de point Clip Gain hors Int32 signé; nouvel ID de clip, index média de relink ou compteurs de noms physiques hors UInt32. |
+| `OverflowError` | Offset de bloc sérialisé hors UInt32; payload `PTBlock` hors champ de taille UInt32; bloc dépassant l'espace fichier UInt32; timestamp restauré d'un groupe ou fin calculée d'un placement de Clip Group hors UInt64; nouvel index de point Clip Gain hors Int32 signé; nouvel ID de clip, index média de relink ou compteurs de noms physiques hors UInt32. |
 | `FileNotFoundError` | Fichier d'entrée absent (propagé nativement); dossier de destination inexistant pour `xor_session()`/`save()`; WAV source ou WAV de remplacement absent, ou dossier du nouveau WAV inexistant pour `relink_clip()`; template/WAV source du builder absent ou parent du dossier de livraison inexistant. |
 | `FileExistsError` | Le chemin du nouveau WAV demandé à `relink_clip()` existe déjà; le dossier cible du builder existe avant l'appel ou apparaît pendant la génération. Aucun écrasement n'est permis. |
 | `PermissionError` et autres `OSError` natifs | Erreur d'ouverture/lecture/création/remplacement du système de fichiers; elles conservent leur sous-type. La recherche facultative dans `Audio Files` est la seule exception : ses `OSError` sont absorbées et la résolution continue avec `0x1004`. |

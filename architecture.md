@@ -1,4 +1,4 @@
-# Architecture logicielle de `pt_api` 1.3.9
+# Architecture logicielle de `pt_api` 1.4.0
 
 Ce document donne un survol global du logiciel. Les structures binaires, offsets, flags et messages d'erreur appartiennent à [`pt_format_specs.md`](pt_format_specs.md), qui est la spécification technique normative. La surface publique et ses limitations sont résumées dans [`README.md`](README.md).
 
@@ -79,6 +79,8 @@ Les fonctions de chiffrement valident l'en-tête PTX, transforment une copie des
 - la liste des offsets de blocs supprimés qui devront être purgés à la sauvegarde.
 
 Les méthodes de lecture exposent pistes, marqueurs, clips et événements. Les méthodes de mutation couvrent les opérations audio documentées dans le README, y compris le clonage/relink physique étroit d'un placement. Les validateurs communs résolvent les noms, compteurs, placements, géométries, catalogues média et dictionnaires avant toute écriture. La hiérarchie interne d'un catalogue PTX reste distincte de la résolution des chemins : l'application fournit les chemins WAV, normalement sous le dossier `Audio Files` associé à la session.
+
+La lecture des macros de Clip Groups suit une voie distincte : `get_timeline_clip_groups()` lit les occurrences visibles de la timeline dans leur namespace `0x262c`, sans les confondre avec les clips audio de `get_timeline_clips()`. Cette séparation préserve les identifiants indépendants et les placements répétés, tout en laissant l'API de groupe strictement en lecture seule.
 
 ### Builder de session audio
 
