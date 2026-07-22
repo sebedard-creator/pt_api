@@ -1,4 +1,4 @@
-# Architecture logicielle de `pt_api`
+# Architecture logicielle de `pt_api` 1.3.9
 
 Ce document donne un survol global du logiciel. Les structures binaires, offsets, flags et messages d'erreur appartiennent à [`pt_format_specs.md`](pt_format_specs.md), qui est la spécification technique normative. La surface publique et ses limitations sont résumées dans [`README.md`](README.md).
 
@@ -37,6 +37,8 @@ Fichier PTX chiffré
 ```
 
 Le chargement produit un modèle mémoire déchiffré. Les opérations ordinaires modifient seulement ce modèle jusqu'à l'appel explicite à `save()`. Le relink physique est l'exception : il installe d'abord un clone WAV atomique — éventuellement avec le chunk PCM `data` d'un rendu strictement compatible — puis l'appelant sauvegarde séparément le PTX; cette frontière est explicite dans le contrat public.
+
+Le lecteur isole les conventions Premiere dans `pt_api`, non dans les applications clientes : il reconnaît les headers `0x2106` variables et les géométries virtuelles observées, sans les modifier. `get_relink_write_status()` ajoute un préflight public observationnel : il peut signaler, avant toute création de WAV, qu'un placement virtuel utilise le header variable Premiere non pris en charge. L'écriture/relink de ces clips reste un point de recherche bloqué : les essais du 21 juillet 2026 ont été refusés par Pro Tools (`End of stream encountered`), y compris avec un catalogue hybride créé nativement.
 
 Le builder de session audio constitue un second flux de haut niveau, volontairement étroit mais indépendant de l'application cliente :
 

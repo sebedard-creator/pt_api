@@ -22,10 +22,19 @@ def filename_record(filename, suffix=b"EVAW"):
     )
 
 
-def media_entry(umid, ordinal=1, production_layout=False):
+def media_entry(
+    umid,
+    ordinal=1,
+    production_layout=False,
+    detail_header_length=None,
+    time_reference=0,
+):
     media_info = bytearray(31)
     media_info[22:31] = b"\x2a" + umid[16:24]
-    detail_header = bytearray(142 if production_layout else 151)
+    if detail_header_length is None:
+        detail_header_length = 142 if production_layout else 151
+    detail_header = bytearray(detail_header_length)
+    struct.pack_into("<I", detail_header, detail_header_length - 51, time_reference)
     detail_tail = bytearray(58)
     detail_tail[18:50] = umid[:32]
     detail = block(
@@ -55,6 +64,7 @@ def clip_definition(
     time_reference,
     virtual_source_offset=None,
     virtual_length=120_000,
+    premiere_virtual_marker=None,
 ):
     encoded = name.encode("utf-8")
     payload = bytearray(struct.pack("<I", len(encoded)) + encoded)
@@ -85,8 +95,11 @@ def clip_definition(
             width_selector, length_width = 0x30, 3
         else:
             width_selector, length_width = 0x40, 4
+        layout_marker = ((flags >> 8) & 0xF0) | 0x04
+        if premiere_virtual_marker is not None:
+            layout_marker = premiere_virtual_marker
         payload.extend(struct.pack("<H", flags))
-        payload.extend(bytes((width_selector, ((flags >> 8) & 0xF0) | 0x04, 0x08)))
+        payload.extend(bytes((width_selector, layout_marker, 0x08)))
         payload.extend(virtual_source_offset.to_bytes(source_width, "little"))
         payload.extend(virtual_length.to_bytes(length_width, "little"))
         payload.extend(struct.pack("<I", time_reference + virtual_source_offset))
@@ -127,6 +140,8 @@ def make_session(
     physical_count=1,
     virtual_source_offset=None,
     filename_record_suffix=b"EVAW",
+    detail_header_length=None,
+    premiere_virtual_marker=None,
 ):
     if source_time_reference is None:
         source_time_reference = start_samples
@@ -175,6 +190,8 @@ def make_session(
                     umid,
                     ordinal,
                     production_layout=virtual_source_offset is not None,
+                    detail_header_length=detail_header_length,
+                    time_reference=source_time_reference,
                 )
                 for ordinal in range(1, physical_count + 1)
             ),
@@ -191,6 +208,7 @@ def make_session(
                 "Audio 1_01",
                 source_time_reference,
                 virtual_source_offset=virtual_source_offset,
+                premiere_virtual_marker=premiere_virtual_marker,
             ),
         ],
     )
@@ -462,6 +480,145 @@ class RelinkTests(unittest.TestCase):
                 [3],
             )
 
+    def test_relink_preserves_a_variable_2106_prefix(self):
+        session, source_umid = make_session(
+            source_time_reference=800,
+            detail_header_length=173,
+        )
+        source_detail = next(
+            item for item in session._root_blocks(0x1004)[0].items
+            if isinstance(item, PTBlock) and item.content_type == 0x1003
+        )
+        source_detail = next(
+            item for item in source_detail.items
+            if isinstance(item, PTBlock) and item.content_type == 0x2106
+        )
+        source_header = next(
+            item for item in source_detail.items
+            if isinstance(item, (bytes, bytearray)) and len(item) == 173
+        )
+        source_header[48:80] = b"Adobe Premiere Pro 2025.0 (Mac)!"
+        preserved_prefix = bytes(source_header[48:80])
+
+        with tempfile.TemporaryDirectory() as directory:
+            audio_dir = Path(directory)
+            source = audio_dir / "Audio 1_01.wav"
+            destination = audio_dir / "Audio 1_02.wav"
+            write_pro_tools_wave(source, source.stem, source_umid, time_reference=800)
+
+            session.relink_clip(
+                "Audio 1",
+                "Audio 1_01",
+                1_000,
+                "REGION TWO",
+                source,
+                destination,
+            )
+
+        new_media = [
+            item for item in session._root_blocks(0x1004)[0].items
+            if isinstance(item, PTBlock) and item.content_type == 0x1003
+        ][1]
+        detail = next(
+            item for item in new_media.items
+            if isinstance(item, PTBlock) and item.content_type == 0x2106
+        )
+        header = next(
+            item for item in detail.items
+            if isinstance(item, (bytes, bytearray)) and len(item) == 173
+        )
+        self.assertEqual(bytes(header[48:80]), preserved_prefix)
+        self.assertEqual(
+            struct.unpack_from("<I", header, len(header) - 51)[0], 1_000
+        )
+
+    def test_relink_write_status_skips_variable_header_virtual_media(self):
+        session, _ = make_session(
+            start_samples=1_000_000,
+            source_time_reference=800,
+            virtual_source_offset=120_000,
+            detail_header_length=173,
+            premiere_virtual_marker=0x04,
+        )
+
+        status = session.get_relink_write_status(
+            "Audio 1",
+            "Audio 1_01",
+            1_000_000,
+        )
+
+        self.assertFalse(status["supported"])
+        self.assertEqual(status["code"], "premiere_virtual_media")
+        self.assertEqual(status["detail_header_length"], 173)
+
+    def test_relink_write_status_accepts_verified_virtual_media(self):
+        session, _ = make_session(
+            start_samples=1_000_000,
+            source_time_reference=800,
+            virtual_source_offset=120_000,
+            premiere_virtual_marker=0x84,
+        )
+
+        status = session.get_relink_write_status(
+            "Audio 1",
+            "Audio 1_01",
+            1_000_000,
+        )
+
+        self.assertTrue(status["supported"])
+        self.assertEqual(status["code"], "verified_virtual_media")
+
+    def test_timeline_reader_ignores_a_dangling_audio_event_without_mutation(self):
+        session, _ = make_session()
+        playlist = session._root_blocks(0x1054)[0].items[1]
+        ghost = timeline_event(2_000)
+        payload = ghost.items[0].items[0]
+        struct.pack_into("<I", payload, 2, 1)
+        ghost.items[1] = bytearray(b"\x01\x01\x01")
+        playlist.items.append(ghost)
+        header = bytearray(playlist.items[0])
+        struct.pack_into("<I", header, 4 + len(b"Audio 1"), 2)
+        playlist.items[0] = header
+        before = repr(session.root_items)
+
+        timeline = session.get_timeline_clips(include_fades=False)
+
+        self.assertEqual(len(timeline), 1)
+        self.assertEqual(repr(session.root_items), before)
+
+    def test_relink_removes_a_dangling_event_before_its_id_can_be_reused(self):
+        session, source_umid = make_session(source_time_reference=800)
+        playlist = session._root_blocks(0x1054)[0].items[1]
+        ghost = timeline_event(2_000)
+        struct.pack_into("<I", ghost.items[0].items[0], 2, 1)
+        ghost.items[1] = bytearray(b"\x01\x01\x01")
+        playlist.items.append(ghost)
+        header = bytearray(playlist.items[0])
+        struct.pack_into("<I", header, 4 + len(b"Audio 1"), 2)
+        playlist.items[0] = header
+
+        with tempfile.TemporaryDirectory() as directory:
+            audio_dir = Path(directory)
+            source = audio_dir / "Audio 1_01.wav"
+            destination = audio_dir / "Audio 1_02.wav"
+            write_pro_tools_wave(source, source.stem, source_umid, time_reference=800)
+            session.relink_clip(
+                "Audio 1",
+                "Audio 1_01",
+                1_000,
+                "Audio 1_02",
+                source,
+                destination,
+            )
+
+        timeline = session.get_timeline_clips(include_fades=False)
+        self.assertEqual([item["clip_name"] for item in timeline], ["Audio 1_02"])
+        self.assertNotIn(ghost, playlist.items)
+        self.assertEqual(
+            struct.unpack_from("<I", playlist.items[0], 4 + len(b"Audio 1"))[0],
+            1,
+        )
+
     def test_relink_supports_environment_independent_multilevel_catalog(self):
         session, source_umid = make_session(
             catalog_labels=("VIDEO", "Exports", "test ottoalign")
@@ -626,11 +783,20 @@ class RelinkTests(unittest.TestCase):
             self.assertEqual(len(session.get_clips()), 1)
 
     def test_relink_preserves_verified_production_virtual_clip_geometry(self):
-        for source_offset in (0, 120_000):
-            with self.subTest(source_offset=source_offset):
+        for source_offset, premiere_marker in (
+            (0, None),
+            (120_000, None),
+            (120_000, 0x04),
+            (120_000, 0x84),
+        ):
+            with self.subTest(
+                source_offset=source_offset, premiere_marker=premiere_marker
+            ):
                 session, source_umid = make_session(
+                    start_samples=1_000_000,
                     source_time_reference=800,
                     virtual_source_offset=source_offset,
+                    premiere_virtual_marker=premiere_marker,
                 )
                 source_definition = [
                     item for item in session._root_blocks(0x262A)[0].items
@@ -643,6 +809,23 @@ class RelinkTests(unittest.TestCase):
                 source_payload = bytes(source_name_block.items[0])
                 source_name_length = struct.unpack_from("<I", source_payload, 0)[0]
                 source_tail = source_payload[4 + source_name_length:]
+                source_info = session._decode_audio_clip_payload(source_payload)
+                source_width = {
+                    0x0001: 0,
+                    0x2001: 2,
+                    0x3001: 3,
+                    0x4001: 4,
+                }[source_info["flags"]]
+                length_width = {
+                    0x10: 1,
+                    0x20: 2,
+                    0x30: 3,
+                    0x40: 4,
+                }[source_tail[2]]
+                embedded_offset = 5 + source_width + length_width
+                source_embedded_reference = struct.unpack_from(
+                    "<I", source_tail, embedded_offset
+                )[0]
 
                 with tempfile.TemporaryDirectory() as directory:
                     audio_dir = Path(directory)
@@ -658,7 +841,7 @@ class RelinkTests(unittest.TestCase):
                     session.relink_clip(
                         "Audio 1",
                         "Audio 1_01",
-                        1_000,
+                        1_000_000,
                         "Audio 1_02",
                         source,
                         destination,
@@ -676,9 +859,17 @@ class RelinkTests(unittest.TestCase):
                     )
                     new_payload = bytes(new_name_block.items[0])
                     new_name_length = struct.unpack_from("<I", new_payload, 0)[0]
+                    expected_tail = bytearray(source_tail)
+                    struct.pack_into(
+                        "<I",
+                        expected_tail,
+                        embedded_offset,
+                        (1_000_000 - source_offset)
+                        + (source_embedded_reference - 800),
+                    )
                     self.assertEqual(
                         new_payload[4 + new_name_length:],
-                        source_tail,
+                        expected_tail,
                     )
                     self.assertEqual(
                         session._decode_audio_clip_payload(new_payload)[
@@ -689,7 +880,7 @@ class RelinkTests(unittest.TestCase):
                     destination_bext = read_chunk(destination, b"bext")
                     self.assertEqual(
                         struct.unpack_from("<Q", destination_bext, 338)[0],
-                        800,
+                        1_000_000 - source_offset,
                     )
                     new_media_entry = [
                         item for item in session._root_blocks(0x1004)[0].items
@@ -708,7 +899,7 @@ class RelinkTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         struct.unpack_from("<I", detail_header, 91)[0],
-                        800,
+                        1_000_000 - source_offset,
                     )
 
     def test_invalid_wav_stem_length_rolls_back_session_and_file(self):

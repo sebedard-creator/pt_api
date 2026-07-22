@@ -30,6 +30,13 @@ dist/
 /test_6min_audio/
 /relink_before/
 /pfx_import_reference/
+/otto_api1381_validation/
+/otto_api1381_validation_v2/
+/target4_consolidated_reference/
+/target4w_imported_audio/
+/target4_save_copy_in/
+/target4_consolidated_otto_validation/
+/premiere_skip_validation/
 
 # Ignorer les métadonnées macOS copiées avec les sessions
 ._*

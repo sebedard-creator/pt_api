@@ -1,5 +1,20 @@
 # Pro Tools API - Changelog
 
+## v1.3.9 (Préflight sûr pour médias virtuels Premiere) - 2026-07-22
+
+- **Nouveau préflight public en lecture seule** : `ProToolsSession.get_relink_write_status(track_name, clip_name, placement_start_samples)` résout un placement audio exact et inspecte sa définition/média sans modifier l'arbre PTX, la table de pointeurs ni un WAV. Il distingue le média virtuel natif vérifié, le média non virtuel et les layouts non vérifiables.
+- **Protection Premiere dans OttoAlign2** : un virtuel à header `0x2106` variable, dont le corpus `target4` de 173 octets, retourne `supported=False` et `premiere_virtual_media`. OttoAlign2 le conserve dans la copie PTX, sans WAV créé ni suffixe `_ALIGNED`, puis l'inscrit avec piste, clip, TC In, TC Out (borne de fin), durée et raison dans `OttoAlign_Report.txt`. Les autres placements restent traités normalement.
+- **Validation complète** : le corpus `target4` a produit une copie PTX byte-for-byte identique à la source et le rapport attendu; l'ouverture manuelle dans Pro Tools a réussi. La suite `pt_api` compte 186 tests, dont les statuts virtuels compatible/incompatible.
+- **Limite inchangée** : `relink_clip()` n'écrit toujours pas les clips virtuels Premiere. Le préflight est une barrière de sécurité, pas une implémentation de ce relink; la consolidation Pro Tools demeure le contournement validé.
+
+## v1.3.8.1 (Audit Premiere Pro — écriture non publiée) - 2026-07-21
+
+- **Lecture `0x2106` à longueur variable** : les références 169/173 octets Premiere Pro sont désormais documentées et reconnues à la lecture, en plus des layouts natifs 142/151.
+- **Blocage relink virtuel Premiere** : les tentatives de clonage de média, de mise à jour de la référence `placement_start_samples - src_offset` et de conservation/normalisation de la référence virtuelle ont toutes produit `End of stream encountered` dans Pro Tools. Le corpus Pro Tools d'import montre un catalogue hybride, des ordinaux `0x1003` non contigus et un nouveau média natif; son écriture n'est pas encore implémentée. Cette version ne doit pas être publiée comme supportant le relink Premiere.
+- **Contournement validé** : `Consolidate Clip` a converti `target4` en média parent natif `0x2106` 151 octets. OttoAlign2 a traité cette session normalement et la sortie relinkée s'est ouverte dans Pro Tools. `Save Copy In…` seul ne normalise pas le média.
+- **Événements obsolètes** : `get_timeline_clips()` ignore sans mutation les événements audio vers un ID de Clip List absent. Lors d'un relink, ces événements sont retirés transactionnellement avant la création du nouvel ID, compteurs et pointeurs inclus.
+- **Régression et intégration** : les tests internes couvrent l'en-tête variable, la géométrie virtuelle et l'événement orphelin, mais ils ne remplacent pas l'ouverture par Pro Tools. Les sorties `target3`/`target4`/`target5` générées sans monkey patch ne constituent pas une validation de publication; `target4` a été refusée par Pro Tools.
+
 ## v1.3.8 (Catalogue WAV et builder générique de sessions audio) - 2026-07-17
 
 - **Nouveau layout `0x103a` observé** : prise en charge des catalogues physiques dont chaque enregistrement WAV se termine par quatre octets nuls au lieu du marqueur `EVAW`. Le suffixe doit être uniforme dans tout le catalogue et est préservé lors de chaque insertion; un suffixe inconnu ou un catalogue mélangeant les deux variantes reste refusé.

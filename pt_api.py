@@ -8,6 +8,8 @@ from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
 
+__version__ = "1.3.9"
+
 
 _TEMPLATE_AUDIO_IEEE_FLOAT_SUBFORMAT = bytes.fromhex(
     "03000000 0000 1000 8000 00aa00389b71"
@@ -1678,7 +1680,12 @@ class ProToolsSession:
                 continue
             clip_id = struct.unpack_from("<I", payload, 2)[0]
             if clip_id not in clip_dict:
-                raise ValueError(f"Timeline event references unknown clip ID {clip_id}.")
+                # Premiere can retain an audio-shaped trailing event whose
+                # clip-list ID no longer exists.  It is not an editable audio
+                # placement, but the original PTX remains valid in Pro Tools.
+                # Keep the reader observational: ignore it here and preserve
+                # its raw event unchanged for a later no-op save.
+                continue
             start = struct.unpack_from("<Q", payload, 7)[0]
             audio_placements.append({
                 "playlist": playlist,
@@ -1706,6 +1713,9 @@ class ProToolsSession:
                 event_type == 0x03
                 and self._audio_timeline_event_kind(event, payload) == "clip_group"
             ):
+                continue
+            if event_type == 0x03 and id(event) not in audio_by_event:
+                # See the dangling-ID handling in the first event pass above.
                 continue
             anchor_timestamp = struct.unpack_from("<Q", payload, 7)[0]
 
@@ -2401,6 +2411,45 @@ class ProToolsSession:
                 timeline_events.append((playlist, event, b104f, payload))
 
         return timeline_events
+
+    def _purge_dangling_audio_timeline_events(self, clip_count):
+        """Remove audio-shaped events that cannot reference the Clip List.
+
+        Premiere sessions have been observed to retain trailing audio events
+        whose IDs are outside the current 0x262a range. A read must preserve
+        them, but a relink appends one definition and could otherwise make one
+        of those stale IDs point to the new media. This normalizer is private
+        to a surrounding mutation transaction and records every removed block
+        for the final 0x0002 pointer-table purge.
+        """
+        if isinstance(clip_count, bool) or not isinstance(clip_count, int):
+            raise TypeError("clip_count must be an integer.")
+        if clip_count < 0:
+            raise ValueError("clip_count cannot be negative.")
+
+        dangling_by_playlist = {}
+        for playlist, event, _, payload in self._validated_main_timeline_events():
+            if self._audio_timeline_event_kind(event, payload) != "audio":
+                continue
+            if struct.unpack_from("<I", payload, 2)[0] >= clip_count:
+                dangling_by_playlist.setdefault(id(playlist), (playlist, []))[1].append(
+                    event
+                )
+
+        for playlist, dangling_events in dangling_by_playlist.values():
+            header = bytearray(playlist.items[0])
+            name_length = struct.unpack_from("<I", header, 0)[0]
+            count_offset = 4 + name_length
+            declared_events = struct.unpack_from("<I", header, count_offset)[0]
+            if declared_events < len(dangling_events):
+                raise ValueError("Invalid playlist count while purging dangling events.")
+            for event in dangling_events:
+                self._collect_offsets_recursive(event, self._removed_offsets)
+                playlist.items.remove(event)
+            struct.pack_into(
+                "<I", header, count_offset, declared_events - len(dangling_events)
+            )
+            playlist.items[0] = header
 
     @staticmethod
     def _audio_timeline_event_kind(event, payload):
@@ -3227,6 +3276,136 @@ class ProToolsSession:
             self._removed_offsets = original_removed_offsets
             raise
 
+    def get_relink_write_status(
+        self,
+        track_name,
+        clip_name,
+        placement_start_samples,
+    ):
+        """Return whether a clip is safe for the verified relink writer.
+
+        This is a read-only preflight for callers that need to avoid invoking
+        :meth:`relink_clip` on a known unsupported virtual-media layout.  A
+        ``supported`` result means that this specific known blocker was not
+        found; it is not a substitute for the full validation performed by
+        ``relink_clip``.
+        """
+        for value, label in ((track_name, "Track name"), (clip_name, "Clip name")):
+            if not isinstance(value, str):
+                raise TypeError(f"{label} must be a string.")
+            if not value:
+                raise ValueError(f"{label} must be non-empty.")
+            if "\x00" in value:
+                raise ValueError(f"{label} cannot contain a NUL character.")
+        if (
+            isinstance(placement_start_samples, bool)
+            or not isinstance(placement_start_samples, int)
+        ):
+            raise TypeError("placement_start_samples must be an integer.")
+        if placement_start_samples < 0 or placement_start_samples > 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("placement_start_samples must fit UInt64.")
+
+        clip_id = self._resolve_unique_clip_id(clip_name)
+        clip_list = self._root_blocks(0x262a)[0]
+        definitions = [
+            item for item in clip_list.items
+            if isinstance(item, PTBlock) and item.content_type == 0x2629
+        ]
+        source_definition = definitions[clip_id]
+        source_clip_info = self._audio_clip_info_by_id(clip_id)
+
+        matching_events = []
+        for playlist, visible_track_name, events in self._validated_main_playlists():
+            if visible_track_name != track_name:
+                continue
+            for event in events:
+                payload_blocks = [
+                    child for child in event.items
+                    if isinstance(child, PTBlock) and child.content_type == 0x104f
+                ]
+                if len(payload_blocks) != 1:
+                    raise ValueError("Invalid 0x1050 event structure.")
+                payload_block = payload_blocks[0]
+                if (
+                    not payload_block.items
+                    or not isinstance(payload_block.items[0], (bytes, bytearray))
+                    or len(payload_block.items[0]) < 16
+                ):
+                    raise ValueError("Invalid 0x104f event payload.")
+                payload = payload_block.items[0]
+                if self._audio_timeline_event_kind(event, payload) != "audio":
+                    continue
+                if (
+                    struct.unpack_from("<I", payload, 2)[0] == clip_id
+                    and struct.unpack_from("<Q", payload, 7)[0]
+                    == placement_start_samples
+                ):
+                    matching_events.append(payload_block)
+        if len(matching_events) != 1:
+            raise ValueError(
+                "Relink target must resolve exactly one placement on the requested track."
+            )
+
+        # Root-audio clips use the fixed layouts already covered by the
+        # relink writer.  Premiere-derived virtual clips use a wider source
+        # offset field and require inspecting their physical 0x2106 header.
+        if source_clip_info["flags"] not in (0x2001, 0x3001, 0x4001):
+            return {"supported": True, "code": "not_virtual_media"}
+
+        _, (_, _, media_record) = self._validated_2629_fixed_records(
+            source_definition
+        )
+        source_media_index = struct.unpack_from("<I", media_record, 96)[0]
+        media_roots = self._root_blocks(0x1004)
+        if len(media_roots) != 1:
+            return {
+                "supported": False,
+                "code": "unverified_media_catalog",
+                "reason": "Le catalogue média 0x1004 ne peut pas être vérifié en lecture seule.",
+            }
+        media_entries = [
+            item for item in media_roots[0].items
+            if isinstance(item, PTBlock) and item.content_type == 0x1003
+        ]
+        if source_media_index >= len(media_entries):
+            return {
+                "supported": False,
+                "code": "unverified_media_catalog",
+                "reason": "L'index média du clip est hors du catalogue 0x1004.",
+            }
+        detail_blocks = [
+            child for child in media_entries[source_media_index].items
+            if isinstance(child, PTBlock) and child.content_type == 0x2106
+        ]
+        if len(detail_blocks) != 1:
+            return {
+                "supported": False,
+                "code": "unverified_media_header",
+                "reason": "L'en-tête média 0x2106 du clip ne peut pas être vérifié.",
+            }
+        headers = [
+            item for item in detail_blocks[0].items
+            if isinstance(item, (bytes, bytearray)) and len(item) >= 142
+        ]
+        if len(headers) != 1:
+            return {
+                "supported": False,
+                "code": "unverified_media_header",
+                "reason": "L'en-tête média 0x2106 du clip est ambigu.",
+            }
+        header_length = len(headers[0])
+        if header_length not in (142, 151):
+            return {
+                "supported": False,
+                "code": "premiere_virtual_media",
+                "reason": (
+                    "Média virtuel à en-tête 0x2106 variable (layout de production "
+                    "non pris en charge par l'écriture de relink)."
+                ),
+                "detail_header_length": header_length,
+            }
+        return {"supported": True, "code": "verified_virtual_media"}
+
     def _relink_clip_impl(
         self,
         track_name,
@@ -3322,6 +3501,7 @@ class ProToolsSession:
         ]
         if len(definitions) > 0xFFFFFFFF:
             raise OverflowError("New clip ID exceeds UInt32.")
+        self._purge_dangling_audio_timeline_events(len(definitions))
         for definition_id, definition in enumerate(definitions):
             info = self._audio_clip_info_by_id(definition_id)
             if definition_id != clip_id and info["name"] == new_clip_name:
@@ -3345,7 +3525,15 @@ class ProToolsSession:
         )[0]
         source_attributes = 4 + source_clip_name_length
         source_clip_info = self._decode_audio_clip_payload(source_clip_payload)
+        source_offset = source_clip_info["src_offset"]
+        if placement_start_samples < source_offset:
+            raise ValueError(
+                "Relink placement cannot precede the clip source offset."
+            )
+        new_media_time_reference = placement_start_samples - source_offset
         patch_root_timestamps = False
+        virtual_embedded_reference = None
+        virtual_embedded_tail_offset = None
         if (
             source_attributes + 16 <= len(source_clip_payload)
             and source_clip_payload[source_attributes:source_attributes + 5]
@@ -3360,8 +3548,6 @@ class ProToolsSession:
             )[0]
             if first_source_timestamp != second_source_timestamp:
                 raise ValueError("Invalid root-audio 0x2628 time-reference pair.")
-            source_time_reference = first_source_timestamp
-            new_media_time_reference = placement_start_samples
             patch_root_timestamps = True
         else:
             source_width_by_flags = {
@@ -3385,11 +3571,20 @@ class ProToolsSession:
             )
             length_width = length_width_by_selector.get(width_selector)
             expected_layout_marker = ((source_flags >> 8) & 0xF0) | 0x04
+            observed_premiere_virtual_layout = (
+                source_flags == 0x3001
+                and width_selector == 0x30
+                and source_clip_payload[source_attributes + 3] in (0x04, 0x84)
+                and source_clip_payload[source_attributes + 4] == 0x08
+            )
             if (
                 source_width is None
                 or length_width is None
-                or source_clip_payload[source_attributes + 3]
-                != expected_layout_marker
+                or (
+                    source_clip_payload[source_attributes + 3]
+                    != expected_layout_marker
+                    and not observed_premiere_virtual_layout
+                )
                 or source_clip_payload[source_attributes + 4] != 0x08
             ):
                 raise ValueError(
@@ -3403,17 +3598,12 @@ class ProToolsSession:
                 raise ValueError(
                     "Truncated production-virtual 0x2628 time reference."
                 )
-            embedded_reference = struct.unpack_from(
+            virtual_embedded_reference = struct.unpack_from(
                 "<I", source_clip_payload, embedded_reference_offset
             )[0]
-            if embedded_reference < source_clip_info["src_offset"]:
-                raise ValueError(
-                    "Invalid production-virtual 0x2628 time reference."
-                )
-            source_time_reference = (
-                embedded_reference - source_clip_info["src_offset"]
+            virtual_embedded_tail_offset = (
+                embedded_reference_offset - source_attributes
             )
-            new_media_time_reference = source_time_reference
         _, (_, _, media_record) = self._validated_2629_fixed_records(
             source_definition
         )
@@ -3424,6 +3614,42 @@ class ProToolsSession:
         )
         if source_media_index >= len(media_entries):
             raise ValueError("Clip media index is outside the 0x1004 catalog.")
+        source_media_entry = media_entries[source_media_index]
+        source_media_detail_blocks = [
+            child for child in source_media_entry.items
+            if isinstance(child, PTBlock) and child.content_type == 0x2106
+        ]
+        if len(source_media_detail_blocks) != 1:
+            raise ValueError("Invalid source 0x2106 relink media template.")
+        source_detail_headers = [
+            item for item in source_media_detail_blocks[0].items
+            if isinstance(item, (bytes, bytearray)) and len(item) >= 142
+        ]
+        if len(source_detail_headers) != 1:
+            raise ValueError("Invalid source 0x2106 relink media template.")
+        source_detail_header = source_detail_headers[0]
+        # A virtual 0x2628 may retain an application-specific embedded
+        # reference.  The source WAV identity is instead authored by its
+        # physical 0x1003/0x2106 entry, which uses the fixed tail geometry.
+        source_time_reference = struct.unpack_from(
+            "<I", source_detail_header, len(source_detail_header) - 51
+        )[0]
+        new_virtual_embedded_reference = None
+        if virtual_embedded_reference is not None:
+            if virtual_embedded_reference < source_time_reference:
+                raise ValueError(
+                    "Invalid production-virtual 0x2628 time reference."
+                )
+            virtual_reference_delta = (
+                virtual_embedded_reference - source_time_reference
+            )
+            if virtual_reference_delta > 0xFFFFFFFF - new_media_time_reference:
+                raise OverflowError(
+                    "Virtual 0x2628 time reference exceeds UInt32."
+                )
+            new_virtual_embedded_reference = (
+                new_media_time_reference + virtual_reference_delta
+            )
         if physical_names[source_media_index].casefold() != source_filename.casefold():
             raise ValueError(
                 "source_audio_path does not match the clip's physical WAV entry."
@@ -3478,7 +3704,6 @@ class ProToolsSession:
                 replacement_audio_path,
             )
 
-            source_media_entry = media_entries[source_media_index]
             new_media_entry = copy.deepcopy(source_media_entry)
             self._wipe_offsets_recursive(new_media_entry)
             ordinal_payload = bytearray(new_media_entry.items[0])
@@ -3508,7 +3733,7 @@ class ProToolsSession:
             media_detail = media_detail_blocks[0]
             detail_headers = [
                 (index, item) for index, item in enumerate(media_detail.items)
-                if isinstance(item, (bytes, bytearray)) and len(item) in (142, 151)
+                if isinstance(item, (bytes, bytearray)) and len(item) >= 142
             ]
             detail_tails = [
                 (index, item) for index, item in enumerate(media_detail.items)
@@ -3518,14 +3743,12 @@ class ProToolsSession:
                 raise ValueError("Invalid 0x2106 relink media template.")
             header_index, detail_header = detail_headers[0]
             detail_header = bytearray(detail_header)
-            if len(detail_header) == 151:
-                time_reference_offset = 100
-                second_filetime_offset = 105
-                uuid_offset = 135
-            else:
-                time_reference_offset = 91
-                second_filetime_offset = 96
-                uuid_offset = 126
+            # The 0x2106 prefix may contain application metadata (Premiere
+            # sessions observed at 169/173 bytes).  Its mutable tail retains
+            # the same geometry as the native 142- and 151-byte variants.
+            time_reference_offset = len(detail_header) - 51
+            second_filetime_offset = len(detail_header) - 46
+            uuid_offset = len(detail_header) - 16
             struct.pack_into(
                 "<Q", detail_header, 29, identity["rounded_filetime"]
             )
@@ -3643,6 +3866,16 @@ class ProToolsSession:
                     new_name_payload,
                     new_timestamp_offset + 4,
                     placement_start_samples,
+                )
+            elif new_virtual_embedded_reference is not None:
+                new_embedded_reference_offset = (
+                    4 + len(new_clip_name_bytes) + virtual_embedded_tail_offset
+                )
+                struct.pack_into(
+                    "<I",
+                    new_name_payload,
+                    new_embedded_reference_offset,
+                    new_virtual_embedded_reference,
                 )
             name_blocks[0].items[0] = new_name_payload
 
