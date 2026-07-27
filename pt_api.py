@@ -17,6 +17,51 @@ _TEMPLATE_AUDIO_IEEE_FLOAT_SUBFORMAT = bytes.fromhex(
 _WINDOWS_FILETIME_EPOCH = 116_444_736_000_000_000
 
 
+# Native Pro Tools import-template layouts verified as complete writer profiles.
+# These dictionaries intentionally name only fields that the builder changes;
+# every other byte is retained from the selected template prototype.
+_AUDIO_IMPORT_TEMPLATE_PROFILES = (
+    {
+        "name": "native_float_15_142",
+        "clip_prefix": b"\x00\x00\x30\x04\x00",
+        "clip_length_offset": 5,
+        "clip_length_width": 3,
+        "clip_time_reference_offsets": (8,),
+        "media_info_length": 15,
+        "media_length_offset": 6,
+        "media_length_width": 3,
+        "media_zero_offset": 9,
+        "media_zero_length": 5,
+        "media_float_code_offset": 14,
+        "detail_header_length": 142,
+        "detail_tail_length": 58,
+        "detail_filetime_offset": 29,
+        "detail_time_reference_offset": 91,
+        "detail_previous_filetime_offset": 96,
+        "detail_uuid_offset": 126,
+    },
+    {
+        "name": "native_float_31_151_u32",
+        "clip_prefix": b"\x00\x00\x40\x44\x00",
+        "clip_length_offset": 5,
+        "clip_length_width": 4,
+        "clip_time_reference_offsets": (9, 13),
+        "media_info_length": 31,
+        "media_length_offset": 6,
+        "media_length_width": 4,
+        "media_zero_offset": 10,
+        "media_zero_length": 4,
+        "media_float_code_offset": 14,
+        "detail_header_length": 151,
+        "detail_tail_length": 58,
+        "detail_filetime_offset": 29,
+        "detail_time_reference_offset": 100,
+        "detail_previous_filetime_offset": 105,
+        "detail_uuid_offset": 135,
+    },
+)
+
+
 def _coerce_string_path(value, parameter_name):
     """Normalize a path-like value while rejecting ambiguous bytes paths."""
     try:
@@ -78,8 +123,15 @@ def _unique_wave_chunk(stream, chunks, chunk_id, minimum_size, label):
     return payload
 
 
-def _inspect_template_audio_wave(file_path):
+def _inspect_template_audio_wave(file_path, maximum_length_samples=0xFFFFFF):
     """Validate one WAV supported by the template-based audio writer."""
+    if (
+        isinstance(maximum_length_samples, bool)
+        or not isinstance(maximum_length_samples, int)
+        or maximum_length_samples < 1
+        or maximum_length_samples > 0xFFFFFFFF
+    ):
+        raise ValueError("Invalid template-audio profile duration limit.")
     file_path = os.path.abspath(_coerce_string_path(file_path, "audio_path"))
     if not os.path.isfile(file_path):
         raise FileNotFoundError(f"Audio WAV does not exist: {file_path}")
@@ -129,9 +181,10 @@ def _inspect_template_audio_wave(file_path):
         if data_size == 0 or data_size % block_align:
             raise ValueError("Audio WAV data size must contain complete mono samples.")
         length_samples = data_size // block_align
-        if length_samples > 0xFFFFFF:
+        if length_samples > maximum_length_samples:
             raise ValueError(
-                "Audio WAV exceeds the verified UInt24 imported-clip length."
+                "Audio WAV exceeds the selected template profile clip-length "
+                "limit."
             )
 
         fact_payload = _unique_wave_chunk(
@@ -166,7 +219,7 @@ def _inspect_template_audio_wave(file_path):
     }
 
 
-def _prepare_template_audio_clips(clip_specs):
+def _prepare_template_audio_clips(clip_specs, maximum_length_samples=0xFFFFFF):
     """Validate an ordered iterable of generic template-audio descriptors."""
     if isinstance(clip_specs, (str, bytes, os.PathLike, Mapping)):
         raise TypeError("clip_specs must be an iterable of descriptor mappings.")
@@ -186,7 +239,9 @@ def _prepare_template_audio_clips(clip_specs):
             raise ValueError(
                 "Each clip descriptor requires audio_path and track_name."
             )
-        metadata = _inspect_template_audio_wave(spec["audio_path"])
+        metadata = _inspect_template_audio_wave(
+            spec["audio_path"], maximum_length_samples
+        )
 
         track_name = spec["track_name"]
         if not isinstance(track_name, str):
@@ -2948,14 +3003,47 @@ class ProToolsSession:
             raise ValueError("Truncated audio-import prototype 0x2628 definition.")
         prototype_name_length = struct.unpack_from("<I", prototype_payload, 0)[0]
         attributes = 4 + prototype_name_length
+        profile = next(
+            (
+                candidate for candidate in _AUDIO_IMPORT_TEMPLATE_PROFILES
+                if prototype_payload[attributes:attributes + 5]
+                == candidate["clip_prefix"]
+            ),
+            None,
+        )
+        if profile is None:
+            raise ValueError(
+                "Audio-import template uses an unsupported imported-parent "
+                "0x2628 profile."
+            )
+        clip_length_end = (
+            attributes + profile["clip_length_offset"]
+            + profile["clip_length_width"]
+        )
+        time_reference_offsets = profile["clip_time_reference_offsets"]
         if (
-            attributes + 12 > len(prototype_payload)
-            or prototype_payload[attributes:attributes + 5]
-            != b"\x00\x00\x30\x04\x00"
+            clip_length_end > len(prototype_payload)
+            or any(
+                attributes + offset + 4 > len(prototype_payload)
+                for offset in time_reference_offsets
+            )
         ):
             raise ValueError(
-                "Audio-import template requires the verified imported-parent "
-                "0x2628 layout."
+                "Truncated audio-import prototype imported-parent profile."
+            )
+        prototype_length = int.from_bytes(
+            prototype_payload[
+                attributes + profile["clip_length_offset"]:clip_length_end
+            ],
+            "little",
+        )
+        prototype_time_references = [
+            struct.unpack_from("<I", prototype_payload, attributes + offset)[0]
+            for offset in time_reference_offsets
+        ]
+        if not prototype_length or len(set(prototype_time_references)) != 1:
+            raise ValueError(
+                "Inconsistent audio-import prototype imported-parent timing."
             )
         _, (_, _, prototype_media_link) = self._validated_2629_fixed_records(
             prototype_definition
@@ -2989,33 +3077,59 @@ class ProToolsSession:
             "Invalid audio-import prototype 0x1001 format record.",
         )
         if (
-            len(media_info) != 15
+            len(media_info) != profile["media_info_length"]
             or struct.unpack_from("<I", media_info, 0)[0] != 48_000
             or media_info[4] != 1
             or media_info[5] != 32
-            or media_info[9:14] != b"\x00" * 5
-            or media_info[14] != 0x03
+            or media_info[
+                profile["media_zero_offset"]:
+                profile["media_zero_offset"] + profile["media_zero_length"]
+            ] != b"\x00" * profile["media_zero_length"]
+            or media_info[profile["media_float_code_offset"]] != 0x03
         ):
             raise ValueError(
-                "Audio-import prototype must use the verified mono 48 kHz "
-                "float 0x1001 layout."
+                "Audio-import template must use the selected mono 48 kHz "
+                "float 0x1001 profile."
+            )
+        media_length_start = profile["media_length_offset"]
+        media_length_end = media_length_start + profile["media_length_width"]
+        if int.from_bytes(
+            media_info[media_length_start:media_length_end], "little"
+        ) != prototype_length:
+            raise ValueError(
+                "Audio-import prototype 0x1001 and 0x2628 lengths differ."
             )
         detail = detail_blocks[0]
         detail_headers = [
             item for item in detail.items
-            if isinstance(item, (bytes, bytearray)) and len(item) == 142
+            if (
+                isinstance(item, (bytes, bytearray))
+                and len(item) == profile["detail_header_length"]
+            )
         ]
         detail_tails = [
             item for item in detail.items
-            if isinstance(item, (bytes, bytearray)) and len(item) == 58
+            if (
+                isinstance(item, (bytes, bytearray))
+                and len(item) == profile["detail_tail_length"]
+            )
         ]
         if len(detail_headers) != 1 or len(detail_tails) != 1:
             raise ValueError(
-                "Audio-import prototype requires the verified 142/58-byte "
-                "0x2106 layout."
+                "Audio-import prototype does not match the selected 0x2106 "
+                "profile."
+            )
+        header_time_reference = struct.unpack_from(
+            "<I", detail_headers[0], profile["detail_time_reference_offset"]
+        )[0]
+        if header_time_reference != prototype_time_references[0]:
+            raise ValueError(
+                "Audio-import prototype 0x2106 and 0x2628 time references "
+                "differ."
             )
 
         return {
+            "profile": profile,
             "playlists": {name: playlist for playlist, name, _ in playlists},
             "clip_list": clip_list,
             "prototype_definition": prototype_definition,
@@ -3024,8 +3138,16 @@ class ProToolsSession:
             "prototype_media": prototype_media,
         }
 
+    def validate_audio_import_template(self):
+        """Describe a supported builder template without changing the session."""
+        template = self._validated_audio_import_template()
+        return {
+            "profile": template["profile"]["name"],
+            "tracks": list(template["playlists"]),
+        }
+
     def _configure_imported_audio_media_entry(
-        self, media_entry, metadata, media_index, filetime
+        self, media_entry, metadata, media_index, filetime, profile
     ):
         """Patch one cloned native media record for a validated source WAV."""
         import uuid
@@ -3056,28 +3178,55 @@ class ProToolsSession:
             media_info_block.items,
             "Invalid audio-import media-clone 0x1001 record.",
         )
-        if len(media_info) != 15:
+        if len(media_info) != profile["media_info_length"]:
             raise ValueError("Invalid audio-import media-clone 0x1001 size.")
-        media_info[6:9] = metadata["length_samples"].to_bytes(3, "little")
+        maximum_length = (1 << (8 * profile["media_length_width"])) - 1
+        if metadata["length_samples"] > maximum_length:
+            raise ValueError(
+                f"Audio-import profile {profile['name']!r} supports clips of "
+                f"at most {maximum_length} samples."
+            )
+        length_start = profile["media_length_offset"]
+        length_end = length_start + profile["media_length_width"]
+        media_info[length_start:length_end] = metadata["length_samples"].to_bytes(
+            profile["media_length_width"], "little"
+        )
         media_info_block.items = [media_info]
 
         detail = detail_blocks[0]
         detail_headers = [
             (index, item) for index, item in enumerate(detail.items)
-            if isinstance(item, (bytes, bytearray)) and len(item) == 142
+            if (
+                isinstance(item, (bytes, bytearray))
+                and len(item) == profile["detail_header_length"]
+            )
         ]
         detail_tails = [
             (index, item) for index, item in enumerate(detail.items)
-            if isinstance(item, (bytes, bytearray)) and len(item) == 58
+            if (
+                isinstance(item, (bytes, bytearray))
+                and len(item) == profile["detail_tail_length"]
+            )
         ]
         if len(detail_headers) != 1 or len(detail_tails) != 1:
             raise ValueError("Invalid audio-import media-clone 0x2106 layout.")
         header_index, header_raw = detail_headers[0]
         header = bytearray(header_raw)
-        struct.pack_into("<Q", header, 29, filetime)
-        struct.pack_into("<I", header, 91, metadata["bwf_time_reference"])
-        struct.pack_into("<Q", header, 96, max(0, filetime - 10_000_000))
-        header[126:142] = uuid.uuid4().bytes
+        struct.pack_into("<Q", header, profile["detail_filetime_offset"], filetime)
+        struct.pack_into(
+            "<I",
+            header,
+            profile["detail_time_reference_offset"],
+            metadata["bwf_time_reference"],
+        )
+        struct.pack_into(
+            "<Q",
+            header,
+            profile["detail_previous_filetime_offset"],
+            max(0, filetime - 10_000_000),
+        )
+        uuid_offset = profile["detail_uuid_offset"]
+        header[uuid_offset:uuid_offset + 16] = uuid.uuid4().bytes
         detail.items[header_index] = header
 
         tail_index, tail_raw = detail_tails[0]
@@ -3086,7 +3235,7 @@ class ProToolsSession:
         detail.items[tail_index] = tail
 
     def _configure_imported_audio_clip_definition(
-        self, definition, metadata, clip_id, media_index
+        self, definition, metadata, clip_id, media_index, profile
     ):
         """Patch one cloned native parent definition and its physical link."""
         import uuid
@@ -3122,10 +3271,18 @@ class ProToolsSession:
         source_payload = name_block.items[0]
         source_name_length = struct.unpack_from("<I", source_payload, 0)[0]
         source_attributes = 4 + source_name_length
+        source_length_end = (
+            source_attributes + profile["clip_length_offset"]
+            + profile["clip_length_width"]
+        )
         if (
-            source_attributes + 12 > len(source_payload)
+            source_length_end > len(source_payload)
             or source_payload[source_attributes:source_attributes + 5]
-            != b"\x00\x00\x30\x04\x00"
+            != profile["clip_prefix"]
+            or any(
+                source_attributes + offset + 4 > len(source_payload)
+                for offset in profile["clip_time_reference_offsets"]
+            )
         ):
             raise ValueError(
                 "Invalid audio-import clip-clone imported-parent layout."
@@ -3135,12 +3292,21 @@ class ProToolsSession:
         payload = bytearray(struct.pack("<I", len(clip_name)) + clip_name)
         payload.extend(source_tail)
         attributes = 4 + len(clip_name)
-        payload[attributes + 5:attributes + 8] = metadata[
-            "length_samples"
-        ].to_bytes(3, "little")
-        struct.pack_into(
-            "<I", payload, attributes + 8, metadata["bwf_time_reference"]
+        maximum_length = (1 << (8 * profile["clip_length_width"])) - 1
+        if metadata["length_samples"] > maximum_length:
+            raise ValueError(
+                f"Audio-import profile {profile['name']!r} supports clips of "
+                f"at most {maximum_length} samples."
+            )
+        length_start = attributes + profile["clip_length_offset"]
+        length_end = length_start + profile["clip_length_width"]
+        payload[length_start:length_end] = metadata["length_samples"].to_bytes(
+            profile["clip_length_width"], "little"
         )
+        for offset in profile["clip_time_reference_offsets"]:
+            struct.pack_into(
+                "<I", payload, attributes + offset, metadata["bwf_time_reference"]
+            )
         name_block.items = [payload]
 
     def _replace_imported_audio_catalog_filenames(self, name_block, filenames):
@@ -3244,13 +3410,15 @@ class ProToolsSession:
         struct.pack_into("<I", header, count_offset, current_count + 1)
         playlist.items[0] = header
 
-    def _populate_audio_import_template(self, prepared):
+    def _populate_audio_import_template(self, prepared, template=None):
         """Replace one validated prototype with caller-ordered audio media."""
         import time
 
         if not prepared:
             raise ValueError("At least one prepared audio source is required.")
-        template = self._validated_audio_import_template()
+        if template is None:
+            template = self._validated_audio_import_template()
+        profile = template["profile"]
         unknown_tracks = [
             item["track"] for item in prepared
             if item["track"] not in template["playlists"]
@@ -3276,10 +3444,10 @@ class ProToolsSession:
                 self._wipe_offsets_recursive(media_entry)
                 self._wipe_offsets_recursive(definition)
             self._configure_imported_audio_media_entry(
-                media_entry, metadata, index, base_filetime + index
+                media_entry, metadata, index, base_filetime + index, profile
             )
             self._configure_imported_audio_clip_definition(
-                definition, metadata, index, index
+                definition, metadata, index, index, profile
             )
             media_entries.append(media_entry)
             definitions.append(definition)
@@ -3442,9 +3610,12 @@ class ProToolsSession:
             )
 
         # Root-audio clips use the fixed layouts already covered by the
-        # relink writer.  Premiere-derived virtual clips use a wider source
-        # offset field and require inspecting their physical 0x2106 header.
-        if source_clip_info["flags"] not in (0x2001, 0x3001, 0x4001):
+        # relink writer.  Production definitions with an embedded reference
+        # use either a parent or virtual flag; both variants require the same
+        # physical 0x2106 validation before the writer preserves that value.
+        if source_clip_info["flags"] not in (
+            0x0000, 0x2000, 0x2001, 0x3000, 0x3001, 0x4001,
+        ):
             return {"supported": True, "code": "not_virtual_media"}
 
         _, (_, _, media_record) = self._validated_2629_fixed_records(
@@ -3646,8 +3817,11 @@ class ProToolsSession:
             patch_root_timestamps = True
         else:
             source_width_by_flags = {
+                0x0000: 0,
                 0x0001: 0,
+                0x2000: 2,
                 0x2001: 2,
+                0x3000: 3,
                 0x3001: 3,
                 0x4001: 4,
             }
@@ -5889,10 +6063,18 @@ def build_audio_session(
     if session_filename.casefold() == ".ptx":
         raise ValueError("session_name must include a basename before .ptx.")
 
-    prepared, target_tracks = _prepare_template_audio_clips(clip_specs)
     session = ProToolsSession(template_ptx_path)
-    template_tracks = session.get_tracks()
-    clip_manifest = session._populate_audio_import_template(prepared)
+    template = session._validated_audio_import_template()
+    profile = template["profile"]
+    maximum_length_samples = min(
+        (1 << (8 * profile["clip_length_width"])) - 1,
+        (1 << (8 * profile["media_length_width"])) - 1,
+    )
+    prepared, target_tracks = _prepare_template_audio_clips(
+        clip_specs, maximum_length_samples
+    )
+    template_tracks = list(template["playlists"])
+    clip_manifest = session._populate_audio_import_template(prepared, template)
 
     temporary_directory = tempfile.mkdtemp(
         prefix=f".{os.path.basename(output_session_directory)}.",

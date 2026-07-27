@@ -67,11 +67,13 @@ def imported_media_entry(length_samples=100, ordinal=1):
     media_info.extend(length_samples.to_bytes(3, "little"))
     media_info.extend(b"\x00" * 5)
     media_info.append(0x03)
+    detail_header = bytearray(142)
+    struct.pack_into("<I", detail_header, 91, 1_000)
     detail = block(
         0x23,
         0x2106,
         [
-            bytearray(142),
+            detail_header,
             block(0x01, 0x4301, [bytearray(32)]),
             bytearray(58),
         ],
@@ -392,6 +394,140 @@ REFERENCE_TEMPLATE = (
     / "01_A_imported_cliplist.ptx"
 )
 REFERENCE_SOURCE = REFERENCE_ROOT / "Source PFX"
+WALLA_U32_TEMPLATE = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "walla_template_native_float_31_151_u32.ptx"
+)
+
+
+def first_raw_block(block, content_type):
+    target = next(
+        item for item in block.items
+        if isinstance(item, PTBlock) and item.content_type == content_type
+    )
+    return target
+
+
+@unittest.skipUnless(
+    WALLA_U32_TEMPLATE.is_file(),
+    "Native 31/151 UInt32 template fixture is not installed.",
+)
+class NativeFloat31151U32TemplateTests(unittest.TestCase):
+    def test_public_validation_detects_native_uint32_profile(self):
+        session = ProToolsSession(WALLA_U32_TEMPLATE)
+        self.assertEqual(
+            session.validate_audio_import_template(),
+            {
+                "profile": "native_float_31_151_u32",
+                "tracks": ["Walla Gen"],
+            },
+        )
+
+    def test_builds_reloads_and_preserves_native_uint32_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.wav"
+            second = root / "second.wav"
+            write_float_bwf_wave(first, 120, 576_000)
+            write_float_bwf_wave(second, 240, 1_152_000)
+            result = build_audio_session(
+                WALLA_U32_TEMPLATE,
+                [
+                    {
+                        "audio_path": first,
+                        "track_name": "Walla Gen",
+                        "placement_start_samples": 960_000,
+                    },
+                    {
+                        "audio_path": second,
+                        "track_name": "Walla Gen",
+                        "placement_start_samples": 1_920_000,
+                    },
+                ],
+                root / "generated",
+            )
+
+            generated = ProToolsSession(result["session_path"])
+            self.assertEqual(generated.get_tracks(), ["Walla Gen"])
+            self.assertEqual(
+                [
+                    (item["physical_filename"], item["start_samples"], item["length_samples"])
+                    for item in generated.get_timeline_clips()
+                ],
+                [("first.wav", 960_000, 120), ("second.wav", 1_920_000, 240)],
+            )
+
+            catalog, entries, _, names, _ = generated._validated_physical_audio_catalog()
+            self.assertEqual(names, ["first.wav", "second.wav"])
+            self.assertEqual(len(entries), 2)
+            for expected_index, (entry, length, reference) in enumerate(
+                zip(entries, (120, 240), (576_000, 1_152_000))
+            ):
+                info = first_raw_block(entry, 0x1001)
+                raw_info = b"".join(
+                    bytes(item) for item in info.items
+                    if isinstance(item, (bytes, bytearray))
+                )
+                self.assertEqual(len(raw_info), 31)
+                self.assertEqual(int.from_bytes(raw_info[6:10], "little"), length)
+                detail = first_raw_block(entry, 0x2106)
+                header = next(
+                    bytes(item) for item in detail.items
+                    if isinstance(item, (bytes, bytearray)) and len(item) == 151
+                )
+                self.assertEqual(struct.unpack_from("<I", header, 100)[0], reference)
+                self.assertNotEqual(header[135:151], b"\x00" * 16)
+                self.assertEqual(
+                    struct.unpack_from("<I", entry.items[0], 0)[0],
+                    expected_index + 1,
+                )
+
+            definitions = [
+                item for item in generated._root_blocks(0x262A)[0].items
+                if isinstance(item, PTBlock) and item.content_type == 0x2629
+            ]
+            self.assertEqual(len(definitions), 2)
+            for definition, length, reference in zip(
+                definitions, (120, 240), (576_000, 1_152_000)
+            ):
+                payload = first_raw_block(definition, 0x2628).items[0]
+                name_length = struct.unpack_from("<I", payload, 0)[0]
+                attributes = 4 + name_length
+                self.assertEqual(payload[attributes:attributes + 5], b"\x00\x00\x40\x44\x00")
+                self.assertEqual(
+                    int.from_bytes(payload[attributes + 5:attributes + 9], "little"),
+                    length,
+                )
+                self.assertEqual(
+                    struct.unpack_from("<I", payload, attributes + 9)[0], reference
+                )
+                self.assertEqual(
+                    struct.unpack_from("<I", payload, attributes + 13)[0], reference
+                )
+
+    def test_native_uint32_profile_writes_long_clip_definitions(self):
+        session = ProToolsSession(WALLA_U32_TEMPLATE)
+        template = session._validated_audio_import_template()
+        length = 27_261_234
+        session._populate_audio_import_template(
+            [{
+                "order": 1,
+                "source_path": "not-used-by-tree-mutation.wav",
+                "physical_filename": "long.wav",
+                "clip_name": "Long.A1",
+                "track": "Walla Gen",
+                "bwf_time_reference": 576_000,
+                "start_samples": 960_000,
+                "length_samples": length,
+                "end_samples": 960_000 + length,
+                "umid": bytes(range(64)),
+            }],
+            template,
+        )
+        self.assertEqual(
+            session.get_timeline_clips()[0]["length_samples"], length
+        )
 
 
 @unittest.skipUnless(

@@ -65,6 +65,7 @@ def clip_definition(
     virtual_source_offset=None,
     virtual_length=120_000,
     premiere_virtual_marker=None,
+    source_flags=None,
 ):
     encoded = name.encode("utf-8")
     payload = bytearray(struct.pack("<I", len(encoded)) + encoded)
@@ -87,6 +88,18 @@ def clip_definition(
         else:
             flags = 0x4001
             source_width = 4
+        if source_flags is not None:
+            source_width_by_flags = {
+                0x0000: 0,
+                0x0001: 0,
+                0x2000: 2,
+                0x2001: 2,
+                0x3000: 3,
+                0x3001: 3,
+                0x4001: 4,
+            }
+            flags = source_flags
+            source_width = source_width_by_flags[flags]
         if virtual_length <= 0xFF:
             width_selector, length_width = 0x10, 1
         elif virtual_length <= 0xFFFF:
@@ -142,6 +155,7 @@ def make_session(
     filename_record_suffix=b"EVAW",
     detail_header_length=None,
     premiere_virtual_marker=None,
+    source_flags=None,
 ):
     if source_time_reference is None:
         source_time_reference = start_samples
@@ -209,6 +223,7 @@ def make_session(
                 source_time_reference,
                 virtual_source_offset=virtual_source_offset,
                 premiere_virtual_marker=premiere_virtual_marker,
+                source_flags=source_flags,
             ),
         ],
     )
@@ -568,6 +583,29 @@ class RelinkTests(unittest.TestCase):
         self.assertTrue(status["supported"])
         self.assertEqual(status["code"], "verified_virtual_media")
 
+    def test_relink_write_status_validates_production_parent_media(self):
+        for source_offset, source_flags in (
+            (0, 0x0000),
+            (12_000, 0x2000),
+            (120_000, 0x3000),
+        ):
+            with self.subTest(
+                source_offset=source_offset, source_flags=hex(source_flags)
+            ):
+                session, _ = make_session(
+                    start_samples=1_000_000,
+                    source_time_reference=800,
+                    virtual_source_offset=source_offset,
+                    source_flags=source_flags,
+                )
+                status = session.get_relink_write_status(
+                    "Audio 1",
+                    "Audio 1_01",
+                    1_000_000,
+                )
+                self.assertTrue(status["supported"])
+                self.assertEqual(status["code"], "verified_virtual_media")
+
     def test_timeline_reader_ignores_a_dangling_audio_event_without_mutation(self):
         session, _ = make_session()
         playlist = session._root_blocks(0x1054)[0].items[1]
@@ -783,20 +821,26 @@ class RelinkTests(unittest.TestCase):
             self.assertEqual(len(session.get_clips()), 1)
 
     def test_relink_preserves_verified_production_virtual_clip_geometry(self):
-        for source_offset, premiere_marker in (
-            (0, None),
-            (120_000, None),
-            (120_000, 0x04),
-            (120_000, 0x84),
+        for source_offset, premiere_marker, source_flags in (
+            (0, None, None),
+            (120_000, None, None),
+            (120_000, 0x04, None),
+            (120_000, 0x84, None),
+            (0, None, 0x0000),
+            (12_000, None, 0x2000),
+            (120_000, None, 0x3000),
         ):
             with self.subTest(
-                source_offset=source_offset, premiere_marker=premiere_marker
+                source_offset=source_offset,
+                premiere_marker=premiere_marker,
+                source_flags=source_flags,
             ):
                 session, source_umid = make_session(
                     start_samples=1_000_000,
                     source_time_reference=800,
                     virtual_source_offset=source_offset,
                     premiere_virtual_marker=premiere_marker,
+                    source_flags=source_flags,
                 )
                 source_definition = [
                     item for item in session._root_blocks(0x262A)[0].items
@@ -811,8 +855,11 @@ class RelinkTests(unittest.TestCase):
                 source_tail = source_payload[4 + source_name_length:]
                 source_info = session._decode_audio_clip_payload(source_payload)
                 source_width = {
+                    0x0000: 0,
                     0x0001: 0,
+                    0x2000: 2,
                     0x2001: 2,
+                    0x3000: 3,
                     0x3001: 3,
                     0x4001: 4,
                 }[source_info["flags"]]

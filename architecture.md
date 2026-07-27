@@ -86,6 +86,8 @@ La lecture des macros de Clip Groups suit une voie distincte : `get_timeline_cli
 
 `build_audio_session()` est une façade de module au-dessus de `ProToolsSession`. Elle n'est pas un moteur général de création de sessions : elle exige un modèle natif 48 kHz/23,976 avec au moins une playlist visible, aucun événement de timeline visible ou caché et un média-prototype importé. Les helpers privés inspectent le RIFF/BWF, valident le manifeste ordonné, réécrivent le catalogue `0x1004`/`0x103a`, les entrées `0x1003`, les définitions `0x2629` et les événements `0x1050`, puis utilisent le pipeline `save()` existant.
 
+Le profil d'écriture est choisi une seule fois depuis le prototype du template, avant toute validation de WAV : `native_float_15_142` (parent 15/142, durée UInt24) ou `native_float_31_151_u32` (parent 31/151, durée UInt32). Les octets non possédés par le writer restent ceux du prototype. `ProToolsSession.validate_audio_import_template()` expose ce diagnostic sans mutation et retourne le profil ainsi que les pistes visibles; les applications clientes n'ont donc pas à appeler les validateurs privés.
+
 La séparation des responsabilités est stricte :
 
 - le client décide de l'ordre, de la piste cible, du nom de clip et, facultativement, du filename livré;
@@ -96,6 +98,8 @@ La séparation des responsabilités est stricte :
 - le template fournit exclusivement les structures opaques et constantes déjà produites par Pro Tools.
 
 Les WAV livrés ne sont jamais réencodés ni enrichis par l'API. Ils sont copiés tels quels; les blocs `DGDA`, `minf` et `regn` ajoutés par Pro Tools ne sont pas reproduits par supposition.
+
+Le relink physique suit le même principe de conservatisme : il ne reconstruit pas une géométrie audio. Sur un catalogue natif vérifié, il clone et retargete les layouts de production parent/virtuel `0x0000`, `0x0001`, `0x2000`, `0x2001`, `0x3000`, `0x3001` et `0x4001` en conservant leur flag et leur largeur d'offset source. Les headers virtuels Premiere à longueur variable restent explicitement bloqués par le préflight lecture seule; ils ne sont pas convertis heuristiquement.
 
 Les deux records fixes d'une définition `0x2629` sont réassemblés lorsqu'une séquence fortuite a été parsée comme un bloc vide. La normalisation procède du span le plus tardif vers le plus ancien afin que la réduction d'un span scindé ne décale jamais l'index du suivant. Le rechargement de la livraison exige ensuite exactement 48 octets d'identité, 104 octets de lien média et un ID/index correspondant à l'ordinal de chaque clip.
 

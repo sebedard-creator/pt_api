@@ -38,5 +38,9 @@ dist/
 /target4_consolidated_otto_validation/
 /premiere_skip_validation/
 
+# Local native builder-template fixtures (kept outside the published repository)
+/tests/fixtures/walla_template_native_float_31_151.ptx
+/tests/fixtures/walla_template_native_float_31_151_u32.ptx
+
 # Ignorer les métadonnées macOS copiées avec les sessions
 ._*

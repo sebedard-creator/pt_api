@@ -1,5 +1,12 @@
 # Pro Tools API - Changelog
 
+## En cours (post-v1.4.0) - 2026-07-27
+
+- **Relink des clips parents de production** : `relink_clip()` et `get_relink_write_status()` prennent désormais en compte les géométries natives parent `0x0000`, `0x2000` et `0x3000`, en plus des racines et virtuels déjà vérifiés. Le writer préserve le flag, la largeur de l'offset source et la référence incorporée; le calcul de la référence média demeure `placement_start_samples - src_offset`. Les tests couvrent chaque largeur et les vérifications réelles OttoAlign2 concernées ont été confirmées réussies. Les layouts virtuels Premiere à header `0x2106` variable restent bloqués en écriture.
+- **Second profil strict du builder** : ajout du profil `native_float_31_151_u32`, sélectionné depuis la géométrie du template (`0x2628` `00 00 40 44 00`, `0x1001` 31 octets, `0x2106` 151/58, durée UInt32). Le profil historique `native_float_15_142` est inchangé. Les octets opaques du prototype sont conservés et une durée ne peut jamais dépasser la largeur réellement présente dans le template.
+- **Préflight public de template** : `ProToolsSession.validate_audio_import_template()` retourne, sans mutation, le profil d'écriture détecté et les pistes visibles. Les applications clientes n'ont plus à dépendre du validateur privé.
+- **Régression** : la suite compte 193 tests automatisés, dont la validation des deux profils, une construction 31/151 à deux WAV avec placements explicites, le rechargement du PTX généré et les chemins de relink parent/virtuel de production.
+
 ## v1.4.0 (Lecture des occurrences de Clip Groups) - 2026-07-22
 
 - **Lecture des occurrences de Clip Groups** : ajout de `ProToolsSession.get_timeline_clip_groups()`. Cette API en lecture seule parcourt les macros `00 00 01` de la timeline principale, les résout dans l'espace d'identifiants `0x262c` séparé de l'audio, puis retourne chaque occurrence avec groupe, piste, plage en échantillons et timecodes. Les occurrences répétées sont conservées et le résultat est trié par position puis piste.
