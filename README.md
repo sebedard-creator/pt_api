@@ -1,10 +1,10 @@
-# pt_api 1.4.0
+# pt_api 1.4.2
 
 *(Reverse-engineered and tested against **Pro Tools Ultimate 2024.3.1** on sessions at **23.98, 24, and 29.97df fps**)*
 
 A standalone, dependency-free Python API for parsing, manipulating, and re-encrypting Pro Tools (`.ptx`) session files in place. 
 
-Version 1.4.0 adds `get_timeline_clip_groups()`, a dedicated read-only reader for every visible Clip Group occurrence, including repeated placements. It also includes the 1.3.9 relink preflight for known unsupported Premiere virtual-media layouts, which OttoAlign2 uses to leave those placements untouched and report them while continuing with compatible placements.
+Version 1.4.2 includes `get_timeline_clip_groups()`, a dedicated read-only reader for every visible Clip Group occurrence, and a strict relink preflight that rejects unwritable geometries before media are created. It also supports the validated native Pro Tools/RX `0x3000 / 0x20 / 0x44 / 0x08` relink layout.
 
 > [!NOTE]
 > **Language Notice:** While this README is provided in English, please note that the underlying codebase, comments, and deep technical documentation (`architecture.md`, `pt_format_specs.md`, etc.) are written entirely in French.

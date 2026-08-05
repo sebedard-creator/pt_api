@@ -1,6 +1,8 @@
 # Pro Tools API - Changelog
 
-## En cours (post-v1.4.0) - 2026-07-27
+## v1.4.2 (Clip Groups et relink de production) - 2026-08-05
+
+- **Géométrie RX validée et préflight cohérent** : ajout du layout natif `0x3000 / 0x20 / 0x44 / 0x08` (offset source UInt24, longueur UInt16). Son équation de référence incorporée a été vérifiée sur un clip de production puis le PTX relinké a été ouvert dans Pro Tools. `get_relink_write_status()` partage désormais le validateur de géométrie du writer et retourne `unsupported_clip_layout` ou `unverified_clip_layout`, au lieu d’annoncer à tort un layout non écrivable comme compatible.
 
 - **Relink des clips parents de production** : `relink_clip()` et `get_relink_write_status()` prennent désormais en compte les géométries natives parent `0x0000`, `0x2000` et `0x3000`, en plus des racines et virtuels déjà vérifiés. Le writer préserve le flag, la largeur de l'offset source et la référence incorporée; le calcul de la référence média demeure `placement_start_samples - src_offset`. Les tests couvrent chaque largeur et les vérifications réelles OttoAlign2 concernées ont été confirmées réussies. Les layouts virtuels Premiere à header `0x2106` variable restent bloqués en écriture.
 - **Second profil strict du builder** : ajout du profil `native_float_31_151_u32`, sélectionné depuis la géométrie du template (`0x2628` `00 00 40 44 00`, `0x1001` 31 octets, `0x2106` 151/58, durée UInt32). Le profil historique `native_float_15_142` est inchangé. Les octets opaques du prototype sont conservés et une durée ne peut jamais dépasser la largeur réellement présente dans le template.

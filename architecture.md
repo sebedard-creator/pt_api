@@ -1,4 +1,4 @@
-# Architecture logicielle de `pt_api` 1.4.0
+# Architecture logicielle de `pt_api` 1.4.2
 
 Ce document donne un survol global du logiciel. Les structures binaires, offsets, flags et messages d'erreur appartiennent à [`pt_format_specs.md`](pt_format_specs.md), qui est la spécification technique normative. La surface publique et ses limitations sont résumées dans [`README.md`](README.md).
 

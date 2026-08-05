@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pt_api"
-version = "1.4.0"
+version = "1.4.2"
 description = "API autonome pour manipuler les sessions Pro Tools (.ptx)"
 readme = "README.md"
 requires-python = ">=3.8"
