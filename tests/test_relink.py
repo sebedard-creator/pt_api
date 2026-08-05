@@ -156,6 +156,7 @@ def make_session(
     detail_header_length=None,
     premiere_virtual_marker=None,
     source_flags=None,
+    virtual_length=120_000,
 ):
     if source_time_reference is None:
         source_time_reference = start_samples
@@ -222,6 +223,7 @@ def make_session(
                 "Audio 1_01",
                 source_time_reference,
                 virtual_source_offset=virtual_source_offset,
+                virtual_length=virtual_length,
                 premiere_virtual_marker=premiere_virtual_marker,
                 source_flags=source_flags,
             ),
@@ -821,19 +823,21 @@ class RelinkTests(unittest.TestCase):
             self.assertEqual(len(session.get_clips()), 1)
 
     def test_relink_preserves_verified_production_virtual_clip_geometry(self):
-        for source_offset, premiere_marker, source_flags in (
-            (0, None, None),
-            (120_000, None, None),
-            (120_000, 0x04, None),
-            (120_000, 0x84, None),
-            (0, None, 0x0000),
-            (12_000, None, 0x2000),
-            (120_000, None, 0x3000),
+        for source_offset, premiere_marker, source_flags, virtual_length in (
+            (0, None, None, 120_000),
+            (120_000, None, None, 120_000),
+            (120_000, 0x04, None, 120_000),
+            (120_000, 0x84, None, 120_000),
+            (0, None, 0x0000, 120_000),
+            (12_000, None, 0x2000, 120_000),
+            (120_000, None, 0x3000, 120_000),
+            (97_001, 0x44, 0x3000, 18_018),
         ):
             with self.subTest(
                 source_offset=source_offset,
                 premiere_marker=premiere_marker,
                 source_flags=source_flags,
+                virtual_length=virtual_length,
             ):
                 session, source_umid = make_session(
                     start_samples=1_000_000,
@@ -841,6 +845,7 @@ class RelinkTests(unittest.TestCase):
                     virtual_source_offset=source_offset,
                     premiere_virtual_marker=premiere_marker,
                     source_flags=source_flags,
+                    virtual_length=virtual_length,
                 )
                 source_definition = [
                     item for item in session._root_blocks(0x262A)[0].items
@@ -883,6 +888,12 @@ class RelinkTests(unittest.TestCase):
                         source.stem,
                         source_umid,
                         time_reference=800,
+                    )
+
+                    self.assertTrue(
+                        session.get_relink_write_status(
+                            "Audio 1", "Audio 1_01", 1_000_000
+                        )["supported"]
                     )
 
                     session.relink_clip(
@@ -948,6 +959,21 @@ class RelinkTests(unittest.TestCase):
                         struct.unpack_from("<I", detail_header, 91)[0],
                         1_000_000 - source_offset,
                     )
+
+    def test_relink_preflight_rejects_an_unverified_0x44_geometry(self):
+        session, _ = make_session(
+            start_samples=1_000_000,
+            source_time_reference=800,
+            virtual_source_offset=97_001,
+            virtual_length=120_000,
+            premiere_virtual_marker=0x44,
+            source_flags=0x3000,
+        )
+
+        status = session.get_relink_write_status("Audio 1", "Audio 1_01", 1_000_000)
+
+        self.assertFalse(status["supported"])
+        self.assertEqual(status["code"], "unsupported_clip_layout")
 
     def test_invalid_wav_stem_length_rolls_back_session_and_file(self):
         session, source_umid = make_session()

@@ -3539,6 +3539,82 @@ class ProToolsSession:
             self._removed_offsets = original_removed_offsets
             raise
 
+    @staticmethod
+    def _is_verified_relink_2628_layout(source_clip_payload, source_clip_info):
+        """Return whether a 0x2628 payload uses a verified relink geometry.
+
+        This deliberately mirrors the writer's narrow layout contract so a
+        read-only preflight can never advertise a geometry the writer will
+        reject later in the same call path.
+        """
+        if not isinstance(source_clip_payload, (bytes, bytearray)):
+            return False
+        try:
+            source_name_length = struct.unpack_from("<I", source_clip_payload, 0)[0]
+        except struct.error:
+            return False
+        source_attributes = 4 + source_name_length
+        if source_attributes + 5 > len(source_clip_payload):
+            return False
+
+        # Root-audio uses its own fixed time-reference pair.
+        if (
+            source_attributes + 16 <= len(source_clip_payload)
+            and source_clip_payload[source_attributes:source_attributes + 5]
+            == b"\x00\x00\x30\x44\x00"
+        ):
+            return (
+                struct.unpack_from("<I", source_clip_payload, source_attributes + 8)[0]
+                == struct.unpack_from(
+                    "<I", source_clip_payload, source_attributes + 12
+                )[0]
+            )
+
+        source_width_by_flags = {
+            0x0000: 0,
+            0x0001: 0,
+            0x2000: 2,
+            0x2001: 2,
+            0x3000: 3,
+            0x3001: 3,
+            0x4001: 4,
+        }
+        length_width_by_selector = {0x10: 1, 0x20: 2, 0x30: 3, 0x40: 4}
+        source_flags = source_clip_info.get("flags")
+        source_width = source_width_by_flags.get(source_flags)
+        width_selector = source_clip_payload[source_attributes + 2]
+        length_width = length_width_by_selector.get(width_selector)
+        layout_marker = source_clip_payload[source_attributes + 3]
+        if source_width is None or length_width is None:
+            return False
+
+        expected_layout_marker = ((source_flags >> 8) & 0xF0) | 0x04
+        known_premiere_virtual_layout = (
+            source_flags == 0x3001
+            and width_selector == 0x30
+            and layout_marker in (0x04, 0x84)
+            and source_clip_payload[source_attributes + 4] == 0x08
+        )
+        # RX-rendered production clips use the same verified field widths and
+        # embedded-reference equation as the regular 0x3000 layout, but with
+        # the observed 0x44 marker instead of 0x34.
+        known_rx_virtual_layout = (
+            source_flags == 0x3000
+            and width_selector == 0x20
+            and layout_marker == 0x44
+            and source_clip_payload[source_attributes + 4] == 0x08
+        )
+        if (
+            layout_marker != expected_layout_marker
+            and not known_premiere_virtual_layout
+            and not known_rx_virtual_layout
+        ):
+            return False
+        embedded_reference_offset = (
+            source_attributes + 5 + source_width + length_width
+        )
+        return embedded_reference_offset + 4 <= len(source_clip_payload)
+
     def get_relink_write_status(
         self,
         track_name,
@@ -3576,6 +3652,31 @@ class ProToolsSession:
         ]
         source_definition = definitions[clip_id]
         source_clip_info = self._audio_clip_info_by_id(clip_id)
+        source_name_blocks = [
+            child for child in source_definition.items
+            if isinstance(child, PTBlock) and child.content_type == 0x2628
+        ]
+        if (
+            len(source_name_blocks) != 1
+            or not source_name_blocks[0].items
+            or not isinstance(source_name_blocks[0].items[0], (bytes, bytearray))
+        ):
+            return {
+                "supported": False,
+                "code": "unverified_clip_layout",
+                "reason": "La géométrie 0x2628 du clip ne peut pas être vérifiée.",
+            }
+        if not self._is_verified_relink_2628_layout(
+            source_name_blocks[0].items[0], source_clip_info
+        ):
+            return {
+                "supported": False,
+                "code": "unsupported_clip_layout",
+                "reason": (
+                    "La géométrie 0x2628 du clip n'est pas prise en charge "
+                    "par l'écriture de relink."
+                ),
+            }
 
         matching_events = []
         for playlist, visible_track_name, events in self._validated_main_playlists():
@@ -3846,6 +3947,12 @@ class ProToolsSession:
                 and source_clip_payload[source_attributes + 3] in (0x04, 0x84)
                 and source_clip_payload[source_attributes + 4] == 0x08
             )
+            observed_rx_virtual_layout = (
+                source_flags == 0x3000
+                and width_selector == 0x20
+                and source_clip_payload[source_attributes + 3] == 0x44
+                and source_clip_payload[source_attributes + 4] == 0x08
+            )
             if (
                 source_width is None
                 or length_width is None
@@ -3853,6 +3960,7 @@ class ProToolsSession:
                     source_clip_payload[source_attributes + 3]
                     != expected_layout_marker
                     and not observed_premiere_virtual_layout
+                    and not observed_rx_virtual_layout
                 )
                 or source_clip_payload[source_attributes + 4] != 0x08
             ):
