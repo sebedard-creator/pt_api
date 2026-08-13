@@ -1,10 +1,10 @@
-# pt_api 1.4.2
+# pt_api 1.5.0
 
 *(Reverse-engineered and tested against **Pro Tools Ultimate 2024.3.1** on sessions at **23.98, 24, and 29.97df fps**)*
 
 A standalone, dependency-free Python API for parsing, manipulating, and re-encrypting Pro Tools (`.ptx`) session files in place. 
 
-Version 1.4.2 includes `get_timeline_clip_groups()`, a dedicated read-only reader for every visible Clip Group occurrence, and a strict relink preflight that rejects unwritable geometries before media are created. It also supports the validated native Pro Tools/RX `0x3000 / 0x20 / 0x44 / 0x08` relink layout.
+Version 1.5.0 adds native empty Clip Group creation: a caller can rename prepared track slots, show only the slots it needs, and place and name empty groups at exact sample positions and durations. It retains the dedicated Clip Group reader, the audio-backed `create_clip_group()` writer, and the strict relink preflight that rejects unwritable geometries before media are created.
 
 > [!NOTE]
 > **Language Notice:** While this README is provided in English, please note that the underlying codebase, comments, and deep technical documentation (`architecture.md`, `pt_format_specs.md`, etc.) are written entirely in French.
@@ -28,7 +28,9 @@ The supported public surface is divided between the high-level `ProToolsSession`
 |---|---|---|
 | **I/O & Crypto** | `ProToolsSession(file)` | Validates, decrypts and parses an existing PTX session. |
 | | `save(out_path)` | Rebuilds pointer tables and performs a transactional, atomic encrypted save. |
-| **Inspection** | `get_tracks()` | Returns the validated visible track names. |
+| **Inspection** | `get_tracks()` | Returns all validated main-timeline track names, including hidden template slots. |
+| **Template track slots** | `rename_track(old_name, new_name)` | Renames one verified pre-authored track, including its native name mirrors. |
+| | `set_visible_tracks(track_names)` | Shows exactly the selected pre-authored track slots, in the requested display order; other slots are hidden. |
 | | `get_markers()` | Returns validated markers with their index, name and timecode. |
 | | `get_clips()` | Describes all supported audio clips and Clip Groups in the Clip Bin. |
 | | `get_timeline_clips(include_fades=True)` | Returns chronological audio/fade events with track, clip, sample range, source offset, mute/fade state and best-effort physical filename. Passing `False` returns audio only and deliberately skips fade-geometry validation. |
@@ -48,7 +50,9 @@ The supported public surface is divided between the high-level `ProToolsSession`
 | | `add_crossfade(track_name, clip_name, cut_hh, cut_mm, cut_ss, cut_ff, fade_hh, fade_mm, fade_ss, fade_ff)` | Atomically splits one clip and adds a centered Equal Power crossfade. |
 | **Automation** | `set_clip_gain(clip_name, float_gain_db)` | Applies static Clip Gain to one uniquely identified clip. Shared point indexes are cloned; Float32 values and `-inf` are supported. |
 | | `add_volume_node(track_name, hh, mm, ss, ff, db_value)` | Adds or replaces a volume node on the resolved track after validating the complete `0x260a` envelope. |
-| **Clip Groups** | `delete_clip_group(group_name)` | Transactionally dissolves one supported simple Clip Group, restores its component clips and repairs affected pointers. |
+| **Clip Groups** | `create_empty_clip_group(track_name, group_name, start_samples, length_samples)` | Creates and places one native empty Clip Group at an exact sample range in the verified blank-group profile. |
+| | `create_clip_group(track_name, group_name, start_samples, prototype_group_name)` | Converts one exact existing audio placement into a native Clip Group, using a verified prototype group already present in the template. |
+| | `delete_clip_group(group_name)` | Transactionally dissolves one supported simple Clip Group, restores its component clips and repairs affected pointers. |
 
 ### Template-based audio-session builder
 
@@ -120,14 +124,14 @@ The output directory must not already exist; its parent must exist. The function
 - **Overlap policy:** Multiple descriptors may target the same track and overlap by any duration. Each new event is appended after prior events in descriptor order; no trim, crossfade, mixing or automatic track change is performed.
 - **Verified bounds:** Duration and `fact` count must fit the selected template profile: UInt24 (`1..16,777,215`) for `native_float_15_142`, UInt32 for `native_float_31_151_u32`. Each BWF time reference must fit UInt32. Physical filenames and generated `.A1` clip names must be unique case-insensitively.
 - **Audio preservation:** Source WAV contents are copied unchanged. The builder does not synthesize Pro Tools' optional/cache chunks such as `DGDA`, `minf` or `regn`; the PTX identity is derived from the existing BWF UMID and timing fields. The native comparison shows that Pro Tools preserves all original chunks and samples before appending its own metadata.
-- **No track authoring:** The builder populates existing empty playlists but does not create, delete, rename or reorder tracks. Unused template tracks remain present and empty.
+- **No track authoring:** The builder populates existing empty playlists but does not create, delete or reorder tracks. Unused template tracks remain present and empty.
 - **Validation status:** PTX generation, encrypted reload, catalog/Clip List/timeline semantics, exact 48/104-byte fixed records and media indexes, false-block reassembly, explicit placement overrides, arbitrary existing track names/counts, exact WAV hashes and same-track overlap are covered automatically for both profiles. The historical 15/142 two-media output was also opened, played, saved and reopened successfully in Pro Tools. The 31/151/UInt32 profile is covered by native before/after references and automated encrypted build/reload tests; it must retain its own manual Pro Tools release check when its writer changes.
 
 ### Targeting and general editing
 
 - **Exact names:** Clip and track operations use exact names. Duplicate matching names are treated as ambiguous and rejected.
 - **Audio focus:** Timeline editing supports audio clips and fades. MIDI regions/controllers, video tracks/clips, Inserts, Sends, I/O routing, Pan automation, Mute automation and plugin automation are not supported. `mute_clip()` changes the static event mute flag; it does not write Mute automation.
-- **No general session authoring:** Outside the specialized template-driven audio builder, the API does not create, delete, rename or reorder tracks; perform unrestricted import/export; or arbitrarily delete Clip Bin definitions and timeline events. Relinking is limited to the exact WAV-clone operation documented below. Only the operations listed in the capability tables are implemented.
+- **Pre-authored track pools only:** `rename_track()` and `set_visible_tracks()` operate only on existing verified native track slots. They do not create, delete or reorder tracks. For programmatic sessions, create the maximum required pool in Pro Tools, save the template normally once after creating the pool, then show and rename only the slots required by the caller. A freshly authored ten-track pool carrying the observed pre-save UI layout is rejected for renaming rather than risk a Pro Tools session with a discarded track map.
 - **Clip Group macros are not audio placements:** Group macros use a separate ID namespace and are ignored by ordinary audio read/mute/move/split/duplicate/trim/fade operations even when their numeric ID collides with a clip ID. `get_timeline_clip_groups()` is the dedicated read-only reader for their visible main-timeline occurrences; it reports every occurrence, including repeated placements.
 - **Attached fades:** `move_clip()`, `duplicate_clip()`, `split_clip()`, `trim_clip_start()` and `trim_clip_end()` reject a placement with attached fades. Duplication does not clone fade geometry.
 - **Ambiguous placements:** Move, duplicate and trim require exactly one visible placement of the named clip. Split also requires one placement on the named track spanning the cut. `mute_clip()` is the exception: it intentionally updates all visible audio placements of the uniquely named clip.
@@ -168,7 +172,10 @@ The native root, zero-offset virtual and nonzero-offset virtual relink paths wer
 ### Clip Groups
 
 - **Dedicated timeline reader:** `get_timeline_clip_groups()` validates the global `0x262c` definitions and main `0x1054` playlists, then returns every `00 00 01` macro sorted by `(start_samples, track)`. Each record includes `group_id`, `group_name`, `track`, `start_samples`, `length_samples`, `end_samples`, and their timecode counterparts. A macro that refers to an unknown group definition is rejected; the method makes no edits.
-- **Dissolve only:** Clip Groups can be read and dissolved, but not created. Creation remains disabled pending reverse-engineering of the `0x2428`/`0x2501` link.
+- **Template-driven creation:** `create_clip_group(track_name, group_name, start_samples, prototype_group_name)` converts exactly one ordinary visible audio placement at `start_samples` on `track_name` into a native Clip Group. Its duration is the source placement's clip-definition duration, so 1-second and variable-length groups are supported without a hard-coded application policy. `prototype_group_name` must identify exactly one already placed native prototype group; the target template must use the verified simple profile with its prototype hidden playlist empty. The method clones the group's definitions/metadata, moves the chosen audio event into the new hidden playlist, replaces it with the correctly flagged macro, and returns samples plus the assigned group ID. Group names must be unique in the complete group-definition list.
+- **Empty-group creation:** `create_empty_clip_group(track_name, group_name, start_samples, length_samples)` needs neither an audio placement nor a group prototype. It writes the independently verified native empty-group profile and returns the same group-placement dictionary. It is validated only for a 48 kHz / 23.976 (`frame_rate_enum == 0x09`) session, a target track containing no audio or fade events, and an empty-group definition list (or existing groups of that same exact profile). Groups are placed chronologically and names are unique globally. The currently verified one-byte ID trailer supports 256 total empty groups per session (IDs `0..255`).
+- **Audio-backed creation remains separate:** `create_clip_group()` does not manufacture a silent region or audio definition. A caller must first supply the ordinary source placement in the compatible session; this keeps audio-backed grouping generic and template-driven.
+- **Verified bounds:** The source start, source end and native group fields must fit UInt32. One prototype macro and exactly one target audio placement are required. The current writer is intentionally limited to one-component, one-track groups with an empty prototype hidden playlist; nested groups, internal fades, multi-event groups and multiple component tracks are rejected rather than guessed.
 - **Simple layout only:** `delete_clip_group()` supports a session containing exactly one simple audio group, containing one track, placed exactly once. Multiple groups, multiple placements, nested groups, internal fades and non-audio events are rejected before mutation.
 
 ### Markers and automation

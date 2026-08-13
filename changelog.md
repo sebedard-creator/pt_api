@@ -1,5 +1,14 @@
 # Pro Tools API - Changelog
 
+## v1.5.0 (Track pools and empty Clip Groups) - 2026-08-12
+
+- **Création native template-driven de Clip Groups** : ajout de `ProToolsSession.create_clip_group(track_name, group_name, start_samples, prototype_group_name)`. À partir d'un prototype de groupe Pro Tools déjà présent et d'une région audio visible existante, l'API clone les définitions et métadonnées de groupe, déplace la région dans une playlist interne, puis la remplace par une macro visible correctement flaggée. L'API ne déduit aucune politique d'application et ne synthétise aucun média ni région.
+- **Durées et pistes réelles** : la durée du groupe provient du clip audio ciblé; la validation manuelle couvre un groupe de 1 seconde, un groupe variable de 3:12 et un groupe créé sur une deuxième piste. Les cas non observés (groupes imbriqués, multi-pistes, multi-composants, fades internes et prototype placé plusieurs fois) restent refusés avant mutation.
+- **Régression et documentation** : un test automatisé couvre la conversion d'une région en groupe variable et la suite atteint 201 tests avec `-W error`. README, architecture, handoff et `pt_format_specs.md` documentent le contrat, les pointeurs `0x0002`, le flag de macro et les limites.
+
+- **Création native de Clip Groups vides** : ajout de `ProToolsSession.create_empty_clip_group(track_name, group_name, start_samples, length_samples)`. Aucun média, région audio ni groupe prototype n'est requis. Le writer construit le profil 48 kHz / 23.976 observé dans une session Pro Tools vierge : définition `0x262b`, index de nom `0x2423`, métadonnée opaque `0x2425`, playlist interne vide `0x2428`, macro visible et les trois pointeurs `0x0002` nécessaires. Les groupes sont nommés globalement, triés chronologiquement sur chaque piste et bornés aux IDs `0..255` du trailer vérifié.
+- **Workflow de pool validé dans Pro Tools** : depuis une template de dix pistes ouverte puis sauvegardée une fois nativement, l'API a renommé les pistes `1` à `10` et créé 55 Clip Groups vides : la piste `N` contient `N` groupes, nommés par leurs TC In/Out. Cette validation confirme la création répétée sur plusieurs pistes dans la même sauvegarde. La variante de pool avant sa première sauvegarde est désormais refusée pour `rename_track()` au lieu de risquer une session dont Pro Tools ignore la map de pistes.
+
 ## v1.4.2 (Clip Groups et relink de production) - 2026-08-05
 
 - **Géométrie RX validée et préflight cohérent** : ajout du layout natif `0x3000 / 0x20 / 0x44 / 0x08` (offset source UInt24, longueur UInt16). Son équation de référence incorporée a été vérifiée sur un clip de production puis le PTX relinké a été ouvert dans Pro Tools. `get_relink_write_status()` partage désormais le validateur de géométrie du writer et retourne `unsupported_clip_layout` ou `unverified_clip_layout`, au lieu d’annoncer à tort un layout non écrivable comme compatible.

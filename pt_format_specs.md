@@ -1,6 +1,6 @@
 # Spécifications binaires du format Pro Tools (`.ptx`)
 
-*(Spécification normative de `pt_api` 1.4.2; sessions de référence produites par Pro Tools Ultimate 2024.3.1 à 23.98, 24 et 29.97df fps, plus layouts Premiere Pro observés.)*
+*(Spécification normative de `pt_api` 1.5.0; sessions de référence produites par Pro Tools Ultimate 2024.3.1 à 23.98, 24 et 29.97df fps, plus layouts Premiere Pro observés.)*
 
 Ce document décrit exactement les structures que le code courant lit, valide, modifie et sérialise. Une structure dite « observée » provient des sessions de référence; une structure dite « prise en charge » possède un chemin explicite dans `pt_api.py`. Les zones non interprétées sont conservées telles quelles et ne doivent pas être déduites par heuristique.
 
@@ -176,7 +176,21 @@ La timeline principale est l'unique racine `0x1054`. L'absence de cette racine p
 - Le nom visible doit être UTF-8, non vide, et le compteur doit égaler le nombre de `0x1050` directement enfants.
 - Les segments bruts et trailers non interprétés conservent leur position.
 
-`get_tracks()` retourne uniquement les noms visibles de ces playlists, après validation complète de la map et de tous ses compteurs. Sans racine `0x1054`, il retourne `[]`.
+`get_tracks()` retourne les noms de toutes les playlists de la timeline principale, après validation complète de la map et de tous ses compteurs. Il ne filtre pas les slots masqués par l'interface Pro Tools. Sans racine `0x1054`, il retourne `[]`.
+
+### 4.1.1 Pool de pistes précréées : renommage et visibilité
+
+L'API ne crée ni ne supprime de piste. Une application peut toutefois employer un pool de pistes Audio déjà créées dans une template Pro Tools : `rename_track()` met à jour les miroirs de nom vérifiés, et `set_visible_tracks(track_names)` affiche exactement les slots demandés, dans l'ordre fourni.
+
+La visibilité native est dupliquée dans trois emplacements qui doivent rester cohérents :
+
+- les deux familles de `0x251a` sous `0x2519` : l'octet après l'identité `2A 00 00 00` vaut l'ordinal one-based de l'affichage, ou `0` si la piste est masquée; le flag court de 11 octets passe respectivement à `... 01 01 00 00 FE FF` ou `... 00 01 00 00 FE FF`;
+- l'entrée agrégée `0x2519`, qui contient le même ordinal pour chaque piste;
+- l'état `0x2589` : UInt16 LE à `+2` vaut `1` (affichée) ou `0` (masquée), et le payload court final vaut respectivement `00 00 00 00 00` ou `01 00 01 00 00`.
+
+`set_visible_tracks()` exige une liste non vide, sans doublon, composée uniquement de noms de pistes existants. Il ne modifie ni le nombre de playlists, ni les offsets, ni le catalogue média, et restaure transactionnellement l'arbre en cas de profil ambigu ou incomplet. Les tests manuels ont validé l'affichage des pistes 1, 2, 3 et 9 dans un pool natif de dix pistes.
+
+Un pool de pistes nouvellement créé doit être ouvert puis sauvegardé normalement une fois dans Pro Tools avant son premier `rename_track()`. Le profil UI pré-normalisation observé dans `all 10_shown.ptx` est lisible et peut servir au contrôle de visibilité, mais un renommage y ferait rejeter la map complète de pistes par Pro Tools. L'API reconnaît ce profil exact et retourne `ValueError` avant toute mutation; elle ne tente pas d'imiter une normalisation interne non documentée.
 
 ### 4.2 Événement `0x1050 → 0x104f`
 
@@ -628,7 +642,43 @@ Chaque nœud est `[timestamp UInt32][valeur Int16]`. La valeur est en déci-dB. 
 
 ## 11. Clip Groups
 
-La lecture des définitions est indépendante des clips audio : `0x262c` contient un compteur UInt32 et des `0x262b`; l'ID de groupe est leur ordinal. Les macros de timeline utilisent ce namespace, pas celui de `0x262a`. Le lecteur `get_timeline_clip_groups()` accepte autant de définitions et de macros visibles que la session en contient; cette généralité de lecture ne relâche pas les contraintes étroites d'écriture de `delete_clip_group()`.
+La lecture des définitions est indépendante des clips audio : `0x262c` contient un compteur UInt32 et des `0x262b`; l'ID de groupe est leur ordinal. Les macros de timeline utilisent ce namespace, pas celui de `0x262a`. Le lecteur `get_timeline_clip_groups()` accepte autant de définitions et de macros visibles que la session en contient. Les écrivains restent intentionnellement plus étroits : `delete_clip_group()` dissout le profil simple historique, `create_clip_group()` convertit une région audio native existante à partir d'un prototype de template, et `create_empty_clip_group()` écrit le profil natif vide décrit en 11.2.
+
+### 11.1 Création template-driven (`create_clip_group`)
+
+La signature publique est `create_clip_group(track_name, group_name, start_samples, prototype_group_name)`. Elle ne crée ni média ni définition audio : elle convertit **une** occurrence audio visible existante (`0x1050` / `0x104f`, type `0x03`, queue `00 01 01` ou `01 01 01`) sur la piste et au timestamp demandés. Sa longueur est celle de la définition audio ciblée. Les applications clientes restent donc responsables de fournir la région source dans une session compatible, sans convention de filename ou de commentaire imposée par l'API.
+
+Le profil d'écriture validé est le groupe audio simple mono/composant suivant :
+
+- Racines uniques `0x262c`, `0x2424`, `0x2426`, `0x2428` et timeline principale `0x1054`; leurs listes de groupes `0x262b`, noms `0x2423`, métadonnées `0x2425` et pistes internes `0x1052` ont toutes le même compteur UInt32.
+- `prototype_group_name` désigne une définition existante et exactement une macro visible `00 00 01`; le prototype interne correspondant est une `0x1052` **vide** (`count=0`, queue `01 00`). Le groupe nouvellement produit a donc une seule piste et un seul événement interne.
+- Le nouveau groupe reçoit l'ordinal `N` (ancien compteur). Il est ajouté aux quatre listes parallèles. Son nom UTF-8 doit être absent de toute la liste `0x262b`, pas seulement des macros déjà placées. Le trailer 9 octets de `0x262b` porte l'ID à l'octet 1; le profil observé limite donc la création à `N <= 255`.
+- Le `0x2628` du prototype est cloné. Sa longueur complète est réécrite à `A+10`, avec sélecteur indépendant `A+2` (`0x10/0x20/0x30/0x40`) choisi selon la largeur minimale de la longueur cible. Les deux UInt32 qui suivent immédiatement cette longueur deviennent `start_samples`. Les octets inconnus sont conservés. Dans le profil validé, le UInt32 opaque à `A+6` est l'origine de coordonnées de la playlist interne; il est recopié comme UInt64 à `+7` de l'événement audio caché, et **n'est ni zéro ni le timestamp visible**.
+- Le payload `0x2523` cloné reçoit le nouveau début à `+0`, le nouvel ID à `+16`, la fin `start + length` à `+44`, et sa valeur à `+36` est ajustée par la différence de longueur par rapport au prototype. Les autres octets restent ceux du prototype.
+- Le `0x2423` cloné porte `[group_id UInt32][name_length UInt32][UTF-8][queue conservée]`; le `0x2425` parallèle porte le nouvel ID UInt32 à `+5`.
+- L'événement audio source est déplacé (cloné puis remplacé) dans la nouvelle `0x1052` cachée avec queue audio conservée et timestamp interne décrit ci-dessus. Dans la piste visible, son clone devient la macro : ID `N` à `payload+2`, `start_samples` UInt64 à `payload+7`, flag obligatoire `payload+18 = 1`, queue `00 00 01`. Omettre ce flag produit un groupe présent dans la Clip List mais absent de la timeline.
+- Trois enregistrements standard de `0x0002` (nom `0x2423`, métadonnée `0x2425`, piste cachée `0x1052`) sont ajoutés dans les séries respectives des trois prototypes. Les nouveaux blocs reçoivent des offsets synthétiques uniques seulement pour cette relocalisation; `save()` les remplace par leurs offsets sérialisés. Les définitions `0x262b` et événements `0x1050` ajoutés ne reçoivent pas d'enregistrement supplémentaire dans le profil observé.
+
+Toutes les validations précèdent la mutation et l'arbre est restauré transactionnellement si une étape échoue. `start_samples` et `start_samples + length` doivent tenir dans UInt32, bien que la macro visible utilise un UInt64. Les groupes imbriqués, plusieurs composants/événements/pistes internes, fades internes, prototype placé plusieurs fois, région source absente ou ambiguë, et toute queue ou compteur non observé sont refusés.
+
+La validation manuelle Pro Tools du 12 août 2026 a confirmé trois sorties API : un groupe de 1 seconde à `10:00:10:00`, un groupe variable de `10:00:20:05` à `10:00:23:17`, et un groupe de 1 seconde sur la piste distincte `PLAYBACK NOTES` à `10:00:30:00`.
+
+### 11.2 Création de groupes vides (`create_empty_clip_group`)
+
+La signature publique est `create_empty_clip_group(track_name, group_name, start_samples, length_samples)`. Elle n'exige ni région audio visible, ni média, ni prototype de groupe : elle crée directement un Audio Region Group vide de durée positive. Elle est réservée au profil natif explicitement observé dans une session vierge à 48 kHz / enum `0x09` (23.976). Toute autre fréquence ou cadence est rejetée avant mutation.
+
+Le profil écrit est le suivant :
+
+- Les racines uniques `0x262c`, `0x2424`, `0x2426`, `0x2428` et la timeline principale `0x1054` sont requises. Les listes parallèles `0x262b`, `0x2423`, `0x2425` et `0x2428 → 0x1054 → 0x1052` portent le même compteur UInt32. Elles peuvent être vides, ou ne contenir que des groupes déjà conformes à ce profil vide.
+- Le nouvel ordinal est `N`, le compteur précédent. Le trailer de définition `0x262b` est `00 N 00 00 00 00 00 00 00`; le profil validé accepte les IDs `0..255`, soit au plus 256 groupes. Les noms UTF-8 sont globaux dans `0x262c` et doivent être uniques.
+- Le payload `0x2628` commence par le nom, puis `00 50`, un sélecteur de largeur `0x10`, `0x20`, `0x30` ou `0x40`, `44 08 00`, l'origine opaque UInt32 LE `0xE8D4A510`, la durée little-endian de largeur sélectionnée, et deux UInt32 LE `start_samples`. Les deux champs temporels doivent tenir dans UInt32.
+- Sous cette définition, `0x2523 → 0x2526` contient un payload de 65 octets. Il porte le début à `+0`, l'ID à `+16`, l'origine encodée sur cinq octets à `+29`, l'origine plus durée sur cinq octets à `+36`, et la fin à `+44`. Les autres octets sont fixes dans le profil vide observé.
+- Le nouveau `0x2423` est `[group_id UInt32][name_length UInt32][nom UTF-8][cinq octets nuls]`. Le `0x2425` parallèle est un payload opaque de 103 octets du profil observé; seul son ordinal UInt32 LE à `+5` est écrit par l'API. La playlist interne `0x1052` est vide et a exactement le header `01 00 00 00 3F 00 00 00 00 01 00`.
+- La macro visible est `0x1050 → 0x104f` de 35 octets, `group_id` à `+2`, `start_samples` UInt64 LE à `+7`, type `0x03` à `+15`, flag `0x01` à `+18`, et queue secondaire `00 00 01`. Trois enregistrements standards `0x0002` sont ajoutés pour le nouveau `0x2423`, `0x2425` et `0x1052`; leurs offsets synthétiques ne servent qu'à la relocalisation de `save()`.
+
+La piste cible doit être unique. Elle peut être vide, ou contenir seulement des macros de groupes vides déjà vérifiées; les placements audio, fades et autres événements sont refusés. L'API déplace les macros par ordre chronologique après insertion. Elle retourne `group_id`, `group_name`, `track`, `start_samples`, `length_samples` et `end_samples`.
+
+La validation manuelle Pro Tools du 12 août 2026 a confirmé un groupe vide de 1 seconde, puis une session de pool normalisée dont les dix pistes ont été renommées `1` à `10` et qui contient 55 groupes vides : la piste `N` contient `N` groupes, chacun nommé avec son TC In et TC Out. Cette validation couvre l'enchaînement `rename_track()` puis `create_empty_clip_group()` à répétition sur plusieurs pistes.
 
 La disposition prise en charge pour `delete_clip_group()` est volontairement étroite :
 
@@ -649,7 +699,7 @@ Le dégroupage :
 6. Retire le `0x262b`, le `0x2423` et le `0x2425`, puis décrémente leurs trois compteurs. Les racines vides `0x262c`, `0x2424` et `0x2426` sont conservées.
 7. Enregistre tous les offsets supprimés afin que `save()` purge leurs enregistrements `0x0002`.
 
-L'opération complète est transactionnelle. Sans racine `0x262c`, `delete_clip_group()` retourne `0`; une dissolution réussie retourne `1`. L'API peut lire et dissoudre ce groupe simple, mais ne crée aucun Clip Group; le lien nécessaire autour de `0x2428`/`0x2501` n'est pas suffisamment établi.
+L'opération complète est transactionnelle. Sans racine `0x262c`, `delete_clip_group()` retourne `0`; une dissolution réussie retourne `1`. La création n'est exposée que dans le profil 11.1; les autres liens autour de `0x2428` restent non documentés et ne doivent pas être généralisés par inférence.
 
 ## 12. Limites fonctionnelles consolidées
 
@@ -657,9 +707,9 @@ L'opération complète est transactionnelle. Sans racine `0x262c`, `delete_clip_
 - Payloads métier little-endian seulement.
 - Conversions temporelles limitées à 24, 23.976 non-drop et 29.97 Drop Frame.
 - Audio et fondus seulement sur la timeline. MIDI, contrôleurs continus, pistes/clips vidéo, Inserts, Sends, routing I/O, Pan, Mute automation et automation de plugins ne sont pas pris en charge.
-- Aucune création/suppression/renommage/réorganisation de pistes, import/export audio général ou suppression arbitraire de définitions/événements. Les deux exceptions étroites sont le clonage WAV exact décrit en 6.4 et le peuplement audio par manifeste d'un template compatible décrit en 6.5.
+- Aucune création/suppression/réorganisation de pistes, import/export audio général ou suppression arbitraire de définitions/événements. Les exceptions étroites sont le renommage et la visibilité de slots de piste précréés (4.1.1), le clonage WAV exact décrit en 6.4 et le peuplement audio par manifeste d'un template compatible décrit en 6.5.
 - Le builder audio 6.5 reste limité aux sessions 48 kHz/23,976 et aux WAV mono WAVE_EXTENSIBLE IEEE float 32 bits munis des métadonnées BWF/UMID requises. Il n'accepte que les profils natifs `native_float_15_142` et `native_float_31_151_u32` documentés ci-dessus; il ne choisit ni ordre, ni regroupement, ni piste à partir d'une convention de filename. Ces politiques appartiennent aux applications clientes.
-- Pas de création de Clip Group; dissolution limitée au cas simple documenté.
+- Création de Clip Group limitée aux deux profils stricts documentés : le profil audio template-driven 11.1 (une région audio source existante, un prototype interne vide, un composant, une piste et une macro prototype unique) et le profil vide 11.2 (48 kHz/23.976, playlist cible vide ou ne contenant que des macros vides vérifiées, IDs `0..255`). La dissolution reste limitée au cas simple documenté.
 - `create_subclip()` et les trims produisent les combinaisons vérifiées offset UInt24/longueur UInt32 (`01 30 40`) et offset UInt32/longueur UInt24 (`01 40 30`). Ils rejettent encore un sous-clip virtuel d'offset nul et de longueur supérieure à UInt24, ainsi que la combinaison offset UInt32/longueur UInt32, faute de référence Pro Tools. Le split accepte les racines courtes et longues vérifiées et une longueur droite UInt32, mais la coupe relative reste limitée à UInt24 tant que le layout du fragment gauche d'un split tardif n'a pas été observé.
 - Move, duplicate, split et trims refusent les placements avec fondus attachés; la duplication ne clone pas les fades.
 - Fades ajoutés seulement; aucune édition/suppression de fade existant. Crossfade centré Equal Power seulement.
@@ -671,9 +721,9 @@ L'opération complète est transactionnelle. Sans racine `0x262c`, `delete_clip_
 
 ## 13. Catalogue exhaustif des erreurs
 
-La portée d'« exhaustif » est la suivante : toutes les familles d'échecs explicitement détectées ou propagées par `pt_api.py` 1.4.2, ainsi que tous les messages Pro Tools consignés dans le corpus et l'historique des essais du projet. Elle ne prétend pas recenser les messages possibles de toutes les versions de Pro Tools.
+La portée d'« exhaustif » est la suivante : toutes les familles d'échecs explicitement détectées ou propagées par `pt_api.py` 1.5.0, ainsi que tous les messages Pro Tools consignés dans le corpus et l'historique des essais du projet. Elle ne prétend pas recenser les messages possibles de toutes les versions de Pro Tools.
 
-Le source courant contient 554 instructions `raise` : 468 `ValueError`, 47 `TypeError`, 8 `NotImplementedError`, 11 `OverflowError`, 8 `FileNotFoundError`, 3 `FileExistsError`, 1 `OSError` et 8 relances nues de l'exception originale.
+Le source courant contient 685 instructions `raise` : 584 `ValueError`, 55 `TypeError`, 10 `NotImplementedError`, 12 `OverflowError`, 8 `FileNotFoundError`, 3 `FileExistsError`, 1 `OSError` et 12 relances nues de l'exception originale.
 
 ### 13.1 Messages observés dans Pro Tools
 
@@ -688,10 +738,10 @@ Le source courant contient 554 instructions `raise` : 468 `ValueError`, 47 `Type
 
 | Exception | Conditions exhaustives par famille |
 |---|---|
-| `TypeError` | Chemin non path-like ou résolu en `bytes`; tampon non `bytes`/`bytearray`; enum/composants/timecode/timestamp/index non entiers; paramètres `mute`/endianness/`include_fades` non booléens; champs `PTBlock` ou `base_offset` du mauvais type; item d'arbre non `bytes`/`bytearray`/`PTBlock`; nom attendu non `str`; gain/volume non convertibles en réel; offset/longueur de sous-clip ou montant de trim non entier; type/forme de fade non `str`; `clip_specs` non itérable ou fourni comme une chaîne, des octets, un chemin ou un mapping unique; descripteur individuel non mapping; `track_name`, `physical_filename` ou `clip_name` non `str`; `placement_start_samples` non entier ou booléen; `session_name` non `str`/`None`. |
+| `TypeError` | Chemin non path-like ou résolu en `bytes`; tampon non `bytes`/`bytearray`; enum/composants/timecode/timestamp/index non entiers; paramètres `mute`/endianness/`include_fades` non booléens; champs `PTBlock` ou `base_offset` du mauvais type; item d'arbre non `bytes`/`bytearray`/`PTBlock`; nom attendu non `str`; gain/volume non convertibles en réel; offset/longueur de sous-clip ou montant de trim non entier; type/forme de fade non `str`; `clip_specs` non itérable ou fourni comme une chaîne, des octets, un chemin ou un mapping unique; descripteur individuel non mapping; `track_name`, `physical_filename`, `clip_name` ou `group_name` non `str`; `placement_start_samples`, `start_samples` ou `length_samples` non entier ou booléen; `session_name` non `str`/`None`. |
 | `ValueError` — enveloppe et temps | Chemin vide; fichier/en-tête trop court; signature/version/endianness/mode XOR invalide; delta XOR introuvable; sample rate non fini, non positif ou hors UInt32; cadence inconnue; composant/timecode/drop-frame invalide; sample négatif; conversion temporelle non représentable. |
 | `ValueError` — arbre, parsing et sauvegarde | `block_type`, `content_type`, tailles ou offsets hors bornes; profondeur >128; cycle; `original_offset` dupliqué; `0x0001` absent/invalide/mal placé; `0x0002` absent/dupliqué/non final/non EOF/non plat/vide; liaison `0x0001→0x0002` fausse; record/suffixe/compteur de série `0x0002` invalide; cible de pointeur inconnue; relocalisations chevauchantes; métadonnées `0x1028`/`0x204d` absentes, dupliquées ou tronquées. |
-| `ValueError` — pistes et événements | Racines `0x1054` ambiguës; compteurs `0x1054`/`0x1052` incohérents; header, nom UTF-8, compteur ou structure `0x1050→0x104f` invalide; queue audio inconnue; ID de clip timeline inconnu; piste/placement absent ou ambigu; timestamp cible hors champ de stockage. |
+| `ValueError` — pistes et événements | Racines `0x1054` ambiguës; compteurs `0x1054`/`0x1052` incohérents; header, nom UTF-8, compteur ou structure `0x1050→0x104f` invalide; queue audio inconnue; ID de clip timeline inconnu; piste/placement absent ou ambigu; timestamp cible hors champ de stockage; pool de pistes dans le profil UI pré-normalisation observé, qui doit être ouvert et sauvegardé une fois dans Pro Tools avant son premier renommage. |
 | `ValueError` — clips et noms | `0x262a`/`0x262c` ambigu, compteur ou définition invalide; `0x2628` tronqué, nom UTF-8 invalide, flag audio/groupe inconnu ou sélecteur de largeur autre que `0x10`/`0x20`/`0x30`/`0x40`; clip absent/ambigu; nouveau nom vide, NUL, non UTF-8, trop long ou déjà présent; ID source inconnu; modèle `0x2629` sans unique identité 48 octets; offset/longueur de sous-clip direct négatif, nul ou hors UInt32; layout offset nul/longueur UInt32 ou offset UInt32/longueur UInt32 non vérifié. |
 | `ValueError` — média physique et relink | RIFF/WAVE invalide, big-endian, tronqué, de taille ou d'alignement incohérent; chunk `bext`/`minf`/`regn`/`umid` absent, dupliqué ou trop court; `fmt ` ou `data` du clone/rendu absent, dupliqué ou tronqué; rendu autre que PCM/WAVE_EXTENSIBLE PCM, format PCM incompatible ou taille `data` différente; UMID, stem complet ou abrégé, paire de tokens ou références temporelles `bext`/`regn` invalides ou non concordantes avec le PTX; basename source différent du catalogue PTX ou du stem `regn`; chemin source et destination identiques; extension autre que `.wav`; stems non UTF-8, identiques ou de longueurs UTF-8 différentes; catalogue `0x1004`/`0x103a`, compteurs, noms, ordinaux ou index média invalides/ambigus; suffixe d'enregistrement WAV inconnu ou mélange des variantes `EVAW`/nulle; queue `0x103a` tronquée, sans nœud parent, avec libellé vide/NUL/non UTF-8, marqueur inconnu, terminaison invalide ou compteurs non conformes à `N+1..N+K`, `N+K+2`, `N+K+1`; nouveau nom physique déjà catalogué ou trop long; enregistrements fixes `0x2629` de 48/104 octets impossibles à réassembler ou mal ordonnés; `0x1001`, `0x2628`, ou header source `0x2106` absent, ambigu, tronqué ou de layout inconnu; header `0x2106` source <142 octets; layout source hors du parent/racine spécial ou des flags natifs de production `0x0000`/`0x0001`/`0x2000`/`0x2001`/`0x3000`/`0x3001`/`0x4001`; référence BWF différente de celle du header source; timestamp relink hors UInt32; nouvelle définition de clip en collision; placement exact absent ou ambigu. |
 | `ValueError` — relink Premiere | Header source `0x2106` absent, ambigu ou <142 octets; référence BWF du WAV différente de celle lue dynamiquement dans le header source; placement antérieur à `src_offset`; variante virtuelle Premiere autre que les marqueurs observés `0x04`/`0x84` (sélecteur `0x30`, constante `0x08`). |
@@ -702,8 +752,8 @@ Le source courant contient 554 instructions `raise` : 468 `ValueError`, 47 `Type
 | `ValueError` — marqueurs | Session sans playlist principale; règle `0x2030` absente/dupliquée/mal formée; compteur incohérent; payload `0x2077`, longueur ou UTF-8 invalide; index dupliqué/hors `1..65535`; timestamp hors Int64; nom NUL/non UTF-8/trop long; modèle ou zone UUID interne invalide. |
 | `ValueError` — Clip Gain | Dictionnaire `0x2637` absent/dupliqué/mal formé; compteur/taille incohérent; index de définition hors dictionnaire; gain `NaN`/`+inf` ou hors Float32; payload de clip trop court. |
 | `ValueError` — Volume | Nom de piste vide/NUL/ambigu; association visible→`0x261c` impossible; `0x2619`, `0x260d` ou `0x260a` absent/ambigu/mal formé; magic, taille, padding, terminateur, compteur de nœuds ou segments incohérent; timestamps non strictement croissants; timestamp hors UInt32; valeur non finie ou hors Int16 déci-dB. |
-| `ValueError` — Clip Groups | Nom vide/groupe absent; racines, compteurs, noms UTF-8 ou métadonnées `0x262c`/`0x2428`/`0x2424`/`0x2426` incohérents; playlist cachée vide/mal formée; macro ou index de nom non concordant; macro visible `00 00 01` dont l'ID ordinal n'existe pas dans `0x262c`. |
-| `NotImplementedError` | Exactement huit refus explicites : session contenant plus d'un Clip Group; groupe contenant plus d'une piste; groupe imbriqué/fade/événement non audio; groupe placé zéro ou plusieurs fois au lieu d'une; move avec fade attaché; duplicate avec fade attaché; split avec fade attaché; trim avec fade attaché. |
+| `ValueError` — Clip Groups | Nom vide, NUL ou UTF-8 invalide; groupe absent ou nom déjà défini; `start_samples`/`length_samples` non entier, négatif, nul (durée) ou hors UInt32, ou fin hors UInt32; racines, compteurs, noms UTF-8 ou métadonnées `0x262c`/`0x2428`/`0x2424`/`0x2426` incohérents; template vide hors 48 kHz/enum `0x09`; groupe existant ou piste cible hors profil vide vérifié; prototype non placé/placé plusieurs fois; source audio cible absente ou ambiguë; payload `0x2628`/`0x2523`/`0x2423`/`0x2425` ou queue/flag de macro non conformes; playlist cachée vide/mal formée pour la dissolution ou non vide pour la création audio-backed; enregistrement `0x0002` prototype absent/ambigu; macro visible `00 00 01` dont l'ID ordinal n'existe pas dans `0x262c`. |
+| `NotImplementedError` | Exactement dix refus explicites : création de groupe vide au-delà de l'ID 255 dans le trailer vérifié; création audio-backed au-delà de la limite de son trailer vérifié; session contenant plus d'un Clip Group pour la dissolution; groupe de dissolution contenant plus d'une piste; groupe de dissolution imbriqué/avec fade/événement non audio; groupe de dissolution placé zéro ou plusieurs fois au lieu d'une; move avec fade attaché; duplicate avec fade attaché; split avec fade attaché; trim avec fade attaché. |
 | `OverflowError` | Offset de bloc sérialisé hors UInt32; payload `PTBlock` hors champ de taille UInt32; bloc dépassant l'espace fichier UInt32; timestamp restauré d'un groupe ou fin calculée d'un placement de Clip Group hors UInt64; nouvel index de point Clip Gain hors Int32 signé; nouvel ID de clip, index média de relink ou compteurs de noms physiques hors UInt32. |
 | `FileNotFoundError` | Fichier d'entrée absent (propagé nativement); dossier de destination inexistant pour `xor_session()`/`save()`; WAV source ou WAV de remplacement absent, ou dossier du nouveau WAV inexistant pour `relink_clip()`; template/WAV source du builder absent ou parent du dossier de livraison inexistant. |
 | `FileExistsError` | Le chemin du nouveau WAV demandé à `relink_clip()` existe déjà; le dossier cible du builder existe avant l'appel ou apparaît pendant la génération. Aucun écrasement n'est permis. |

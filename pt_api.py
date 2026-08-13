@@ -8,13 +8,30 @@ from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.4.2"
+__version__ = "1.5.0"
 
 
 _TEMPLATE_AUDIO_IEEE_FLOAT_SUBFORMAT = bytes.fromhex(
     "03000000 0000 1000 8000 00aa00389b71"
 )
 _WINDOWS_FILETIME_EPOCH = 116_444_736_000_000_000
+
+
+# Verified native profile for an empty Audio Region Group created in a blank
+# 48 kHz / 23.976 Pro Tools session.  The 0x2425 record is opaque session
+# history metadata.  Pro Tools keeps the historical value when later groups
+# are added, so the writer preserves this established native payload and owns
+# only its ordinal at +5.
+_EMPTY_CLIP_GROUP_METADATA_TEMPLATE = bytes.fromhex(
+    "0100000000000000000400000010000000534841524520544f204e4554574f524b"
+    "1400000070745f6170695f64656275675f31325f616f757410000000454d505459"
+    "2047524f555020544553540c00000061667465725f31732e707478462218950000"
+    "00000000"
+)
+_EMPTY_CLIP_GROUP_PLAYLIST_ORIGIN = 0xE8D4A510
+_EMPTY_CLIP_GROUP_MACRO_TEMPLATE = bytes.fromhex(
+    "00000000000000e0e220670000000003feff01000000ffffffffffffffff0000000000"
+)
 
 
 # Native Pro Tools import-template layouts verified as complete writer profiles.
@@ -1084,6 +1101,405 @@ class ProToolsSession:
         """Returns a list of all track names in the session."""
         return [name for _, name, _ in self._validated_main_playlists()]
 
+    def rename_track(self, old_name, new_name):
+        """Rename one visible main-timeline track in a verified native layout.
+
+        Pro Tools mirrors an audio-track name in several independent records.
+        This method deliberately supports only the native mono-track profile
+        whose mirrors are all present and internally consistent; an unfamiliar
+        profile is rejected before any mutation is made.
+        """
+        if not isinstance(old_name, str):
+            raise TypeError("old_name must be a string.")
+        if not old_name:
+            raise ValueError("old_name must be non-empty.")
+        if "\x00" in old_name:
+            raise ValueError("old_name cannot contain a NUL character.")
+        if not isinstance(new_name, str):
+            raise TypeError("new_name must be a string.")
+        if not new_name:
+            raise ValueError("new_name must be non-empty.")
+        if "\x00" in new_name:
+            raise ValueError("new_name cannot contain a NUL character.")
+        try:
+            old_name_bytes = old_name.encode("utf-8")
+            new_name_bytes = new_name.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("Track names must be valid UTF-8.") from exc
+        if len(new_name_bytes) > 0xFFFFFFFF:
+            raise ValueError("new_name is too long for the PTX format.")
+        if old_name == new_name:
+            return 0
+
+        original_root_items = copy.deepcopy(self.root_items)
+        original_removed_offsets = list(getattr(self, "_removed_offsets", []))
+        try:
+            return self._rename_track_impl(old_name, new_name, old_name_bytes, new_name_bytes)
+        except Exception:
+            self.root_items = original_root_items
+            self._removed_offsets = original_removed_offsets
+            raise
+
+    def _rename_track_impl(self, old_name, new_name, old_name_bytes, new_name_bytes):
+        """Implementation for :meth:`rename_track` after argument validation."""
+        playlists = self._validated_main_playlists()
+        matches = [(playlist, name) for playlist, name, _ in playlists if name == old_name]
+        if not matches:
+            raise ValueError(f"Track '{old_name}' not found.")
+        if len(matches) != 1:
+            raise ValueError(f"Track name '{old_name}' is ambiguous in the session.")
+        if any(name == new_name for _, name, _ in playlists):
+            raise ValueError(f"Track name '{new_name}' already exists in the session.")
+
+        def replace_length_prefixed_name(payload, length_offset, label):
+            if not isinstance(payload, (bytes, bytearray)) or length_offset < 0:
+                raise ValueError(f"Invalid {label} payload.")
+            if length_offset + 4 > len(payload):
+                raise ValueError(f"Invalid {label} name length.")
+            current_length = struct.unpack_from("<I", payload, length_offset)[0]
+            name_offset = length_offset + 4
+            name_end = name_offset + current_length
+            if name_end > len(payload):
+                raise ValueError(f"Truncated {label} name.")
+            try:
+                current_name = bytes(payload[name_offset:name_end]).decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"Invalid UTF-8 {label} name.") from exc
+            if current_name != old_name:
+                return None
+            replacement = bytearray(payload[:length_offset])
+            replacement.extend(struct.pack("<I", len(new_name_bytes)))
+            replacement.extend(new_name_bytes)
+            replacement.extend(payload[name_end:])
+            return replacement
+
+        # Visible main playlist: this is the source of truth used by
+        # get_tracks() and the timeline APIs.
+        target_playlist, _ = matches[0]
+        playlist_header = replace_length_prefixed_name(
+            target_playlist.items[0], 0, "0x1052 playlist"
+        )
+        if playlist_header is None:
+            raise ValueError("The selected 0x1052 playlist no longer matches its track name.")
+
+        # Native mono-track profile mirrors the UI name in these records.
+        roots_1015 = self._root_blocks(0x1015)
+        roots_2107 = self._root_blocks(0x2107)
+        roots_2519 = self._root_blocks(0x2519)
+        if len(roots_1015) != 1 or len(roots_2107) != 1 or len(roots_2519) != 1:
+            raise ValueError("Unsupported track-name mirror layout.")
+
+        def matching_blocks(container, content_type, length_offset, label):
+            found = []
+            for block in container.get_all_blocks(content_type):
+                raw_items = [item for item in block.items if isinstance(item, (bytes, bytearray))]
+                if len(raw_items) != 1:
+                    continue
+                replacement = replace_length_prefixed_name(raw_items[0], length_offset, label)
+                if replacement is not None:
+                    found.append((block, replacement))
+            return found
+
+        fields_1014 = matching_blocks(roots_1015[0], 0x1014, 0, "0x1014 track")
+        fields_210b = matching_blocks(roots_2107[0], 0x210B, 4, "0x210b track")
+        if len(fields_1014) != 1 or len(fields_210b) != 1:
+            raise ValueError("Unsupported or ambiguous track-name mirror layout.")
+
+        # The native profile has one aggregate 0x2519 entry and two 0x251a
+        # display entries.  Their payloads contain exactly one complete
+        # UInt32-length-prefixed copy of the visible name.
+        token = struct.pack("<I", len(old_name_bytes)) + old_name_bytes
+
+        def replace_unique_token(payload, label):
+            if not isinstance(payload, (bytes, bytearray)):
+                raise ValueError(f"Invalid {label} payload.")
+            first = bytes(payload).find(token)
+            if first < 0:
+                return None
+            if bytes(payload).find(token, first + 1) >= 0:
+                raise ValueError(f"Ambiguous {label} track-name mirror.")
+            replacement = bytearray(payload[:first])
+            replacement.extend(struct.pack("<I", len(new_name_bytes)))
+            replacement.extend(new_name_bytes)
+            replacement.extend(payload[first + len(token):])
+            return replacement
+
+        root_2519 = roots_2519[0]
+        aggregate_matches = []
+        for index, item in enumerate(root_2519.items):
+            if isinstance(item, (bytes, bytearray)):
+                replacement = replace_unique_token(item, "0x2519")
+                if replacement is not None:
+                    aggregate_matches.append((index, replacement))
+        display_matches = []
+        for block in root_2519.get_all_blocks(0x251A):
+            raw_items = [item for item in block.items if isinstance(item, (bytes, bytearray))]
+            if len(raw_items) != 2:
+                raise ValueError("Invalid 0x251a track-name mirror.")
+            replacement = replace_unique_token(raw_items[0], "0x251a")
+            if replacement is not None:
+                display_matches.append((block, replacement))
+
+        if len(aggregate_matches) != 1 or len(display_matches) != 2:
+            raise ValueError("Unsupported or ambiguous 0x2519 track-name mirrors.")
+
+        # A newly created ten-track pool can retain pre-save UI state in its
+        # per-track 0x2624 configuration tree.  Native Pro Tools normalizes
+        # that state on its first ordinary save.  It is not safe to recreate
+        # that undocumented normalization heuristically: renaming first
+        # makes Pro Tools discard the complete track map.  Reject this exact
+        # layout before mutating any name mirror; a template saved once in
+        # Pro Tools uses the verified stable profile.
+        self._reject_unstable_track_config_for_rename(len(playlists))
+
+        # All profile checks succeeded. Commit the six observed native
+        # mirrors together; legacy 0x2619 identity labels intentionally stay
+        # untouched because Pro Tools itself does not rewrite them on rename.
+        target_playlist.items[0] = playlist_header
+        for block, replacement in fields_1014 + fields_210b:
+            block.items[0] = replacement
+        for index, replacement in aggregate_matches:
+            root_2519.items[index] = replacement
+        for block, replacement in display_matches:
+            block.items[0] = replacement
+
+        logger.info("Renamed track %r to %r", old_name, new_name)
+        return 1
+
+    def _reject_unstable_track_config_for_rename(self, playlist_count):
+        """Reject the observed unsaved multi-track UI profile before rename.
+
+        This profile is structurally valid to read, but Pro Tools performs a
+        private normalization on its first ordinary save.  A name edit before
+        that save produced a PTX whose track map Pro Tools discarded.  The
+        format of that normalization is intentionally not inferred here.
+        """
+        roots_2624 = self._root_blocks(0x2624)
+        if len(roots_2624) != 1:
+            return
+        root_2624 = roots_2624[0]
+        slots = [
+            item for item in root_2624.items
+            if isinstance(item, PTBlock) and item.content_type == 0x261C
+        ]
+        if len(slots) != playlist_count or not slots:
+            return
+
+        expected_legacy_types = (
+            0x2038, None, 0x2104, None, 0x2038, None,
+            0x2434, None, 0x2038, None, 0x2580, None,
+        )
+        expected_legacy_raw_lengths = (22, 27, 13, 4, 5, 8)
+        is_unstable = True
+        for slot in slots:
+            config_roots = [
+                block for block in slot.get_all_blocks(0x200B)
+                if any(
+                    isinstance(item, PTBlock) and item.content_type == 0x200A
+                    for item in block.items
+                )
+            ]
+            if len(config_roots) != 1:
+                return
+            config = config_roots[0]
+            config_blocks = [
+                item for item in config.items
+                if isinstance(item, PTBlock) and item.content_type == 0x200A
+            ]
+            if len(config_blocks) != 1:
+                return
+            profile = [
+                item for item in config_blocks[0].items
+                if isinstance(item, PTBlock) and item.content_type == 0x2015
+            ]
+            if len(profile) != 1:
+                return
+            profile = profile[0]
+
+            def matches_shape(expected_types, raw_lengths):
+                if len(profile.items) != len(expected_types):
+                    return False
+                raw_index = 0
+                for item, expected_type in zip(profile.items, expected_types):
+                    if expected_type is None:
+                        if (
+                            not isinstance(item, (bytes, bytearray))
+                            or len(item) != raw_lengths[raw_index]
+                        ):
+                            return False
+                        raw_index += 1
+                    elif (
+                        not isinstance(item, PTBlock)
+                        or item.content_type != expected_type
+                    ):
+                        return False
+                return True
+
+            if matches_shape(expected_legacy_types, expected_legacy_raw_lengths):
+                obsolete_separator = profile.items[4]
+                if (
+                    not isinstance(obsolete_separator, PTBlock)
+                    or len(obsolete_separator.items) != 2
+                    or not isinstance(obsolete_separator.items[0], PTBlock)
+                    or obsolete_separator.items[0].content_type != 0x2037
+                    or bytes(obsolete_separator.items[1]) != b"\x00"
+                ):
+                    return
+                state_payload = bytes(profile.items[1])
+                if state_payload[:2] not in (b"\x01\x01", b"\x00\x01"):
+                    return
+            else:
+                return
+        if is_unstable:
+            raise ValueError(
+                "This track-pool template must be opened and saved once in "
+                "Pro Tools before tracks can be renamed."
+            )
+
+
+    def set_visible_tracks(self, track_names):
+        """Show exactly the selected pre-authored Audio-track slots.
+
+        The method is intentionally template-driven: it neither creates nor
+        deletes tracks.  It updates the verified native visibility mirrors in
+        place, so no PTX block offsets or media catalog records are changed.
+        The supplied order becomes the Pro Tools track-display order.
+        """
+        if isinstance(track_names, (str, bytes)):
+            raise TypeError("track_names must be an iterable of track-name strings.")
+        try:
+            shown_names = list(track_names)
+        except TypeError as exc:
+            raise TypeError("track_names must be an iterable of track-name strings.") from exc
+        if not shown_names:
+            raise ValueError("At least one track must remain visible.")
+        if any(not isinstance(name, str) or not name or "\x00" in name for name in shown_names):
+            raise ValueError("Track names must be non-empty strings without NUL.")
+        if len(set(shown_names)) != len(shown_names):
+            raise ValueError("track_names must not contain duplicates.")
+
+        original_root_items = copy.deepcopy(self.root_items)
+        original_removed_offsets = list(getattr(self, "_removed_offsets", []))
+        try:
+            playlists = self._validated_main_playlists()
+            all_names = [name for _, name, _ in playlists]
+            unknown = sorted(set(shown_names).difference(all_names))
+            if unknown:
+                raise ValueError(f"Track '{unknown[0]}' not found.")
+
+            roots_2519 = self._root_blocks(0x2519)
+            roots_2587 = self._root_blocks(0x2587)
+            if len(roots_2519) != 1 or len(roots_2587) != 1:
+                raise ValueError("Unsupported native track-visibility layout.")
+            root_2519 = roots_2519[0]
+            root_2587 = roots_2587[0]
+            display_blocks = [
+                item for item in root_2519.items
+                if isinstance(item, PTBlock) and item.content_type == 0x251A
+            ]
+            if len(display_blocks) != 2 * len(all_names):
+                raise ValueError("Unsupported native 0x251a visibility mirrors.")
+
+            aggregate_items = [
+                item for item in root_2519.items
+                if isinstance(item, (bytes, bytearray))
+                and all(
+                    (struct.pack("<I", len(name.encode("utf-8"))) + name.encode("utf-8")) in item
+                    for name in all_names
+                )
+            ]
+            if len(aggregate_items) != 1:
+                raise ValueError("Unsupported native 0x2519 aggregate layout.")
+            aggregate = bytearray(aggregate_items[0])
+
+            def status_position(payload, name, label):
+                name_bytes = name.encode("utf-8")
+                token = struct.pack("<I", len(name_bytes)) + name_bytes
+                first = bytes(payload).find(token)
+                if first < 0 or bytes(payload).find(token, first + 1) >= 0:
+                    raise ValueError(f"Unsupported {label} track-name layout.")
+                marker = bytes(payload).find(b"\x2a\x00\x00\x00", first + len(token))
+                if marker < 0 or marker + 13 > len(payload):
+                    raise ValueError(f"Unsupported {label} visibility layout.")
+                return marker + 12
+
+            shown_ordinals = {name: index for index, name in enumerate(shown_names, start=1)}
+            for name in all_names:
+                aggregate[status_position(aggregate, name, "0x2519 aggregate")] = shown_ordinals.get(name, 0)
+            root_2519.items[root_2519.items.index(aggregate_items[0])] = aggregate
+
+            for block in display_blocks:
+                if not block.items or not isinstance(block.items[0], (bytes, bytearray)):
+                    raise ValueError("Invalid 0x251a visibility payload.")
+                payload = bytearray(block.items[0])
+                matches = []
+                for name in all_names:
+                    try:
+                        matches.append((name, status_position(payload, name, "0x251a")))
+                    except ValueError:
+                        continue
+                if len(matches) != 1:
+                    raise ValueError("Ambiguous 0x251a track-visibility mirror.")
+                name, position = matches[0]
+                payload[position] = shown_ordinals.get(name, 0)
+                block.items[0] = payload
+
+                flag_indices = [
+                    index for index, item in enumerate(block.items)
+                    if isinstance(item, (bytes, bytearray))
+                    and len(item) == 11
+                    and bytes(item)[5:] == b"\x01\x00\x00\x00\xfe\xff"
+                ]
+                if len(flag_indices) != 1:
+                    raise ValueError("Unsupported 0x251a visibility flag layout.")
+                flag = bytearray(block.items[flag_indices[0]])
+                flag[4] = 1 if name in shown_ordinals else 0
+                block.items[flag_indices[0]] = flag
+
+            state_blocks = root_2587.get_all_blocks(0x2589)
+            if len(state_blocks) != len(all_names):
+                raise ValueError("Unsupported native 0x2589 visibility state count.")
+            states_by_track = {}
+            for block in state_blocks:
+                raw_indices = [
+                    index for index, item in enumerate(block.items)
+                    if isinstance(item, (bytes, bytearray))
+                ]
+                if not raw_indices or not isinstance(block.items[raw_indices[0]], (bytes, bytearray)):
+                    raise ValueError("Invalid 0x2589 visibility state.")
+                state = bytearray(block.items[raw_indices[0]])
+                if len(state) != 6 or state[4:] != b"\x3d\x00":
+                    raise ValueError("Unsupported 0x2589 visibility state layout.")
+                track_index = struct.unpack_from("<H", state, 0)[0]
+                if track_index >= len(all_names) or track_index in states_by_track:
+                    raise ValueError("Ambiguous 0x2589 track-visibility state.")
+                tail_indices = [
+                    index for index in raw_indices
+                    if len(block.items[index]) == 5
+                ]
+                if len(tail_indices) != 1:
+                    raise ValueError("Unsupported 0x2589 visibility flag layout.")
+                states_by_track[track_index] = (block, raw_indices[0], tail_indices[0])
+            if set(states_by_track) != set(range(len(all_names))):
+                raise ValueError("Incomplete 0x2589 track-visibility state map.")
+
+            for track_index, name in enumerate(all_names):
+                block, state_index, tail_index = states_by_track[track_index]
+                state = bytearray(block.items[state_index])
+                visible = name in shown_ordinals
+                struct.pack_into("<H", state, 2, 1 if visible else 0)
+                block.items[state_index] = state
+                block.items[tail_index] = bytearray(
+                    b"\x00\x00\x00\x00\x00" if visible else b"\x01\x00\x01\x00\x00"
+                )
+
+            logger.info("Set %d/%d template tracks visible: %s", len(shown_names), len(all_names), shown_names)
+            return list(shown_names)
+        except Exception:
+            self.root_items = original_root_items
+            self._removed_offsets = original_removed_offsets
+            raise
+
     def _validated_main_playlists(self):
         """Return direct main playlists as (block, name, events) tuples."""
         track_maps = self._root_blocks(0x1054)
@@ -1304,7 +1720,11 @@ class ProToolsSession:
             raise ValueError("Invalid Clip Group 0x2628 payload.")
         name_length = struct.unpack_from("<I", payload, 0)[0]
         attribute_offset = 4 + name_length
-        if attribute_offset + 13 > len(payload):
+        # A Clip Group uses the same selector vocabulary as an audio clip for
+        # its complete-span field: UInt8/UInt16/UInt24/UInt32.  The first
+        # production corpus happened to use UInt24, but native one-second
+        # groups use the compact UInt16 variant.
+        if attribute_offset + 3 > len(payload):
             raise ValueError("Truncated Clip Group 0x2628 payload.")
         try:
             name = payload[4:attribute_offset].decode("utf-8").strip("\x00")
@@ -1315,10 +1735,23 @@ class ProToolsSession:
         if flags != 0x5000:
             raise ValueError(f"Unsupported Clip Group flags: 0x{flags:04x}.")
 
-        # The verified simple-group layout stores its complete span as a
-        # 24-bit value at +10. Bytes +13 and +17 are absolute timestamps.
+        width_by_selector = {0x10: 1, 0x20: 2, 0x30: 3, 0x40: 4}
+        width_selector = payload[attribute_offset + 2]
+        length_width = width_by_selector.get(width_selector)
+        if length_width is None:
+            raise ValueError(
+                f"Unsupported Clip Group 0x2628 width selector: "
+                f"0x{width_selector:02x}."
+            )
+
+        # The verified simple-group layout stores its complete span at +10,
+        # with the width selected above. The following absolute timestamps
+        # begin immediately after that variable-width field.
+        length_offset = attribute_offset + 10
+        if length_offset + length_width > len(payload):
+            raise ValueError("Truncated Clip Group length payload.")
         length = int.from_bytes(
-            payload[attribute_offset + 10:attribute_offset + 13], "little"
+            payload[length_offset:length_offset + length_width], "little"
         )
         return {"name": name, "flags": flags, "length": length, "src_offset": 0}
 
@@ -3538,6 +3971,889 @@ class ProToolsSession:
             self.root_items = original_root_items
             self._removed_offsets = original_removed_offsets
             raise
+
+    def create_clip_group(self, track_name, group_name, start_samples,
+                          prototype_group_name):
+        """Place a native Clip Group cloned from a verified template prototype.
+
+        The source session must already contain one native Clip Group named
+        ``prototype_group_name`` and one ordinary audio placement on
+        ``track_name`` at ``start_samples``.  The placement is converted to a
+        group: its audio is moved into the group's internal hidden timeline,
+        so the duration comes from that real source clip.  This deliberately
+        does *not* manufacture arbitrary audio data; a silent template region
+        works just as safely as a regular audio region.
+
+        ``start_samples`` identifies the exact visible audio placement to
+        group.  Pro Tools' verified group-definition profile stores this
+        position and its end as UInt32, so larger values are rejected before
+        the session is changed.
+        """
+        for parameter_name, value in (
+            ("track_name", track_name),
+            ("group_name", group_name),
+            ("prototype_group_name", prototype_group_name),
+        ):
+            if not isinstance(value, str):
+                raise TypeError(f"{parameter_name} must be a string.")
+            if not value:
+                raise ValueError(f"{parameter_name} must be non-empty.")
+            if "\x00" in value:
+                raise ValueError(f"{parameter_name} cannot contain a NUL character.")
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValueError(f"{parameter_name} must be valid UTF-8.") from exc
+        if isinstance(start_samples, bool) or not isinstance(start_samples, int):
+            raise TypeError("start_samples must be an integer.")
+        if start_samples < 0 or start_samples > 0xFFFFFFFF:
+            raise ValueError(
+                "Clip Group start_samples must fit the verified UInt32 "
+                "group-definition layout."
+            )
+
+        original_root_items = copy.deepcopy(self.root_items)
+        original_removed_offsets = list(getattr(self, "_removed_offsets", []))
+        try:
+            return self._create_clip_group_impl(
+                track_name, group_name, start_samples, prototype_group_name
+            )
+        except Exception:
+            self.root_items = original_root_items
+            self._removed_offsets = original_removed_offsets
+            raise
+
+    def _new_synthetic_offsets(self, count):
+        """Reserve temporary old-offset keys for newly pointer-indexed blocks.
+
+        The PTX pointer table records *old* offsets and save() relocates them
+        to their serialized positions.  Blocks newly created in memory have no
+        such old offset, so give the three pointer-indexed group records
+        unique, otherwise-unused keys for this one save pass.
+        """
+        if count < 1:
+            return []
+        occupied = set()
+
+        def collect(block):
+            if not isinstance(block, PTBlock):
+                return
+            if block.original_offset > 0:
+                occupied.add(block.original_offset)
+            for child in block.items:
+                collect(child)
+
+        for item in self.root_items:
+            collect(item)
+        tables = self._root_blocks(0x0002)
+        if len(tables) != 1:
+            raise ValueError("A unique root 0x0002 pointer table is required.")
+        pointer_payload = self._raw_0002_payload(tables[0])
+        occupied.update(
+            struct.unpack_from("<I", pointer_payload, offset)[0]
+            for offset in range(0, len(pointer_payload) - 3)
+        )
+
+        result = []
+        candidate = 0xFE000000
+        while len(result) < count:
+            if candidate not in occupied:
+                result.append(candidate)
+                occupied.add(candidate)
+            candidate -= 1
+            if candidate <= 0:
+                raise OverflowError("Unable to reserve PTX pointer-table offsets.")
+        return result
+
+    def _append_0002_pointer_record(self, anchor_offset, new_offset):
+        """Append one pointer record to the run containing ``anchor_offset``."""
+        tables = self._root_blocks(0x0002)
+        if len(tables) != 1:
+            raise ValueError("A unique root 0x0002 pointer table is required.")
+        table = tables[0]
+        payload = self._raw_0002_payload(table)
+        records = self._validate_0002_record_layout(payload)
+        pointer_format = ">I" if self.is_bigendian else "<I"
+        matching = [
+            index for index, (_, pointer_position) in enumerate(records)
+            if struct.unpack_from(pointer_format, payload, pointer_position)[0]
+            == anchor_offset
+        ]
+        if len(matching) != 1:
+            raise ValueError(
+                "Cannot locate the prototype's unique 0x0002 pointer record."
+            )
+        index = matching[0]
+        run_start = index
+        while (
+            run_start > 0
+            and records[run_start][0] == records[run_start - 1][0] + 15
+        ):
+            run_start -= 1
+        run_end = index + 1
+        while (
+            run_end < len(records)
+            and records[run_end][0] == records[run_end - 1][0] + 15
+        ):
+            run_end += 1
+        count_position = records[run_start][0] - 2
+        declared_count = struct.unpack_from(">H", payload, count_position)[0]
+        if declared_count != run_end - run_start:
+            raise ValueError("Invalid 0x0002 pointer-record run.")
+
+        insertion_position = records[run_end - 1][0] + 15
+        record = bytearray(bytes.fromhex("0000000104000100"))
+        record.extend(struct.pack(pointer_format, new_offset))
+        record.extend(b"\x00\x00\x00")
+        payload[insertion_position:insertion_position] = record
+        struct.pack_into(">H", payload, count_position, declared_count + 1)
+        table.items = [payload]
+
+    def _create_clip_group_impl(self, track_name, group_name, start_samples,
+                                prototype_group_name):
+        """Validated implementation for :meth:`create_clip_group`."""
+        def direct_blocks(container, content_type):
+            return [
+                item for item in container.items
+                if isinstance(item, PTBlock) and item.content_type == content_type
+            ]
+
+        def count_and_blocks(container, content_type, label):
+            if (
+                not container.items
+                or not isinstance(container.items[0], (bytes, bytearray))
+                or len(container.items[0]) < 4
+            ):
+                raise ValueError(f"Invalid {label} counter payload.")
+            blocks = direct_blocks(container, content_type)
+            declared = struct.unpack_from("<I", container.items[0], 0)[0]
+            if declared != len(blocks):
+                raise ValueError(
+                    f"Inconsistent {label} count: declared={declared}, "
+                    f"actual={len(blocks)}."
+                )
+            return declared, blocks
+
+        def replace_group_name_and_timing(group_block, old_group_id, new_group_id,
+                                          name_bytes, new_start, length):
+            payload_blocks = direct_blocks(group_block, 0x2628)
+            if (
+                len(payload_blocks) != 1
+                or not payload_blocks[0].items
+                or not isinstance(payload_blocks[0].items[0], (bytes, bytearray))
+            ):
+                raise ValueError("Invalid prototype Clip Group definition.")
+            b2628 = payload_blocks[0]
+            old_payload = b2628.items[0]
+            if not isinstance(old_payload, (bytes, bytearray)) or len(old_payload) < 14:
+                raise ValueError("Truncated prototype Clip Group definition.")
+            old_name_length = struct.unpack_from("<I", old_payload, 0)[0]
+            attributes = 4 + old_name_length
+            if attributes + 10 > len(old_payload):
+                raise ValueError("Truncated prototype Clip Group attributes.")
+            selector_to_width = {0x10: 1, 0x20: 2, 0x30: 3, 0x40: 4}
+            old_width = selector_to_width.get(old_payload[attributes + 2])
+            if old_width is None:
+                raise ValueError("Unsupported prototype Clip Group duration layout.")
+            old_length = int.from_bytes(
+                old_payload[attributes + 10:attributes + 10 + old_width], "little"
+            )
+            timing_start = attributes + 10 + old_width
+            if (
+                timing_start + 8 > len(old_payload)
+                or struct.unpack_from("<I", old_payload, timing_start)[0] != prototype_start
+                or struct.unpack_from("<I", old_payload, timing_start + 4)[0]
+                != prototype_start
+            ):
+                raise ValueError("Unsupported prototype Clip Group timing layout.")
+            width = max(1, (length.bit_length() + 7) // 8)
+            if width > 4:
+                raise ValueError("Clip Group duration exceeds UInt32.")
+            selector = {1: 0x10, 2: 0x20, 3: 0x30, 4: 0x40}[width]
+            attributes_bytes = bytearray(old_payload[attributes:attributes + 10])
+            attributes_bytes[2] = selector
+            tail = bytearray(old_payload[timing_start:])
+            struct.pack_into("<I", tail, 0, new_start)
+            struct.pack_into("<I", tail, 4, new_start)
+            new_payload = bytearray(struct.pack("<I", len(name_bytes)))
+            new_payload.extend(name_bytes)
+            new_payload.extend(attributes_bytes)
+            new_payload.extend(length.to_bytes(width, "little"))
+            new_payload.extend(tail)
+            b2628.items[0] = new_payload
+
+            b2523_blocks = group_block.get_all_blocks(0x2523)
+            if len(b2523_blocks) != 1:
+                raise ValueError("Unsupported prototype Clip Group 0x2523 layout.")
+            b2523 = b2523_blocks[0]
+            raw_positions = [
+                index for index, item in enumerate(b2523.items)
+                if isinstance(item, (bytes, bytearray)) and len(item) >= 48
+            ]
+            if len(raw_positions) != 1:
+                raise ValueError("Unsupported prototype Clip Group 0x2523 payload.")
+            raw_position = raw_positions[0]
+            raw = bytearray(b2523.items[raw_position])
+            if (
+                struct.unpack_from("<I", raw, 0)[0] != prototype_start
+                or struct.unpack_from("<I", raw, 16)[0] != old_group_id
+                or struct.unpack_from("<I", raw, 44)[0]
+                != prototype_start + old_length
+            ):
+                raise ValueError("Inconsistent prototype Clip Group 0x2523 timing.")
+            duration_base = (
+                struct.unpack_from("<I", raw, 36)[0] - old_length
+            ) & 0xFFFFFFFF
+            struct.pack_into("<I", raw, 0, new_start)
+            struct.pack_into("<I", raw, 16, new_group_id)
+            struct.pack_into("<I", raw, 36, (duration_base + length) & 0xFFFFFFFF)
+            struct.pack_into("<I", raw, 44, new_start + length)
+            b2523.items[raw_position] = raw
+
+            trailer_positions = [
+                index for index, item in enumerate(group_block.items)
+                if isinstance(item, (bytes, bytearray)) and len(item) == 9
+            ]
+            if len(trailer_positions) != 1 or new_group_id > 0xFF:
+                raise ValueError("Unsupported Clip Group ID trailer layout.")
+            trailer = bytearray(group_block.items[trailer_positions[0]])
+            if trailer[0] != 0 or trailer[1] != old_group_id or any(trailer[2:]):
+                raise ValueError("Inconsistent prototype Clip Group ID trailer.")
+            trailer[1] = new_group_id
+            group_block.items[trailer_positions[0]] = trailer
+
+        b262c_roots = self._root_blocks(0x262c)
+        b2424_roots = self._root_blocks(0x2424)
+        b2426_roots = self._root_blocks(0x2426)
+        b2428_roots = self._root_blocks(0x2428)
+        if not (
+            len(b262c_roots) == len(b2424_roots) == len(b2426_roots)
+            == len(b2428_roots) == 1
+        ):
+            raise ValueError("Unsupported Clip Group template root layout.")
+        b262c, b2424, b2426, b2428 = (
+            b262c_roots[0], b2424_roots[0], b2426_roots[0], b2428_roots[0]
+        )
+        group_count, groups = count_and_blocks(b262c, 0x262b, "0x262c group")
+        name_count, name_blocks = count_and_blocks(b2424, 0x2423, "0x2424 group-name")
+        metadata_count, metadata_blocks = count_and_blocks(
+            b2426, 0x2425, "0x2426 group-metadata"
+        )
+        if group_count != name_count or group_count != metadata_count:
+            raise ValueError("Clip Group definition and metadata counts do not match.")
+        if group_count >= 0x100:
+            raise NotImplementedError(
+                "The verified Clip Group ID trailer supports at most 255 groups."
+            )
+
+        definition_names = []
+        for definition in groups:
+            payload_blocks = direct_blocks(definition, 0x2628)
+            if (
+                len(payload_blocks) != 1
+                or not payload_blocks[0].items
+                or not isinstance(payload_blocks[0].items[0], (bytes, bytearray))
+            ):
+                raise ValueError("Invalid Clip Group definition name payload.")
+            payload = payload_blocks[0].items[0]
+            if len(payload) < 4:
+                raise ValueError("Truncated Clip Group definition name payload.")
+            name_length = struct.unpack_from("<I", payload, 0)[0]
+            if 4 + name_length > len(payload):
+                raise ValueError("Truncated Clip Group definition name.")
+            try:
+                definition_names.append(payload[4:4 + name_length].decode("utf-8"))
+            except UnicodeDecodeError as exc:
+                raise ValueError("Invalid UTF-8 Clip Group definition name.") from exc
+        if group_name in definition_names:
+            raise ValueError(f"Clip Group '{group_name}' already exists.")
+        existing_groups = self.get_timeline_clip_groups()
+        prototype_matches = [
+            group for group in existing_groups
+            if group["group_name"] == prototype_group_name
+        ]
+        if len(prototype_matches) != 1:
+            raise ValueError(
+                "prototype_group_name must identify exactly one placed Clip Group."
+            )
+        prototype = prototype_matches[0]
+        prototype_group_id = prototype["group_id"]
+        prototype_start = prototype["start_samples"]
+        if prototype_group_id >= group_count:
+            raise ValueError("Prototype Clip Group ID is outside the group-definition list.")
+
+        playlists = self._validated_main_playlists()
+        target_matches = [playlist for playlist, name, _ in playlists if name == track_name]
+        if len(target_matches) != 1:
+            raise ValueError(f"Unknown or ambiguous target track '{track_name}'.")
+        target_playlist = target_matches[0]
+
+        hidden_roots = direct_blocks(b2428, 0x1054)
+        if len(hidden_roots) != 1:
+            raise ValueError("Unsupported Clip Group hidden-timeline layout.")
+        hidden_1054 = hidden_roots[0]
+        hidden_count, hidden_tracks = count_and_blocks(
+            hidden_1054, 0x1052, "hidden 0x1054 track"
+        )
+        if hidden_count != group_count:
+            raise ValueError("Clip Group hidden-track count does not match group count.")
+        prototype_hidden = hidden_tracks[prototype_group_id]
+        hidden_events = direct_blocks(prototype_hidden, 0x1050)
+        if hidden_events:
+            raise ValueError(
+                "The verified creation profile requires an empty prototype "
+                "hidden timeline."
+            )
+        if (
+            not prototype_hidden.items
+            or not isinstance(prototype_hidden.items[0], (bytes, bytearray))
+            or len(prototype_hidden.items[0]) < 8
+        ):
+            raise ValueError("Invalid prototype Clip Group hidden-track header.")
+        prototype_hidden_header = bytearray(prototype_hidden.items[0])
+        hidden_name_length = struct.unpack_from("<I", prototype_hidden_header, 0)[0]
+        hidden_count_offset = 4 + hidden_name_length
+        if (
+            hidden_count_offset + 4 > len(prototype_hidden_header)
+            or struct.unpack_from("<I", prototype_hidden_header, hidden_count_offset)[0]
+            != 0
+        ):
+            raise ValueError("Invalid empty prototype Clip Group hidden timeline.")
+
+        prototype_group = groups[prototype_group_id]
+        prototype_name = name_blocks[prototype_group_id]
+        prototype_metadata = metadata_blocks[prototype_group_id]
+        prototype_group_payload_blocks = direct_blocks(prototype_group, 0x2628)
+        if (
+            len(prototype_group_payload_blocks) != 1
+            or not prototype_group_payload_blocks[0].items
+            or not isinstance(prototype_group_payload_blocks[0].items[0], (bytes, bytearray))
+        ):
+            raise ValueError("Invalid prototype Clip Group definition payload.")
+        prototype_group_payload = prototype_group_payload_blocks[0].items[0]
+        prototype_group_name_length = struct.unpack_from(
+            "<I", prototype_group_payload, 0
+        )[0]
+        prototype_group_attributes = 4 + prototype_group_name_length
+        if prototype_group_attributes + 10 > len(prototype_group_payload):
+            raise ValueError("Truncated prototype Clip Group coordinate origin.")
+        # This UInt32 is Pro Tools' internal group-playlist coordinate origin;
+        # it is neither the visible macro position nor a timecode sample
+        # position.  The native hidden audio event must retain it exactly.
+        group_playlist_origin = struct.unpack_from(
+            "<I", prototype_group_payload, prototype_group_attributes + 6
+        )[0]
+        if not prototype_name.items or not isinstance(prototype_name.items[0], (bytes, bytearray)):
+            raise ValueError("Invalid prototype Clip Group name record.")
+        name_payload = prototype_name.items[0]
+        if (
+            len(name_payload) < 8
+            or struct.unpack_from("<I", name_payload, 0)[0] != prototype_group_id
+            or 8 + struct.unpack_from("<I", name_payload, 4)[0] > len(name_payload)
+        ):
+            raise ValueError("Inconsistent prototype Clip Group name record.")
+        if not prototype_metadata.items or not isinstance(prototype_metadata.items[0], (bytes, bytearray)):
+            raise ValueError("Invalid prototype Clip Group metadata record.")
+        metadata_payload = prototype_metadata.items[0]
+        if (
+            len(metadata_payload) < 9
+            or struct.unpack_from("<I", metadata_payload, 5)[0] != prototype_group_id
+        ):
+            raise ValueError("Inconsistent prototype Clip Group metadata record.")
+
+        macro_matches = []
+        target_audio_matches = []
+        for playlist, _, events in playlists:
+            for event in events:
+                event_payloads = direct_blocks(event, 0x104f)
+                tail = b"".join(
+                    bytes(item) for item in event.items
+                    if isinstance(item, (bytes, bytearray))
+                )
+                if (
+                    len(event_payloads) == 1
+                    and event_payloads[0].items
+                    and isinstance(event_payloads[0].items[0], (bytes, bytearray))
+                ):
+                    payload = event_payloads[0].items[0]
+                    if (
+                        len(payload) == 35
+                        and payload[15] == 0x03
+                        and tail == b"\x00\x00\x01"
+                        and struct.unpack_from("<I", payload, 2)[0] == prototype_group_id
+                    ):
+                        macro_matches.append(event)
+                    if (
+                        playlist is target_playlist
+                        and len(payload) == 35
+                        and payload[15] == 0x03
+                        and tail in (b"\x00\x01\x01", b"\x01\x01\x01")
+                        and struct.unpack_from("<Q", payload, 7)[0] == start_samples
+                    ):
+                        target_audio_matches.append(event)
+        if len(macro_matches) != 1:
+            raise ValueError(
+                "The prototype must have exactly one visible Clip Group macro."
+            )
+        if len(target_audio_matches) != 1:
+            raise ValueError(
+                "track_name and start_samples must identify exactly one "
+                "ordinary audio placement to convert into a Clip Group."
+            )
+        target_audio = target_audio_matches[0]
+        target_audio_payload = direct_blocks(target_audio, 0x104f)[0].items[0]
+        source_clip_id = struct.unpack_from("<I", target_audio_payload, 2)[0]
+        source_clip = self._audio_clip_info_by_id(source_clip_id)
+        duration = source_clip["length"]
+        if not duration:
+            raise ValueError("The source audio placement has zero duration.")
+        if start_samples + duration > 0xFFFFFFFF:
+            raise ValueError(
+                "Clip Group end exceeds the verified UInt32 group-definition layout."
+            )
+
+        new_group_id = group_count
+        name_bytes = group_name.encode("utf-8")
+        new_group = copy.deepcopy(prototype_group)
+        new_name = copy.deepcopy(prototype_name)
+        new_metadata = copy.deepcopy(prototype_metadata)
+        new_hidden = copy.deepcopy(prototype_hidden)
+        new_macro = copy.deepcopy(target_audio)
+        new_hidden_audio = copy.deepcopy(target_audio)
+        for block in (
+            new_group, new_name, new_metadata, new_hidden, new_macro,
+            new_hidden_audio,
+        ):
+            self._wipe_offsets_recursive(block)
+        synthetic_name, synthetic_metadata, synthetic_hidden = self._new_synthetic_offsets(3)
+        new_name.original_offset = synthetic_name
+        new_metadata.original_offset = synthetic_metadata
+        new_hidden.original_offset = synthetic_hidden
+
+        replace_group_name_and_timing(
+            new_group, prototype_group_id, new_group_id, name_bytes,
+            start_samples, duration
+        )
+        new_name_payload = bytearray(struct.pack("<II", new_group_id, len(name_bytes)))
+        new_name_payload.extend(name_bytes)
+        new_name_payload.extend(name_payload[8 + struct.unpack_from("<I", name_payload, 4)[0]:])
+        new_name.items[0] = new_name_payload
+        new_metadata_payload = bytearray(new_metadata.items[0])
+        struct.pack_into("<I", new_metadata_payload, 5, new_group_id)
+        new_metadata.items[0] = new_metadata_payload
+
+        macro_payload_block = direct_blocks(new_macro, 0x104f)[0]
+        macro_payload = bytearray(macro_payload_block.items[0])
+        struct.pack_into("<I", macro_payload, 2, new_group_id)
+        struct.pack_into("<Q", macro_payload, 7, start_samples)
+        # A visible Clip Group macro differs from the source audio event in
+        # one further verified flag at +18.  Without it Pro Tools indexes the
+        # group in the Clip List but does not instantiate it on the timeline.
+        if macro_payload[18] != 0:
+            raise ValueError("Unsupported source audio-event macro flag.")
+        macro_payload[18] = 1
+        macro_payload_block.items[0] = macro_payload
+        macro_tails = [
+            index for index, item in enumerate(new_macro.items)
+            if isinstance(item, (bytes, bytearray))
+        ]
+        if len(macro_tails) != 1 or bytes(new_macro.items[macro_tails[0]]) not in (
+            b"\x00\x01\x01", b"\x01\x01\x01"
+        ):
+            raise ValueError("Unsupported source audio-event tail layout.")
+        new_macro.items[macro_tails[0]] = bytearray(b"\x00\x00\x01")
+
+        hidden_payload_block = direct_blocks(new_hidden_audio, 0x104f)[0]
+        hidden_payload = bytearray(hidden_payload_block.items[0])
+        # Internal group audio is anchored at the opaque coordinate origin
+        # carried by the prototype group definition, not at zero and not at
+        # the visible macro's sample position.  The macro supplies placement.
+        struct.pack_into("<Q", hidden_payload, 7, group_playlist_origin)
+        hidden_payload_block.items[0] = hidden_payload
+        # Native Pro Tools moves the two-byte empty-playlist trailer out of
+        # the 0x1052 header when the internal playlist receives its first
+        # event: [header-with-count][event][01 00].  Leaving it inside the
+        # header creates a structurally parsable PTX, but Pro Tools rejects it
+        # while translating Audio Region Group Playlists.
+        hidden_trailer = bytearray(prototype_hidden_header[hidden_count_offset + 4:])
+        if hidden_trailer != b"\x01\x00":
+            raise ValueError("Unsupported prototype empty Clip Group trailer.")
+        prototype_hidden_header = prototype_hidden_header[:hidden_count_offset + 4]
+        new_hidden.items = [prototype_hidden_header, new_hidden_audio, hidden_trailer]
+        struct.pack_into("<I", prototype_hidden_header, hidden_count_offset, 1)
+
+        group_insert = max(
+            index for index, item in enumerate(b262c.items)
+            if isinstance(item, PTBlock) and item.content_type == 0x262b
+        ) + 1
+        b262c.items.insert(group_insert, new_group)
+        name_insert = max(
+            index for index, item in enumerate(b2424.items)
+            if isinstance(item, PTBlock) and item.content_type == 0x2423
+        ) + 1
+        b2424.items.insert(name_insert, new_name)
+        metadata_insert = max(
+            index for index, item in enumerate(b2426.items)
+            if isinstance(item, PTBlock) and item.content_type == 0x2425
+        ) + 1
+        b2426.items.insert(metadata_insert, new_metadata)
+        hidden_track_insert = max(
+            index for index, item in enumerate(hidden_1054.items)
+            if isinstance(item, PTBlock) and item.content_type == 0x1052
+        ) + 1
+        hidden_1054.items.insert(hidden_track_insert, new_hidden)
+        for container, count in (
+            (b262c, group_count), (b2424, name_count), (b2426, metadata_count),
+            (hidden_1054, hidden_count),
+        ):
+            payload = bytearray(container.items[0])
+            struct.pack_into("<I", payload, 0, count + 1)
+            container.items[0] = payload
+
+        target_header = bytearray(target_playlist.items[0])
+        track_name_length = struct.unpack_from("<I", target_header, 0)[0]
+        count_offset = 4 + track_name_length
+        if count_offset + 4 > len(target_header):
+            raise ValueError("Invalid target-track event counter.")
+        target_events = direct_blocks(target_playlist, 0x1050)
+        if struct.unpack_from("<I", target_header, count_offset)[0] != len(target_events):
+            raise ValueError("Inconsistent target-track event count.")
+        target_index = target_playlist.items.index(target_audio)
+        target_playlist.items[target_index] = new_macro
+
+        self._append_0002_pointer_record(prototype_name.original_offset, synthetic_name)
+        self._append_0002_pointer_record(
+            prototype_metadata.original_offset, synthetic_metadata
+        )
+        self._append_0002_pointer_record(
+            prototype_hidden.original_offset, synthetic_hidden
+        )
+        return {
+            "group_id": new_group_id,
+            "group_name": group_name,
+            "track": track_name,
+            "start_samples": start_samples,
+            "length_samples": duration,
+            "end_samples": start_samples + duration,
+        }
+
+    def create_empty_clip_group(self, track_name, group_name, start_samples,
+                                length_samples):
+        """Create one native empty Clip Group in the verified blank profile.
+
+        This is intentionally separate from :meth:`create_clip_group`: no
+        audio placement or Clip Group prototype is required.  It writes only
+        the native empty-group profile observed in a 48 kHz / 23.976 session.
+        Existing groups must also be empty groups of that same profile.
+        """
+        for parameter_name, value in (("track_name", track_name), ("group_name", group_name)):
+            if not isinstance(value, str):
+                raise TypeError(f"{parameter_name} must be a string.")
+            if not value:
+                raise ValueError(f"{parameter_name} must be non-empty.")
+            if "\x00" in value:
+                raise ValueError(f"{parameter_name} cannot contain a NUL character.")
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValueError(f"{parameter_name} must be valid UTF-8.") from exc
+        for parameter_name, value in (
+            ("start_samples", start_samples), ("length_samples", length_samples),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{parameter_name} must be an integer.")
+        if start_samples < 0 or start_samples > 0xFFFFFFFF:
+            raise ValueError("Empty Clip Group start_samples must fit UInt32.")
+        if length_samples < 1 or length_samples > 0xFFFFFFFF:
+            raise ValueError("Empty Clip Group length_samples must fit UInt32 and be positive.")
+        if start_samples + length_samples > 0xFFFFFFFF:
+            raise ValueError("Empty Clip Group end must fit UInt32.")
+
+        original_root_items = copy.deepcopy(self.root_items)
+        original_removed_offsets = list(getattr(self, "_removed_offsets", []))
+        try:
+            return self._create_empty_clip_group_impl(
+                track_name, group_name, start_samples, length_samples
+            )
+        except Exception:
+            self.root_items = original_root_items
+            self._removed_offsets = original_removed_offsets
+            raise
+
+    def _create_empty_clip_group_impl(self, track_name, group_name,
+                                      start_samples, length_samples):
+        """Validated implementation for :meth:`create_empty_clip_group`."""
+        if self.sample_rate != 48_000 or self.frame_rate_enum != 0x09:
+            raise ValueError(
+                "Empty Clip Group creation requires the verified 48 kHz / "
+                "23.976 template profile."
+            )
+
+        def direct_blocks(container, content_type):
+            return [
+                item for item in container.items
+                if isinstance(item, PTBlock) and item.content_type == content_type
+            ]
+
+        def count_and_blocks(container, content_type, label):
+            if (
+                not container.items
+                or not isinstance(container.items[0], (bytes, bytearray))
+                or len(container.items[0]) < 4
+            ):
+                raise ValueError(f"Invalid {label} counter payload.")
+            blocks = direct_blocks(container, content_type)
+            count = struct.unpack_from("<I", container.items[0], 0)[0]
+            if count != len(blocks):
+                raise ValueError(
+                    f"Inconsistent {label} count: declared={count}, "
+                    f"actual={len(blocks)}."
+                )
+            return count, blocks
+
+        def group_name_from_definition(definition):
+            payload_blocks = direct_blocks(definition, 0x2628)
+            if (
+                len(payload_blocks) != 1
+                or not payload_blocks[0].items
+                or not isinstance(payload_blocks[0].items[0], (bytes, bytearray))
+            ):
+                raise ValueError("Invalid empty Clip Group definition payload.")
+            payload = payload_blocks[0].items[0]
+            if len(payload) < 4:
+                raise ValueError("Truncated empty Clip Group definition name.")
+            name_length = struct.unpack_from("<I", payload, 0)[0]
+            if 4 + name_length > len(payload):
+                raise ValueError("Truncated empty Clip Group name.")
+            try:
+                return payload[4:4 + name_length].decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("Invalid UTF-8 empty Clip Group name.") from exc
+
+        def insert_counted(container, content_type, new_block, old_count):
+            existing = direct_blocks(container, content_type)
+            if existing:
+                insertion = max(container.items.index(item) for item in existing) + 1
+                container.items.insert(insertion, new_block)
+            else:
+                # The empty native 0x262c counter carries an opaque four-byte
+                # trailer in its same raw item.  Split that item before adding
+                # its first direct child; other empty counted lists have none.
+                first = bytearray(container.items[0])
+                container.items[0] = first[:4]
+                container.items.insert(1, new_block)
+                if len(first) > 4:
+                    container.items.insert(2, first[4:])
+            counter = bytearray(container.items[0])
+            struct.pack_into("<I", counter, 0, old_count + 1)
+            container.items[0] = counter
+
+        roots_262c = self._root_blocks(0x262c)
+        roots_2424 = self._root_blocks(0x2424)
+        roots_2426 = self._root_blocks(0x2426)
+        roots_2428 = self._root_blocks(0x2428)
+        if not (
+            len(roots_262c) == len(roots_2424) == len(roots_2426)
+            == len(roots_2428) == 1
+        ):
+            raise ValueError("Unsupported empty Clip Group template root layout.")
+        b262c, b2424, b2426, b2428 = (
+            roots_262c[0], roots_2424[0], roots_2426[0], roots_2428[0]
+        )
+        group_count, groups = count_and_blocks(b262c, 0x262b, "0x262c group")
+        name_count, names = count_and_blocks(b2424, 0x2423, "0x2424 group-name")
+        metadata_count, metadata = count_and_blocks(
+            b2426, 0x2425, "0x2426 group-metadata"
+        )
+        if group_count != name_count or group_count != metadata_count:
+            raise ValueError("Empty Clip Group parallel-list counts do not match.")
+        if group_count >= 0x100:
+            raise NotImplementedError(
+                "The verified empty Clip Group ID trailer supports at most 255 groups."
+            )
+        if group_name in [group_name_from_definition(group) for group in groups]:
+            raise ValueError(f"Clip Group '{group_name}' already exists.")
+
+        hidden_roots = direct_blocks(b2428, 0x1054)
+        if len(hidden_roots) != 1:
+            raise ValueError("Unsupported empty Clip Group hidden-timeline layout.")
+        hidden_1054 = hidden_roots[0]
+        hidden_count, hidden_tracks = count_and_blocks(
+            hidden_1054, 0x1052, "hidden 0x1054 track"
+        )
+        if hidden_count != group_count:
+            raise ValueError("Empty Clip Group hidden-track count does not match groups.")
+        expected_hidden_header = b"\x01\x00\x00\x00\x3f\x00\x00\x00\x00\x01\x00"
+        for hidden_track in hidden_tracks:
+            if (
+                len(hidden_track.items) != 1
+                or bytes(hidden_track.items[0]) != expected_hidden_header
+            ):
+                raise ValueError("Existing Clip Group is not the verified empty profile.")
+
+        playlists = self._validated_main_playlists()
+        target_matches = [playlist for playlist, name, _ in playlists if name == track_name]
+        if len(target_matches) != 1:
+            raise ValueError(f"Unknown or ambiguous target track '{track_name}'.")
+        target_playlist = target_matches[0]
+        target_events = direct_blocks(target_playlist, 0x1050)
+        for event in target_events:
+            payload_blocks = direct_blocks(event, 0x104f)
+            tail = b"".join(
+                bytes(item) for item in event.items
+                if isinstance(item, (bytes, bytearray))
+            )
+            if (
+                len(payload_blocks) != 1
+                or not payload_blocks[0].items
+                or not isinstance(payload_blocks[0].items[0], (bytes, bytearray))
+                or len(payload_blocks[0].items[0]) != 35
+                or payload_blocks[0].items[0][15] != 0x03
+                or tail != b"\x00\x00\x01"
+            ):
+                raise ValueError(
+                    "Empty Clip Group target track may contain only verified group macros."
+                )
+
+        new_group_id = group_count
+        name_bytes = group_name.encode("utf-8")
+        width = max(1, (length_samples.bit_length() + 7) // 8)
+        selector = {1: 0x10, 2: 0x20, 3: 0x30, 4: 0x40}[width]
+        group_payload = bytearray(struct.pack("<I", len(name_bytes)))
+        group_payload.extend(name_bytes)
+        group_payload.extend(b"\x00\x50" + bytes((selector, 0x44, 0x08, 0x00)))
+        group_payload.extend(struct.pack("<I", _EMPTY_CLIP_GROUP_PLAYLIST_ORIGIN))
+        group_payload.extend(length_samples.to_bytes(width, "little"))
+        group_payload.extend(struct.pack("<II", start_samples, start_samples))
+        group_payload.extend(bytes.fromhex("fffffffffffffffffeff00000000ffff0400040001000000"))
+
+        group_timing = bytearray(65)
+        struct.pack_into("<I", group_timing, 0, start_samples)
+        struct.pack_into("<I", group_timing, 8, 0xFFFFFFFF)
+        struct.pack_into("<I", group_timing, 16, new_group_id)
+        # 0x2523 stores the shared origin and origin+duration as two
+        # unaligned five-byte little-endian values, not as adjacent UInt32s.
+        # The one-second and 3:12 native references establish this relation.
+        group_timing[29:34] = (
+            _EMPTY_CLIP_GROUP_PLAYLIST_ORIGIN << 8
+        ).to_bytes(5, "little")
+        group_timing[36:41] = (
+            (_EMPTY_CLIP_GROUP_PLAYLIST_ORIGIN << 8) + length_samples
+        ).to_bytes(5, "little")
+        struct.pack_into("<I", group_timing, 44, start_samples + length_samples)
+        struct.pack_into("<I", group_timing, 52, 0xFFFFFFFF)
+        new_group = PTBlock(1, 0x262b)
+        new_definition = PTBlock(4, 0x2628)
+        group_properties = PTBlock(9, 0x2523)
+        new_group.items = [
+            new_definition,
+            bytearray((0, new_group_id, 0, 0, 0, 0, 0, 0, 0)),
+        ]
+        new_definition.items = [
+            group_payload,
+            group_properties,
+            bytearray(bytes.fromhex("0000000000000000000000000000000000ffffffff0000")),
+        ]
+        group_properties.items = [
+            PTBlock(2, 0x2526), group_timing,
+        ]
+        group_properties.items[0].items = [bytearray(12)]
+
+        new_name = PTBlock(4, 0x2423)
+        new_name.items = [
+            bytearray(struct.pack("<II", new_group_id, len(name_bytes)) + name_bytes + b"\x00" * 5)
+        ]
+        new_metadata = PTBlock(2, 0x2425)
+        metadata_payload = bytearray(_EMPTY_CLIP_GROUP_METADATA_TEMPLATE)
+        struct.pack_into("<I", metadata_payload, 5, new_group_id)
+        new_metadata.items = [metadata_payload]
+        new_hidden = PTBlock(3, 0x1052)
+        new_hidden.items = [bytearray(expected_hidden_header)]
+        macro_payload = bytearray(_EMPTY_CLIP_GROUP_MACRO_TEMPLATE)
+        struct.pack_into("<I", macro_payload, 2, new_group_id)
+        struct.pack_into("<Q", macro_payload, 7, start_samples)
+        new_macro_payload = PTBlock(0x0A, 0x104f)
+        new_macro_payload.items = [macro_payload]
+        new_macro = PTBlock(3, 0x1050)
+        new_macro.items = [new_macro_payload, bytearray(b"\x00\x00\x01")]
+
+        synthetic_name, synthetic_metadata, synthetic_hidden = self._new_synthetic_offsets(3)
+        new_name.original_offset = synthetic_name
+        new_metadata.original_offset = synthetic_metadata
+        new_hidden.original_offset = synthetic_hidden
+
+        insert_counted(b262c, 0x262b, new_group, group_count)
+        insert_counted(b2424, 0x2423, new_name, name_count)
+        insert_counted(b2426, 0x2425, new_metadata, metadata_count)
+        hidden_insert = max(
+            (index for index, item in enumerate(hidden_1054.items)
+             if isinstance(item, PTBlock) and item.content_type == 0x1052),
+            default=0,
+        ) + 1
+        # A new hidden track must precede the opaque 0x4828 trailer.
+        if not hidden_tracks:
+            hidden_insert = next(
+                index for index, item in enumerate(hidden_1054.items)
+                if isinstance(item, PTBlock) and item.content_type == 0x4828
+            )
+        hidden_1054.items.insert(hidden_insert, new_hidden)
+        hidden_counter = bytearray(hidden_1054.items[0])
+        struct.pack_into("<I", hidden_counter, 0, hidden_count + 1)
+        hidden_1054.items[0] = hidden_counter
+
+        target_header = bytearray(target_playlist.items[0])
+        target_name_length = struct.unpack_from("<I", target_header, 0)[0]
+        target_count_offset = 4 + target_name_length
+        if (
+            target_count_offset + 4 > len(target_header)
+            or struct.unpack_from("<I", target_header, target_count_offset)[0]
+            != len(target_events)
+        ):
+            raise ValueError("Invalid empty Clip Group target-track counter.")
+        header_end = target_count_offset + 4
+        header_trailer = bytearray(target_header[header_end:])
+        if target_events:
+            if header_trailer:
+                raise ValueError("Unexpected target-track header trailer.")
+        elif header_trailer != b"\x01\x00":
+            raise ValueError("Unsupported empty target-track trailer.")
+        if header_trailer:
+            target_header = target_header[:header_end]
+            target_playlist.items[0] = target_header
+        event_slots = [
+            index for index, item in enumerate(target_playlist.items)
+            if isinstance(item, PTBlock) and item.content_type == 0x1050
+        ]
+        insertion = event_slots[-1] + 1 if event_slots else 1
+        target_playlist.items.insert(insertion, new_macro)
+        if header_trailer:
+            target_playlist.items.insert(insertion + 1, header_trailer)
+        event_slots = [
+            index for index, item in enumerate(target_playlist.items)
+            if isinstance(item, PTBlock) and item.content_type == 0x1050
+        ]
+        sorted_events = sorted(
+            (target_playlist.items[index] for index in event_slots),
+            key=lambda event: struct.unpack_from(
+                "<Q", direct_blocks(event, 0x104f)[0].items[0], 7
+            ),
+        )
+        for index, event in zip(event_slots, sorted_events):
+            target_playlist.items[index] = event
+        struct.pack_into("<I", target_header, target_count_offset, len(target_events) + 1)
+        target_playlist.items[0] = target_header
+
+        self._append_0002_pointer_record(b2424.original_offset, synthetic_name)
+        self._append_0002_pointer_record(b2426.original_offset, synthetic_metadata)
+        self._append_0002_pointer_record(hidden_1054.original_offset, synthetic_hidden)
+        return {
+            "group_id": new_group_id,
+            "group_name": group_name,
+            "track": track_name,
+            "start_samples": start_samples,
+            "length_samples": length_samples,
+            "end_samples": start_samples + length_samples,
+        }
 
     @staticmethod
     def _is_verified_relink_2628_layout(source_clip_payload, source_clip_info):
