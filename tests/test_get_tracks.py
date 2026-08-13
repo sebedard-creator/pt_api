@@ -72,9 +72,18 @@ def make_native_rename_profile(track_names=("AUDIO 1", "AUDIO 2")):
     return session
 
 
-def make_native_visibility_profile(track_names=("AUDIO 1", "AUDIO 2", "AUDIO 3")):
+def make_native_visibility_profile(
+    track_names=("AUDIO 1", "AUDIO 2", "AUDIO 3"),
+    visibility_suffixes=None,
+):
     """Build the explicit 0x251a/0x2589 visibility mirrors."""
     session = make_session([playlist(name) for name in track_names])
+    if visibility_suffixes is None:
+        visibility_suffixes = [b"\xfe\xff"] * len(track_names)
+    if len(visibility_suffixes) != len(track_names):
+        raise ValueError("visibility_suffixes must match track_names.")
+    if any(not isinstance(value, bytes) or len(value) != 2 for value in visibility_suffixes):
+        raise ValueError("visibility suffixes must be two-byte values.")
     aggregate = bytearray(b"\x01" * 16 + struct.pack("<I", len(track_names)))
     displays_first = []
     displays_second = []
@@ -91,7 +100,10 @@ def make_native_visibility_profile(track_names=("AUDIO 1", "AUDIO 2", "AUDIO 3")
             target.append(block(10, 0x251A, [
                 bytearray(b"\x00\x00" + entry + b"\x00"),
                 bytearray(b"\x00\x00"),
-                bytearray(b"\x00\x00\x00\x00\x01\x01\x00\x00\x00\xfe\xff"),
+                bytearray(
+                    b"\x00\x00\x00\x00\x01\x01\x00\x00\x00"
+                    + visibility_suffixes[index]
+                ),
             ]))
         states.append(block(9, 0x2589, [
             bytearray(struct.pack("<HH", index, 1) + b"\x3d\x00"),
@@ -212,6 +224,26 @@ class TrackVisibilityTests(unittest.TestCase):
             session.set_visible_tracks(["MISSING"])
 
         self.assertEqual(bytes(session._root_blocks(0x2519)[0].items[0]), before)
+
+    def test_preserves_native_per_track_visibility_suffixes(self):
+        suffixes = [b"\xfe\xff", b"\x1e\x00", b"\x2d\x00"]
+        session = make_native_visibility_profile(visibility_suffixes=suffixes)
+        root_2519 = session._root_blocks(0x2519)[0]
+        before = [
+            bytes(item.items[2])
+            for item in root_2519.get_all_blocks(0x251A)
+        ]
+
+        session.set_visible_tracks(["AUDIO 1", "AUDIO 3"])
+
+        after = [
+            bytes(item.items[2])
+            for item in root_2519.get_all_blocks(0x251A)
+        ]
+        self.assertEqual([item[4] for item in after[:3]], [1, 0, 1])
+        for old, new in zip(before, after):
+            self.assertEqual(old[:4], new[:4])
+            self.assertEqual(old[5:], new[5:])
 
     def test_rejects_incomplete_profile_without_mutation(self):
         session = make_native_rename_profile()

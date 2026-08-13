@@ -8,7 +8,7 @@ from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 
 
 _TEMPLATE_AUDIO_IEEE_FLOAT_SUBFORMAT = bytes.fromhex(
@@ -1448,7 +1448,13 @@ class ProToolsSession:
                     index for index, item in enumerate(block.items)
                     if isinstance(item, (bytes, bytearray))
                     and len(item) == 11
-                    and bytes(item)[5:] == b"\x01\x00\x00\x00\xfe\xff"
+                    # The final UInt16 is a native per-track opaque value:
+                    # it is FE FF in some sessions but differs for other
+                    # tracks in the same Pro Tools pool.  Visibility owns
+                    # only byte 4; identify the invariant structure and
+                    # preserve the suffix byte-for-byte.
+                    and bytes(item)[:4] == b"\x00\x00\x00\x00"
+                    and bytes(item)[5:9] == b"\x01\x00\x00\x00"
                 ]
                 if len(flag_indices) != 1:
                     raise ValueError("Unsupported 0x251a visibility flag layout.")
