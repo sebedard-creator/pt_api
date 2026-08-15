@@ -1,4 +1,4 @@
-# Architecture logicielle de `pt_api` 1.5.1
+# Architecture logicielle de `pt_api` 1.5.2
 
 Ce document donne un survol global du logiciel. Les structures binaires, offsets, flags et messages d'erreur appartiennent à [`pt_format_specs.md`](pt_format_specs.md), qui est la spécification technique normative. La surface publique et ses limitations sont résumées dans [`README.md`](README.md).
 
@@ -76,11 +76,11 @@ Les fonctions de chiffrement valident l'en-tête PTX, transforment une copie des
 - les octets déchiffrés et le chemin absolu de la session;
 - l'arbre racine ordonné;
 - les métadonnées temporelles;
-- la liste des offsets de blocs supprimés qui devront être purgés à la sauvegarde.
+- la liste des offsets/types de blocs supprimés qui devront être purgés à la sauvegarde.
 
-Les méthodes de lecture exposent pistes, marqueurs, clips et événements. Les méthodes de mutation couvrent les opérations audio documentées dans le README, y compris le clonage/relink physique étroit d'un placement. Les validateurs communs résolvent les noms, compteurs, placements, géométries, catalogues média et dictionnaires avant toute écriture. La hiérarchie interne d'un catalogue PTX reste distincte de la résolution des chemins : l'application fournit les chemins WAV, normalement sous le dossier `Audio Files` associé à la session.
+Les méthodes de lecture exposent pistes, marqueurs, clips et événements. Les markers ponctuels peuvent aussi être filtrés par le nom d’une règle de markers native : le reader associe l’ordinal final du `0x2077` au catalogue de règles `0x2519`, sans confondre cette règle avec une playlist Audio. Les méthodes de mutation couvrent les opérations audio documentées dans le README, y compris le clonage/relink physique étroit d'un placement. Les validateurs communs résolvent les noms, compteurs, placements, géométries, catalogues média et dictionnaires avant toute écriture. La hiérarchie interne d'un catalogue PTX reste distincte de la résolution des chemins : l'application fournit les chemins WAV, normalement sous le dossier `Audio Files` associé à la session.
 
-Pour les applications qui doivent composer une session sans créer de pistes binaires, la template peut contenir un pool de slots Audio précréés. `rename_track()` renomme un slot et `set_visible_tracks()` active exactement les slots nécessaires en laissant les autres cachés. Cette couche ne crée, ne supprime ni ne réordonne les pistes : la complexité native de création reste entièrement du ressort de Pro Tools au moment de la préparation de la template. Une template de pool doit être sauvegardée au moins une fois par Pro Tools après sa création; le profil UI pré-normalisation observé est refusé pour le renommage plutôt que réécrit par heuristique. Les suffixes UInt16 des flags `0x251a` restent opaques et sont conservés : ils ne constituent pas un identifiant de profil.
+Pour les applications qui composent une session à partir d'un pool Audio précréé, la template peut contenir plus de slots que nécessaire. `rename_track()` renomme un slot et `set_visible_tracks()` active exactement les slots nécessaires en laissant les autres cachés. `delete_tracks()` est la voie distincte de réduction du pool : elle accepte toute combinaison de slots Audio vides du profil natif vérifié, conserve au moins un slot et met à jour les miroirs de timeline, nom, affichage, index et état, ainsi que les métadonnées brutes `0x0002` associées. Elle ne crée ni ne réordonne de pistes et refuse une piste contenant des événements ou une structure non reconnue. Une template de pool doit être sauvegardée au moins une fois par Pro Tools après sa création; le profil UI pré-normalisation observé est refusé pour le renommage plutôt que réécrit par heuristique. Les suffixes UInt16 des flags `0x251a` restent opaques et sont conservés : ils ne constituent pas un identifiant de profil.
 
 La lecture des macros de Clip Groups suit une voie distincte : `get_timeline_clip_groups()` lit les occurrences visibles de la timeline dans leur namespace `0x262c`, sans les confondre avec les clips audio de `get_timeline_clips()`. Cette séparation préserve les identifiants indépendants et les placements répétés. Deux writers utilisent ce namespace : `create_clip_group()` convertit une région audio existante à partir d'un prototype, tandis que `create_empty_clip_group()` construit le profil natif à playlist interne vide à partir d'une session vierge compatible. Aucun des deux ne crée de piste ni de média; les politiques de préparation, de nommage et d'affectation restent chez l'application cliente.
 
@@ -135,6 +135,7 @@ Avant l'écriture, les invariants structurels et temporels sont revalidés. Apr�
 - Les compteurs doivent correspondre au nombre réel de blocs ou d'enregistrements.
 - Les données opaques sont conservées byte-for-byte.
 - Les offsets existants ne sont jamais effacés globalement.
+- Une suppression de piste ne retire des métadonnées `0x0002` non standard que lorsque leur groupe natif exact a été validé; toute autre disposition est refusée.
 - Les nouvelles fonctions doivent réutiliser les validateurs et mécanismes transactionnels communs.
 - La bibliothèque n'écrit pas dans `stdout`; les diagnostics facultatifs passent par le logger `pt_api`.
 - Toute nouvelle disposition binaire doit être confirmée par une session Pro Tools de référence avant d'être déclarée prise en charge.

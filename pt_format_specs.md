@@ -1,6 +1,6 @@
 # Spécifications binaires du format Pro Tools (`.ptx`)
 
-*(Spécification normative de `pt_api` 1.5.1; sessions de référence produites par Pro Tools Ultimate 2024.3.1 à 23.98, 24 et 29.97df fps, plus layouts Premiere Pro observés.)*
+*(Spécification normative de `pt_api` 1.5.2; sessions de référence produites par Pro Tools Ultimate 2024.3.1 à 23.98, 24 et 29.97df fps, plus layouts Premiere Pro observés.)*
 
 Ce document décrit exactement les structures que le code courant lit, valide, modifie et sérialise. Une structure dite « observée » provient des sessions de référence; une structure dite « prise en charge » possède un chemin explicite dans `pt_api.py`. Les zones non interprétées sont conservées telles quelles et ne doivent pas être déduites par heuristique.
 
@@ -109,7 +109,7 @@ Un enregistrement standard mesure 15 octets :
 - Ces métadonnées peuvent contenir d'autres offsets absolus. Lors de la sauvegarde, le code examine chaque alignement possible de quatre octets hors des enregistrements standards et ne remplace que les valeurs présentes dans la table `ancien_offset → nouvel_offset`. À l'intérieur d'un enregistrement, seul le champ à `+8` est admissible.
 - Deux patchs de quatre octets ne peuvent pas se chevaucher.
 
-Lorsqu'un bloc est supprimé, tous ses offsets et ceux de ses descendants sont placés dans `_removed_offsets`. La purge retire uniquement les 15 octets de chaque enregistrement standard correspondant et décrémente le compteur UInt16 BE de sa série; elle ne supprime jamais les métadonnées voisines.
+Lorsqu'un bloc est supprimé, tous ses offsets et ceux de ses descendants sont placés dans `_removed_offsets`. La purge générique retire uniquement les 15 octets de chaque enregistrement standard correspondant et décrémente le compteur UInt16 BE de sa série; elle ne supprime jamais les métadonnées voisines. `delete_tracks()` possède une exception strictement profilée documentée en §4.1.2 : trois groupes de métadonnées de piste, observés natifs, sont retirés comme unités complètes avec leurs records standards incorporés. Aucune autre métadonnée voisine n'est supprimée par inférence.
 
 ### 2.3 Pipeline de `save()`
 
@@ -117,11 +117,11 @@ La sauvegarde est transactionnelle en mémoire et atomique sur disque :
 
 1. Sérialiser virtuellement toutes les racines pour produire la table globale des anciens et nouveaux offsets.
 2. Revalider `0x0001`, l'unique `0x0002` final, son format plat, ses compteurs et les métadonnées temporelles.
-3. Purger les enregistrements des blocs réellement supprimés.
-4. Relocaliser les pointeurs standards et secondaires de `0x0002`.
+3. Capturer l'identité des records et, pour une suppression de pistes vérifiée, les groupes de métadonnées natifs à retirer.
+4. Relocaliser les pointeurs standards et secondaires de `0x0002`, mettre à jour les compteurs/mirroirs de suppression de pistes, puis purger les records et groupes capturés.
 5. Sérialiser de nouveau, calculer l'offset final de `0x0002` et patcher `0x0001`.
 6. Préserver l'en-tête déchiffré, rechiffrer une copie dans un fichier temporaire, rafraîchir tous les `original_offset`, puis remplacer atomiquement la destination.
-7. Après succès, mettre à jour `self.data` avec les octets déchiffrés, vider `_removed_offsets` et stocker le chemin absolu de sortie dans `file_path`. `save()` retourne `None`.
+7. Après succès, mettre à jour `self.data` avec les octets déchiffrés, vider `_removed_offsets` et les types associés, puis stocker le chemin absolu de sortie dans `file_path`. `save()` retourne `None`.
 
 Toute exception antérieure au remplacement restaure `root_items`, `_removed_offsets` et `file_path`. Pour les sessions prises en charge, un chargement suivi d'une sauvegarde sans mutation est byte-for-byte identique.
 
@@ -180,7 +180,7 @@ La timeline principale est l'unique racine `0x1054`. L'absence de cette racine p
 
 ### 4.1.1 Pool de pistes précréées : renommage et visibilité
 
-L'API ne crée ni ne supprime de piste. Une application peut toutefois employer un pool de pistes Audio déjà créées dans une template Pro Tools : `rename_track()` met à jour les miroirs de nom vérifiés, et `set_visible_tracks(track_names)` affiche exactement les slots demandés, dans l'ordre fourni.
+L'API ne crée ni ne réordonne de piste. Une application peut employer un pool de pistes Audio déjà créées dans une template Pro Tools : `rename_track()` met à jour les miroirs de nom vérifiés, `set_visible_tracks(track_names)` affiche exactement les slots demandés, dans l'ordre fourni, et `delete_tracks()` peut retirer les slots vides du profil strict documenté en §4.1.2.
 
 La visibilité native est dupliquée dans trois emplacements qui doivent rester cohérents :
 
@@ -193,6 +193,24 @@ Dans le record court de 11 octets de `0x251a`, les neuf premiers octets ont la f
 `set_visible_tracks()` exige une liste non vide, sans doublon, composée uniquement de noms de pistes existants. Il ne modifie ni le nombre de playlists, ni les offsets, ni le catalogue média, et restaure transactionnellement l'arbre en cas de profil ambigu ou incomplet. Les tests manuels ont validé l'affichage des pistes 1, 2, 3 et 9 dans un pool natif de dix pistes.
 
 Un pool de pistes nouvellement créé doit être ouvert puis sauvegardé normalement une fois dans Pro Tools avant son premier `rename_track()`. Le profil UI pré-normalisation observé dans certaines templates de pool est lisible et peut servir au contrôle de visibilité, mais un renommage y ferait rejeter la map complète de pistes par Pro Tools. L'API reconnaît ce profil exact et retourne `ValueError` avant toute mutation; elle ne tente pas d'imiter une normalisation interne non documentée.
+
+### 4.1.2 Suppression de pistes Audio vides (`delete_tracks`)
+
+`delete_tracks(track_names)` est une mutation de template, pas un destructeur général de pistes Pro Tools. `track_names` doit être un itérable non vide de `str` uniques, sans NUL, qui désignent des playlists `0x1052` principales existantes. Au moins une piste Audio doit rester. Toutes les playlists principales doivent être vides : un compteur d'événements non nul ou un enfant événement provoque `NotImplementedError` avant toute écriture.
+
+Le profil d'écriture exige une occurrence unique et cohérente de chacun des miroirs suivants. Les noms et compteurs doivent tous correspondre à l'ordre de `0x1054` :
+
+- `0x1054 → 0x1052` : compteur et playlists principales; les playlists supprimées disparaissent.
+- `0x1015 → 0x1014` : compteur, descripteurs de noms et leurs deux ordinaux UInt32; les ordinaux restants deviennent `0..N-1`.
+- `0x2107 → 0x210b` : compteur et métadonnées de noms; les identités restantes sont conservées.
+- `0x2519` : agrégat de noms, deux familles directes `0x251a` et leur compteur intermédiaire; les ordinaux d'affichage restants deviennent `1..N`.
+- `0x2587 → 0x258a → 0x2589` : compteur et états de piste. Les états d'ID final hors du domaine compact sont retirés; les états restants sont sérialisés dans l'ordre canonique croissant `0..N-1`. Cet ordre ne dépend ni des noms, ni de leur position d'origine.
+- `0x2624 → 0x261c` : compteur et slots. Les libellés opaques historiques `Audio N` sont conservés, mais les deux records d'ordinal du slot (`12` et `24` octets) sont compactés vers `0..N-1`.
+- `0x202b → 0x202a` : les deux listes d'indices UInt16 deviennent exactement `0..N-1` avec leur compteur UInt32.
+
+La table finale `0x0002` possède aussi trois miroirs bruts de cette topologie. Le writer les reconnaît seulement dans leur forme native exacte : (1) la liste de pointeurs des premiers `0x251a`, dont la longueur octet et le compteur BE sont compactés; (2) les entrées de 45 octets des seconds `0x251a`; (3) les entrées de 67 octets des slots `0x261c`. Les deux dernières entrées incorporent chacune un record standard de 15 octets. Elles sont capturées avant relocalisation, leurs records ne sont comptés qu'une fois lors de la purge, et leurs ordinaux restants sont compactés. Les six compteurs `0x251b`, le compteur voisin `0x2716`, le compteur de tête BE et le trailer final `0x261c` observé sont mis à jour suivant le profil. Une ambiguïté de taille, de type, d'ordinal, de compteur, de pointeur ou de recouvrement interrompt la transaction.
+
+Ce chemin a été validé dans Pro Tools sur des suppressions simple en première/milieu/dernière position, doubles adjacentes et non adjacentes, aux extrémités, et triple. Il ne prend pas en charge une piste peuplée (clips, fades, groupes, automation ou tout autre événement), ni MIDI, vidéo, routing, inserts, sends, playlists alternatives ou layouts de miroirs non observés.
 
 ### 4.2 Événement `0x1050 → 0x104f`
 
@@ -569,6 +587,22 @@ Le premier segment brut de chaque `0x2077` lu par l'API possède :
 
 `get_markers()` exige des index uniques dans toutes les règles reconnues et convertit le premier timestamp en timecode. Sans règle reconnue ou sans marqueur, il retourne `[]`.
 
+### 8.1 Catalogue des règles de markers et filtre de lecture
+
+Le profil natif multi-règle vérifié contient une unique racine `0x2519`, un enfant direct `0x251b`, puis des entrées directes `0x251c`. Une entrée de règle a le payload exact suivant :
+
+```text
+UInt16LE ruler_id
+UInt32LE name_length
+UTF-8 name[name_length]
+0x01
+UInt32LE ruler_id
+```
+
+Les entrées `0x251c` qui n’ont pas cette forme sont des entrées UI non-règle et sont ignorées. Les `ruler_id` et noms de règle doivent être uniques. Le dernier segment brut de huit octets d’un événement marker `0x2077` est `UInt32LE(0) | UInt32LE(ruler_id)`.
+
+`get_markers(marker_track_name=None)` reste entièrement en lecture seule. Sans argument, il retourne tous les marqueurs reconnus. Avec un nom de règle, il valide le catalogue ci-dessus et l’assignation de **chaque** marker, puis retourne uniquement ceux dont l’ordinal final correspond au nom demandé. Un catalogue absent, ambigu, invalide, un nom inconnu ou une assignation inconnue est refusé par `ValueError`; aucun repli par position ou par nom de marker n’est autorisé.
+
 `add_marker()` exige :
 
 - Au moins une playlist principale entièrement valide.
@@ -723,17 +757,17 @@ L'opération complète est transactionnelle. Sans racine `0x262c`, `delete_clip_
 
 ## 13. Catalogue exhaustif des erreurs
 
-La portée d'« exhaustif » est la suivante : toutes les familles d'échecs explicitement détectées ou propagées par `pt_api.py` 1.5.1, ainsi que tous les messages Pro Tools consignés dans le corpus et l'historique des essais du projet. Elle ne prétend pas recenser les messages possibles de toutes les versions de Pro Tools.
+La portée d'« exhaustif » est la suivante : toutes les familles d'échecs explicitement détectées ou propagées par `pt_api.py` 1.5.2, ainsi que tous les messages Pro Tools consignés dans le corpus et l'historique des essais du projet. Elle ne prétend pas recenser les messages possibles de toutes les versions de Pro Tools.
 
-Le source courant contient 685 instructions `raise` : 584 `ValueError`, 55 `TypeError`, 10 `NotImplementedError`, 12 `OverflowError`, 8 `FileNotFoundError`, 3 `FileExistsError`, 1 `OSError` et 12 relances nues de l'exception originale.
+Le source courant contient 775 instructions `raise` : 669 `ValueError`, 58 `TypeError`, 11 `NotImplementedError`, 12 `OverflowError`, 8 `FileNotFoundError`, 3 `FileExistsError`, 1 `OSError` et 13 relances nues de l'exception originale.
 
 ### 13.1 Messages observés dans Pro Tools
 
 | Message affiché | Causes techniques couvertes | Prévention/réparation |
 |---|---|---|
-| **Magic ID does not match** | `0x0001` pointe au mauvais offset; un enregistrement standard ou un offset secondaire de `0x0002` est obsolète; un bloc a été supprimé sans purger son pointeur; une relocalisation a utilisé un offset dupliqué. | Recalculer tous les offsets, patcher `0x0001`, relocaliser `0x0002`, purger exactement les enregistrements des blocs supprimés et refuser les `original_offset` dupliqués. |
+| **Magic ID does not match** | `0x0001` pointe au mauvais offset; un enregistrement standard ou un offset secondaire de `0x0002` est obsolète; un bloc a été supprimé sans purger son pointeur; une relocalisation a utilisé un offset dupliqué; un miroir brut de suppression de piste a été conservé ou mal compacté. | Recalculer tous les offsets, patcher `0x0001`, relocaliser `0x0002`, purger exactement les enregistrements et groupes de métadonnées natifs supprimés, puis refuser les `original_offset` dupliqués. |
 | **Unexpected stream type** | Un faux bloc a été créé par un `0x5A` fortuit; `block_type`, taille ou `content_type` ne correspondent plus au flux attendu; l'ordre ou l'enveloppe d'un bloc a été altéré. | Garder les payloads fixes à plat, conserver les octets opaques, sérialiser l'en-tête générique dans l'ordre exact et ne générer que les dispositions vérifiées. |
-| **End of stream** | Bloc/payload tronqué; taille déclarée trop grande; compteur de `0x0002`, `0x1054`, `0x1052`, `0x2030`, `0x2424`, `0x2426`, `0x262a`, `0x262c`, `0x2630`, `0x2637` ou `0x260a` supérieur aux données réelles; compteur de série `0x0002` non ajusté; table `0x0002` amputée par un faux enfant; ajout de padding d'alignement; longueur de nom décalant la queue. | Valider toutes les tailles et compteurs avant mutation/sauvegarde, ne jamais aligner artificiellement les chaînes/blocs, garder `0x0002` plat et retirer uniquement les 15 octets d'un enregistrement standard. |
+| **End of stream** | Bloc/payload tronqué; taille déclarée trop grande; compteur de `0x0002`, `0x1054`, `0x1052`, `0x2030`, `0x2424`, `0x2426`, `0x262a`, `0x262c`, `0x2630`, `0x2637` ou `0x260a` supérieur aux données réelles; compteur de série `0x0002` non ajusté; table `0x0002` amputée par un faux enfant; ajout de padding d'alignement; longueur de nom décalant la queue. | Valider toutes les tailles et compteurs avant mutation/sauvegarde, ne jamais aligner artificiellement les chaînes/blocs, garder `0x0002` plat et retirer uniquement les records standards ou groupes de métadonnées explicitement vérifiés. |
 | **Cannot open the selected file because end of stream encountered** | Variante d'interface du même échec **End of stream**, observée lors des premiers essais de dissolution de Clip Group et de crossfade dont la structure sérialisée était incomplète. | Appliquer les mêmes contrôles que pour **End of stream**, en particulier compteurs, padding, payloads fixes et intégrité complète de `0x0002`. |
 
 ### 13.2 Exceptions de l'API
@@ -744,6 +778,7 @@ Le source courant contient 685 instructions `raise` : 584 `ValueError`, 55 `Type
 | `ValueError` — enveloppe et temps | Chemin vide; fichier/en-tête trop court; signature/version/endianness/mode XOR invalide; delta XOR introuvable; sample rate non fini, non positif ou hors UInt32; cadence inconnue; composant/timecode/drop-frame invalide; sample négatif; conversion temporelle non représentable. |
 | `ValueError` — arbre, parsing et sauvegarde | `block_type`, `content_type`, tailles ou offsets hors bornes; profondeur >128; cycle; `original_offset` dupliqué; `0x0001` absent/invalide/mal placé; `0x0002` absent/dupliqué/non final/non EOF/non plat/vide; liaison `0x0001→0x0002` fausse; record/suffixe/compteur de série `0x0002` invalide; cible de pointeur inconnue; relocalisations chevauchantes; métadonnées `0x1028`/`0x204d` absentes, dupliquées ou tronquées. |
 | `ValueError` — pistes et événements | Racines `0x1054` ambiguës; compteurs `0x1054`/`0x1052` incohérents; header, nom UTF-8, compteur ou structure `0x1050→0x104f` invalide; queue audio inconnue; ID de clip timeline inconnu; piste/placement absent ou ambigu; timestamp cible hors champ de stockage; pool de pistes dans le profil UI pré-normalisation observé, qui doit être ouvert et sauvegardé une fois dans Pro Tools avant son premier renommage. |
+| `TypeError` / `ValueError` / `NotImplementedError` — suppression de pistes | `track_names` est une chaîne, n'est pas itérable, est vide, contient un nom non `str`, vide, NUL ou dupliqué; nom absent; tentative de supprimer toutes les pistes; miroir unique `0x1054`/`0x1015`/`0x2107`/`0x2519`/`0x2587`/`0x2624`/`0x202b` absent, ambigu, tronqué, mal ordonné ou incohérent; liste/compteur/ordinal/pointeur brut `0x0002` non natif; ou playlist contenant un événement. Le dernier cas retourne `NotImplementedError`; tous les autres rejets se produisent avant écriture. |
 | `ValueError` — clips et noms | `0x262a`/`0x262c` ambigu, compteur ou définition invalide; `0x2628` tronqué, nom UTF-8 invalide, flag audio/groupe inconnu ou sélecteur de largeur autre que `0x10`/`0x20`/`0x30`/`0x40`; clip absent/ambigu; nouveau nom vide, NUL, non UTF-8, trop long ou déjà présent; ID source inconnu; modèle `0x2629` sans unique identité 48 octets; offset/longueur de sous-clip direct négatif, nul ou hors UInt32; layout offset nul/longueur UInt32 ou offset UInt32/longueur UInt32 non vérifié. |
 | `ValueError` — média physique et relink | RIFF/WAVE invalide, big-endian, tronqué, de taille ou d'alignement incohérent; chunk `bext`/`minf`/`regn`/`umid` absent, dupliqué ou trop court; `fmt ` ou `data` du clone/rendu absent, dupliqué ou tronqué; rendu autre que PCM/WAVE_EXTENSIBLE PCM, format PCM incompatible ou taille `data` différente; UMID, stem complet ou abrégé, paire de tokens ou références temporelles `bext`/`regn` invalides ou non concordantes avec le PTX; basename source différent du catalogue PTX ou du stem `regn`; chemin source et destination identiques; extension autre que `.wav`; stems non UTF-8, identiques ou de longueurs UTF-8 différentes; catalogue `0x1004`/`0x103a`, compteurs, noms, ordinaux ou index média invalides/ambigus; suffixe d'enregistrement WAV inconnu ou mélange des variantes `EVAW`/nulle; queue `0x103a` tronquée, sans nœud parent, avec libellé vide/NUL/non UTF-8, marqueur inconnu, terminaison invalide ou compteurs non conformes à `N+1..N+K`, `N+K+2`, `N+K+1`; nouveau nom physique déjà catalogué ou trop long; enregistrements fixes `0x2629` de 48/104 octets impossibles à réassembler ou mal ordonnés; `0x1001`, `0x2628`, ou header source `0x2106` absent, ambigu, tronqué ou de layout inconnu; header `0x2106` source <142 octets; layout source hors du parent/racine spécial ou des flags natifs de production `0x0000`/`0x0001`/`0x2000`/`0x2001`/`0x3000`/`0x3001`/`0x4001`; référence BWF différente de celle du header source; timestamp relink hors UInt32; nouvelle définition de clip en collision; placement exact absent ou ambigu. |
 | `ValueError` — relink Premiere | Header source `0x2106` absent, ambigu ou <142 octets; référence BWF du WAV différente de celle lue dynamiquement dans le header source; placement antérieur à `src_offset`; variante virtuelle Premiere autre que les marqueurs observés `0x04`/`0x84` (sélecteur `0x30`, constante `0x08`). |
@@ -751,11 +786,11 @@ Le source courant contient 685 instructions `raise` : 584 `ValueError`, 55 `Type
 | `ValueError` — builder audio | Manifeste vide; descripteur sans `audio_path` ou `track_name`; nom de piste, filename physique ou nom de clip vide/NUL/non UTF-8; `physical_filename` contenant un chemin ou n'ayant pas l'extension `.wav`; filename physique ou nom de clip dupliqué sans tenir compte de la casse; placement négatif, hors UInt64 ou dont la fin dépasse UInt64; RIFF invalide; `fmt `/`fact`/`data`/`bext` absent, dupliqué, tronqué ou trop court; format autre que WAVE_EXTENSIBLE float mono 48 kHz/32 bits; byte rate, block align, valid bits ou GUID incompatibles; `data` vide/non aligné; `fact` différent de la durée ou durée hors de la largeur du profil; référence BWF hors UInt32; basic UMID nul; template autre que 48 kHz/enum `0x09`, sans piste visible, noms de pistes dupliqués, piste demandée absente, contenant un événement de timeline visible ou caché, prototype/catalogue non unique, lien média non zéro, ou mélange ne correspondant à aucun des profils stricts `15/142/UInt24` et `31/151/UInt32`; catalogue/playlist/clone incohérent; racine ou nombre de définitions générées incohérent; record fixe autre que 48/104 octets; ID de définition ou index média différent de son ordinal; nom de session vide/NUL ou contenant un séparateur; rechargement généré ne concordant pas avec le manifeste. |
 | `ValueError` — opérations de montage | Aucun placement visible; plusieurs placements; cut hors du clip ou partagé par plusieurs occurrences; source de split hors layout racine vérifié; coupe/offset source relatif hors UInt24; timestamp de coupe ou nouveau timestamp de Start Trim hors UInt32; payload audio non 35 octets; montant de trim nul/négatif/trop grand; composant d'image invalide ou label Drop Frame interdit. Toute opération transactionnelle restaure l'état avant de relancer l'erreur. |
 | `ValueError` — fondus | `0x2630` absent/dupliqué; compteur ou payload `0x262f` invalide; nombre d'événements et géométries différent; ID inconnu/dupliqué; taille géométrique autre que 22/26/27/34; association audio absente/ambiguë; début calculé négatif; durée nulle pour crossfade ou >UInt16; type/forme invalide; clip de durée nulle; cible hors clip/ambiguë; fade dépassant les bornes ou déjà existant. |
-| `ValueError` — marqueurs | Session sans playlist principale; règle `0x2030` absente/dupliquée/mal formée; compteur incohérent; payload `0x2077`, longueur ou UTF-8 invalide; index dupliqué/hors `1..65535`; timestamp hors Int64; nom NUL/non UTF-8/trop long; modèle ou zone UUID interne invalide. |
+| `TypeError` / `ValueError` — marqueurs | Session sans playlist principale; règle `0x2030` absente/dupliquée/mal formée; compteur incohérent; payload `0x2077`, longueur ou UTF-8 invalide; index dupliqué/hors `1..65535`; timestamp hors Int64; nom NUL/non UTF-8/trop long; modèle ou zone UUID interne invalide. Pour le filtre `marker_track_name` : argument non `str`, vide ou NUL; catalogue `0x2519 → 0x251b → 0x251c` absent, ambigu, tronqué, dupliqué ou non UTF-8; nom de règle absent; segment final d’assignation `0x2077` absent, de longueur autre que 8, réservé non nul ou ordinal inconnu. |
 | `ValueError` — Clip Gain | Dictionnaire `0x2637` absent/dupliqué/mal formé; compteur/taille incohérent; index de définition hors dictionnaire; gain `NaN`/`+inf` ou hors Float32; payload de clip trop court. |
 | `ValueError` — Volume | Nom de piste vide/NUL/ambigu; association visible→`0x261c` impossible; `0x2619`, `0x260d` ou `0x260a` absent/ambigu/mal formé; magic, taille, padding, terminateur, compteur de nœuds ou segments incohérent; timestamps non strictement croissants; timestamp hors UInt32; valeur non finie ou hors Int16 déci-dB. |
 | `ValueError` — Clip Groups | Nom vide, NUL ou UTF-8 invalide; groupe absent ou nom déjà défini; `start_samples`/`length_samples` non entier, négatif, nul (durée) ou hors UInt32, ou fin hors UInt32; racines, compteurs, noms UTF-8 ou métadonnées `0x262c`/`0x2428`/`0x2424`/`0x2426` incohérents; template vide hors 48 kHz/enum `0x09`; groupe existant ou piste cible hors profil vide vérifié; prototype non placé/placé plusieurs fois; source audio cible absente ou ambiguë; payload `0x2628`/`0x2523`/`0x2423`/`0x2425` ou queue/flag de macro non conformes; playlist cachée vide/mal formée pour la dissolution ou non vide pour la création audio-backed; enregistrement `0x0002` prototype absent/ambigu; macro visible `00 00 01` dont l'ID ordinal n'existe pas dans `0x262c`. |
-| `NotImplementedError` | Exactement dix refus explicites : création de groupe vide au-delà de l'ID 255 dans le trailer vérifié; création audio-backed au-delà de la limite de son trailer vérifié; session contenant plus d'un Clip Group pour la dissolution; groupe de dissolution contenant plus d'une piste; groupe de dissolution imbriqué/avec fade/événement non audio; groupe de dissolution placé zéro ou plusieurs fois au lieu d'une; move avec fade attaché; duplicate avec fade attaché; split avec fade attaché; trim avec fade attaché. |
+| `NotImplementedError` | Exactement onze refus explicites : piste non vide pour `delete_tracks()`; création de groupe vide au-delà de l'ID 255 dans le trailer vérifié; création audio-backed au-delà de la limite de son trailer vérifié; session contenant plus d'un Clip Group pour la dissolution; groupe de dissolution contenant plus d'une piste; groupe de dissolution imbriqué/avec fade/événement non audio; groupe de dissolution placé zéro ou plusieurs fois au lieu d'une; move avec fade attaché; duplicate avec fade attaché; split avec fade attaché; trim avec fade attaché. |
 | `OverflowError` | Offset de bloc sérialisé hors UInt32; payload `PTBlock` hors champ de taille UInt32; bloc dépassant l'espace fichier UInt32; timestamp restauré d'un groupe ou fin calculée d'un placement de Clip Group hors UInt64; nouvel index de point Clip Gain hors Int32 signé; nouvel ID de clip, index média de relink ou compteurs de noms physiques hors UInt32. |
 | `FileNotFoundError` | Fichier d'entrée absent (propagé nativement); dossier de destination inexistant pour `xor_session()`/`save()`; WAV source ou WAV de remplacement absent, ou dossier du nouveau WAV inexistant pour `relink_clip()`; template/WAV source du builder absent ou parent du dossier de livraison inexistant. |
 | `FileExistsError` | Le chemin du nouveau WAV demandé à `relink_clip()` existe déjà; le dossier cible du builder existe avant l'appel ou apparaît pendant la génération. Aucun écrasement n'est permis. |

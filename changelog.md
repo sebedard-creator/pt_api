@@ -1,5 +1,12 @@
 # Pro Tools API - Changelog
 
+## v1.5.2 (Track deletion and marker-ruler filtering) - 2026-08-15
+
+- **Suppression sûre de pools Audio vides** : ajout de `ProToolsSession.delete_tracks(track_names)`. La méthode accepte toute combinaison non vide de noms uniques dans le profil natif validé, conserve au moins une piste et refuse toute playlist contenant des événements. Elle compacte les miroirs `0x1054`, `0x1015`, `0x2107`, `0x2519`, `0x2587`, `0x2624` et `0x202b`; les états `0x2589` sont écrits dans l'ordre canonique de leurs IDs. La sauvegarde retire aussi les records et groupes de métadonnées `0x0002` explicitement validés, avec leurs compteurs associés, plutôt que de laisser des références obsolètes.
+- **Validation native exhaustive du profil** : Pro Tools a ouvert les sorties de suppressions simple, en tête, au milieu, en fin, doubles adjacentes/non adjacentes, aux extrémités et triple. Le résultat correspondait à chaque liste de pistes attendue. Les templates à pistes peuplées, les structures ambigües et les profils de miroirs inconnus restent rejetés sans mutation.
+
+- **Lecture ciblée de markers** : `get_markers(marker_track_name=None)` accepte maintenant le nom visible d’une règle de markers native. Sur le profil multi-règle vérifié, l’API associe le `ruler_id` final de chaque `0x2077` au catalogue `0x2519 → 0x251b → 0x251c`, puis retourne uniquement les markers de la règle demandée avec leur index, nom et timecode. Le chemin est strictement en lecture seule; les catalogues ou assignations ambigus sont rejetés, sans heuristique. Les sessions comparatives avant/après renommage ont confirmé que seul le catalogue de règle change et que les événements restent associés au bon nom.
+
 ## v1.5.1 (Track visibility suffix compatibility) - 2026-08-13
 
 - **Visibilité de pool assouplie sans perte** : `set_visible_tracks()` n'exige plus que le UInt16 opaque final d'un flag `0x251a` vaille `FE FF`. Pro Tools peut employer une valeur différente par piste dans une même template sauvegardée nativement. L'API valide désormais les neuf octets structurels, modifie seulement l'octet de visibilité à `+4` et préserve le suffixe natif intact. Une régression couvre des suffixes distincts; l’intégration a ouvert avec succès une template native avec les pistes demandées visibles et un Clip Group vide.

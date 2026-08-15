@@ -215,6 +215,51 @@ class RepeatedSaveOffsetTests(unittest.TestCase):
             struct.pack(">H", 1) + parent_record,
         )
 
+    def test_pointer_purge_uses_captured_starts_after_relocation(self):
+        session = ProToolsSession.__new__(ProToolsSession)
+        first_record = PREFIX_0002 + struct.pack("<I", 100) + b"\x00\x00\x00"
+        second_record = PREFIX_0002 + struct.pack("<I", 200) + b"\x00\x00\x00"
+        pointer_table = PTBlock(1, 0x0002, 1)
+        pointer_table.items = [
+            bytearray(struct.pack(">H", 2) + first_record + second_record)
+        ]
+
+        # The first live record is relocated onto the stale address 200. Its
+        # original record position, not its post-relocation value, determines
+        # which record may be deleted.
+        struct.pack_into("<I", pointer_table.items[0], 2 + 8, 200)
+        purged = session._purge_0002_records(
+            pointer_table, [100], False, record_starts={2}
+        )
+
+        self.assertEqual(purged, 1)
+        self.assertEqual(
+            pointer_table.items[0],
+            struct.pack(">H", 1) + second_record,
+        )
+
+    def test_pointer_purge_removes_a_captured_metadata_group_with_record(self):
+        session = ProToolsSession.__new__(ProToolsSession)
+        record = PREFIX_0002 + struct.pack("<I", 100) + b"\x00\x00\x00"
+        pointer_table = PTBlock(1, 0x0002, 1)
+        pointer_table.items = [
+            bytearray(b"HEAD" + struct.pack(">H", 1) + record + b"TAIL")
+        ]
+
+        purged = session._purge_0002_records(
+            pointer_table,
+            [100],
+            False,
+            record_starts={6},
+            metadata_spans=[(6, 21)],
+        )
+
+        self.assertEqual(purged, 1)
+        self.assertEqual(
+            pointer_table.items[0],
+            b"HEAD" + struct.pack(">H", 0) + b"TAIL",
+        )
+
     def test_pointer_table_reassembly_preserves_bytes_and_rejects_blocks(self):
         session = ProToolsSession.__new__(ProToolsSession)
         pointer_table = PTBlock(1, 0x0002, 1)
@@ -272,6 +317,31 @@ class RepeatedSaveOffsetTests(unittest.TestCase):
         )
         self.assertEqual(patched, 1)
         self.assertEqual(pointer_table.items[0], expected)
+
+    def test_rebuild_keeps_one_source_aligned_metadata_offset(self):
+        session = ProToolsSession.__new__(ProToolsSession)
+        # The real pointer begins at payload offset 4.  With the normal
+        # seven-byte block header and an original block offset of 1, that
+        # source-file position is 4-byte aligned; the apparent value one byte
+        # later is not.
+        pointer_table = PTBlock(1, 0x0002, 1)
+        pointer_table.original_offset = 1
+        pointer_table.items = [
+            bytearray(b"HEAD" + struct.pack("<I", 0x0002E8CB) + b"TAIL")
+        ]
+
+        patched = session._rebuild_0002(
+            pointer_table,
+            {0x0002E8CB: 0x0002E23B, 744: 738},
+            False,
+        )
+
+        self.assertEqual(patched, 1)
+        self.assertEqual(
+            pointer_table.items[0],
+            b"HEAD" + struct.pack("<I", 0x0002E23B) + b"TAIL",
+        )
+
 
 
 if __name__ == "__main__":

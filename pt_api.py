@@ -8,7 +8,7 @@ from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.5.1"
+__version__ = "1.5.2"
 
 
 _TEMPLATE_AUDIO_IEEE_FLOAT_SUBFORMAT = bytes.fromhex(
@@ -1008,6 +1008,11 @@ class ProToolsSession:
         # longer appear in global_mapping at save() time, so their stale
         # 0x0002 records must be purged explicitly instead of left dangling.
         self._removed_offsets = []
+        # ``delete_tracks()`` also has to remove three non-standard 0x0002
+        # metadata mirrors.  Keep the original content type for the blocks
+        # it removes so that save() can identify those mirrors strictly,
+        # rather than guessing from a relocated offset value.
+        self._removed_block_types = {}
 
     @staticmethod
     def _is_initial_pointer_block(item):
@@ -1097,6 +1102,15 @@ class ProToolsSession:
             for child in node.items:
                 self._collect_offsets_recursive(child, out)
 
+    @staticmethod
+    def _collect_offset_types_recursive(node, out):
+        """Record original PTBlock offsets and content types before removal."""
+        if isinstance(node, PTBlock):
+            if node.original_offset and node.original_offset > 0:
+                out[node.original_offset] = node.content_type
+            for child in node.items:
+                ProToolsSession._collect_offset_types_recursive(child, out)
+
     def get_tracks(self):
         """Returns a list of all track names in the session."""
         return [name for _, name, _ in self._validated_main_playlists()]
@@ -1131,8 +1145,10 @@ class ProToolsSession:
         if old_name == new_name:
             return 0
 
+        if not hasattr(self, "_removed_offsets"):
+            self._removed_offsets = []
         original_root_items = copy.deepcopy(self.root_items)
-        original_removed_offsets = list(getattr(self, "_removed_offsets", []))
+        original_removed_offsets = list(self._removed_offsets)
         try:
             return self._rename_track_impl(old_name, new_name, old_name_bytes, new_name_bytes)
         except Exception:
@@ -1506,6 +1522,473 @@ class ProToolsSession:
             self._removed_offsets = original_removed_offsets
             raise
 
+    def delete_tracks(self, track_names):
+        """Delete verified empty native Audio-track slots from a template.
+
+        The operation is deliberately template-oriented: every Audio playlist
+        in the session must be empty and the session must use the observed
+        native mirrors for ``0x1054``, ``0x1015``, ``0x2107``, ``0x2519``,
+        ``0x2587`` and ``0x2624``.  It does not attempt to infer how Pro Tools
+        deletes tracks containing timeline events, groups, fades, automation,
+        routing, or other unverified state.
+        """
+        if isinstance(track_names, (str, bytes)):
+            raise TypeError("track_names must be an iterable of track-name strings.")
+        try:
+            names_to_delete = list(track_names)
+        except TypeError as exc:
+            raise TypeError("track_names must be an iterable of track-name strings.") from exc
+        if not names_to_delete:
+            raise ValueError("At least one track name must be supplied.")
+        if any(
+            not isinstance(name, str) or not name or "\x00" in name
+            for name in names_to_delete
+        ):
+            raise ValueError("Track names must be non-empty strings without NUL.")
+        if len(set(names_to_delete)) != len(names_to_delete):
+            raise ValueError("track_names must not contain duplicates.")
+
+        if not hasattr(self, "_removed_offsets"):
+            self._removed_offsets = []
+        if not hasattr(self, "_removed_block_types"):
+            self._removed_block_types = {}
+        original_root_items = copy.deepcopy(self.root_items)
+        original_removed_offsets = list(self._removed_offsets)
+        original_removed_block_types = dict(self._removed_block_types)
+        try:
+            return self._delete_tracks_impl(names_to_delete)
+        except Exception:
+            self.root_items = original_root_items
+            self._removed_offsets = original_removed_offsets
+            self._removed_block_types = original_removed_block_types
+            raise
+
+    def _delete_tracks_impl(self, names_to_delete):
+        """Implement :meth:`delete_tracks` after common input validation."""
+        playlists = self._validated_main_playlists()
+        all_names = [name for _, name, _ in playlists]
+        unknown = sorted(set(names_to_delete).difference(all_names))
+        if unknown:
+            raise ValueError(f"Track '{unknown[0]}' not found.")
+        if len(names_to_delete) >= len(all_names):
+            raise ValueError("At least one Audio track must remain in the session.")
+        if any(events for _, _, events in playlists):
+            raise NotImplementedError(
+                "delete_tracks supports only templates whose Audio tracks are empty."
+            )
+
+        removed_indices = {
+            index for index, name in enumerate(all_names)
+            if name in names_to_delete
+        }
+        kept = [
+            (index, playlist, name)
+            for index, (playlist, name, _) in enumerate(playlists)
+            if index not in removed_indices
+        ]
+        kept_names = [name for _, _, name in kept]
+        old_count = len(all_names)
+        new_count = len(kept)
+
+        def exact_root(content_type, label):
+            roots = self._root_blocks(content_type)
+            if len(roots) != 1:
+                raise ValueError(f"Unsupported {label} layout.")
+            return roots[0]
+
+        def direct_blocks(container, content_type):
+            return [
+                item for item in container.items
+                if isinstance(item, PTBlock) and item.content_type == content_type
+            ]
+
+        def replace_count(container, item_index, offset, expected, value, label):
+            if item_index >= len(container.items) or not isinstance(
+                container.items[item_index], (bytes, bytearray)
+            ):
+                raise ValueError(f"Invalid {label} counter payload.")
+            payload = bytearray(container.items[item_index])
+            if offset < 0 or offset + 4 > len(payload):
+                raise ValueError(f"Invalid {label} counter payload.")
+            if struct.unpack_from("<I", payload, offset)[0] != expected:
+                raise ValueError(f"Inconsistent {label} counter.")
+            struct.pack_into("<I", payload, offset, value)
+            container.items[item_index] = payload
+
+        def prefixed_name(payload, offset, label):
+            if not isinstance(payload, (bytes, bytearray)) or offset < 0:
+                raise ValueError(f"Invalid {label} payload.")
+            if offset + 4 > len(payload):
+                raise ValueError(f"Invalid {label} name length.")
+            length = struct.unpack_from("<I", payload, offset)[0]
+            end = offset + 4 + length
+            if end > len(payload) or length == 0:
+                raise ValueError(f"Invalid {label} name length.")
+            try:
+                name = bytes(payload[offset + 4:end]).decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"Invalid UTF-8 {label} name.") from exc
+            if "\x00" in name:
+                raise ValueError(f"Invalid {label} name.")
+            return name, end
+
+        def collect_removed(block):
+            self._collect_offset_types_recursive(block, self._removed_block_types)
+            self._collect_offsets_recursive(block, self._removed_offsets)
+
+        # The main timeline owns the visible Audio playlists.  Its count and
+        # every selected empty playlist are removed together.
+        track_map = exact_root(0x1054, "0x1054 track map")
+        timeline_blocks = direct_blocks(track_map, 0x1052)
+        if timeline_blocks != [playlist for playlist, _, _ in playlists]:
+            raise ValueError("Unsupported 0x1054 playlist ordering.")
+        replace_count(track_map, 0, 0, old_count, new_count, "0x1054")
+        removed_playlist_ids = {id(playlists[index][0]) for index in removed_indices}
+        track_map.items = [
+            item for item in track_map.items
+            if not (
+                isinstance(item, PTBlock)
+                and item.content_type == 0x1052
+                and id(item) in removed_playlist_ids
+            )
+        ]
+        for index in removed_indices:
+            collect_removed(playlists[index][0])
+
+        # ``0x1014`` is the only surviving name mirror whose two ordinals are
+        # compacted by native Pro Tools after a deletion.
+        root_1015 = exact_root(0x1015, "0x1015 track descriptor")
+        descriptors = direct_blocks(root_1015, 0x1014)
+        descriptor_names = []
+        for index, descriptor in enumerate(descriptors):
+            if len(descriptor.items) != 1:
+                raise ValueError("Invalid 0x1014 track descriptor.")
+            payload = bytearray(descriptor.items[0])
+            name, name_end = prefixed_name(payload, 0, "0x1014 track")
+            if len(payload) != name_end + 39:
+                raise ValueError("Unsupported 0x1014 track descriptor layout.")
+            for ordinal_offset in (name_end + 5, name_end + 30):
+                if struct.unpack_from("<I", payload, ordinal_offset)[0] != index:
+                    raise ValueError("Inconsistent 0x1014 track ordinal.")
+            descriptor_names.append(name)
+        if descriptor_names != all_names:
+            raise ValueError("Unsupported 0x1014 track descriptor ordering.")
+        replace_count(root_1015, 0, 0, old_count, new_count, "0x1015")
+        descriptor_by_name = dict(zip(all_names, descriptors))
+        for new_index, (_, _, name) in enumerate(kept):
+            descriptor = descriptor_by_name[name]
+            payload = bytearray(descriptor.items[0])
+            _, name_end = prefixed_name(payload, 0, "0x1014 track")
+            struct.pack_into("<I", payload, name_end + 5, new_index)
+            struct.pack_into("<I", payload, name_end + 30, new_index)
+            descriptor.items[0] = payload
+        removed_descriptor_ids = {id(descriptor_by_name[all_names[index]]) for index in removed_indices}
+        root_1015.items = [
+            item for item in root_1015.items
+            if not (
+                isinstance(item, PTBlock)
+                and item.content_type == 0x1014
+                and id(item) in removed_descriptor_ids
+            )
+        ]
+        for index in removed_indices:
+            collect_removed(descriptor_by_name[all_names[index]])
+
+        # The second native name mirror has stable per-track identity bytes;
+        # only its count and selected direct records are removed.
+        root_2107 = exact_root(0x2107, "0x2107 track metadata")
+        if (
+            not root_2107.items
+            or not isinstance(root_2107.items[0], (bytes, bytearray))
+            or len(root_2107.items[0]) != 13
+            or bytes(root_2107.items[0])[:9] != b"\x00" * 8 + b"\x01"
+        ):
+            raise ValueError("Unsupported 0x2107 track metadata header.")
+        metadata = direct_blocks(root_2107, 0x210B)
+        metadata_names = []
+        for field in metadata:
+            if len(field.items) != 1:
+                raise ValueError("Invalid 0x210b track metadata.")
+            metadata_names.append(prefixed_name(field.items[0], 4, "0x210b track")[0])
+        if metadata_names != all_names:
+            raise ValueError("Unsupported 0x210b track metadata ordering.")
+        replace_count(root_2107, 0, 9, old_count, new_count, "0x2107")
+        metadata_by_name = dict(zip(all_names, metadata))
+        removed_metadata_ids = {id(metadata_by_name[all_names[index]]) for index in removed_indices}
+        root_2107.items = [
+            item for item in root_2107.items
+            if not (
+                isinstance(item, PTBlock)
+                and item.content_type == 0x210B
+                and id(item) in removed_metadata_ids
+            )
+        ]
+        for index in removed_indices:
+            collect_removed(metadata_by_name[all_names[index]])
+
+        # ``0x2519`` holds the aggregate display order and two complete
+        # per-track display mirrors.  The tested deletion profile has every
+        # slot shown, so native statuses are compact 1..N values.
+        root_2519 = exact_root(0x2519, "0x2519 track display")
+        if not root_2519.items or not isinstance(root_2519.items[0], (bytes, bytearray)):
+            raise ValueError("Invalid 0x2519 aggregate payload.")
+        aggregate = bytes(root_2519.items[0])
+        if len(aggregate) < 22 or struct.unpack_from("<I", aggregate, 14)[0] != old_count:
+            raise ValueError("Unsupported 0x2519 aggregate layout.")
+        aggregate_starts = []
+        for name in all_names:
+            token = struct.pack("<I", len(name.encode("utf-8"))) + name.encode("utf-8")
+            start = aggregate.find(token)
+            if start < 20 or aggregate.find(token, start + 1) >= 0:
+                raise ValueError("Unsupported 0x2519 aggregate name layout.")
+            aggregate_starts.append(start)
+        if aggregate_starts != sorted(aggregate_starts) or aggregate_starts[0] != 20:
+            raise ValueError("Unsupported 0x2519 aggregate ordering.")
+        aggregate_tail = aggregate[-2:]
+        aggregate_records = {}
+        for index, (name, start) in enumerate(zip(all_names, aggregate_starts)):
+            end = aggregate_starts[index + 1] if index + 1 < old_count else len(aggregate) - 2
+            record = bytearray(aggregate[start:end])
+            token = struct.pack("<I", len(name.encode("utf-8"))) + name.encode("utf-8")
+            marker = record.find(b"\x2a\x00\x00\x00", len(token))
+            if marker < 0 or marker + 13 > len(record) or record[marker + 12] != index + 1:
+                raise ValueError("Unsupported 0x2519 aggregate visibility layout.")
+            aggregate_records[name] = (record, marker + 12)
+        aggregate_header = bytearray(aggregate[:20])
+        struct.pack_into("<I", aggregate_header, 14, new_count)
+        rebuilt_aggregate = bytearray(aggregate_header)
+        for new_index, (_, _, name) in enumerate(kept, start=1):
+            record, status_offset = aggregate_records[name]
+            record[status_offset] = new_index
+            # When the final original track is removed, the four zero bytes
+            # between the last retained record and the first removed name are
+            # removed with that trailing record by native Pro Tools. Keeping
+            # them produces a malformed 0x2519 aggregate despite otherwise
+            # valid per-track display entries.
+            if name == kept_names[-1] and old_count - 1 in removed_indices:
+                if bytes(record[-4:]) != b"\x00" * 4:
+                    raise ValueError("Unsupported trailing 0x2519 aggregate layout.")
+                record = record[:-4]
+            rebuilt_aggregate.extend(record)
+        rebuilt_aggregate.extend(aggregate_tail)
+
+        display_indices = [
+            index for index, item in enumerate(root_2519.items)
+            if isinstance(item, PTBlock) and item.content_type == 0x251A
+        ]
+        if (
+            len(display_indices) != 2 * old_count
+            or display_indices != list(range(1, old_count + 1))
+            + list(range(old_count + 2, 2 * old_count + 2))
+            or old_count + 1 >= len(root_2519.items)
+            or not isinstance(root_2519.items[old_count + 1], (bytes, bytearray))
+            or bytes(root_2519.items[old_count + 1]) != struct.pack("<I", old_count)
+        ):
+            raise ValueError("Unsupported 0x2519 display-mirror layout.")
+        first_display = [root_2519.items[index] for index in display_indices[:old_count]]
+        second_display = [root_2519.items[index] for index in display_indices[old_count:]]
+
+        def validate_display_group(entries):
+            result = {}
+            for index, entry in enumerate(entries):
+                if (
+                    len(entry.items) < 1
+                    or not isinstance(entry.items[0], (bytes, bytearray))
+                ):
+                    raise ValueError("Invalid 0x251a track-display payload.")
+                payload = bytearray(entry.items[0])
+                name, name_end = prefixed_name(payload, 2, "0x251a track")
+                if name not in all_names or name in result:
+                    raise ValueError("Ambiguous 0x251a track-display name.")
+                marker = payload.find(b"\x2a\x00\x00\x00", name_end)
+                if marker < 0 or marker + 13 > len(payload):
+                    raise ValueError("Unsupported 0x251a track-display layout.")
+                expected = all_names.index(name) + 1
+                if payload[marker + 12] != expected:
+                    raise ValueError("Unsupported 0x251a track-display visibility.")
+                result[name] = (entry, payload, marker + 12)
+            if set(result) != set(all_names):
+                raise ValueError("Incomplete 0x251a track-display mirror.")
+            return result
+
+        first_by_name = validate_display_group(first_display)
+        second_by_name = validate_display_group(second_display)
+        for new_index, (_, _, name) in enumerate(kept, start=1):
+            for entry, payload, status_offset in (first_by_name[name], second_by_name[name]):
+                payload[status_offset] = new_index
+                entry.items[0] = payload
+        for index in removed_indices:
+            name = all_names[index]
+            collect_removed(first_by_name[name][0])
+            collect_removed(second_by_name[name][0])
+        root_2519.items = [
+            rebuilt_aggregate,
+            *[first_by_name[name][0] for name in kept_names],
+            bytearray(struct.pack("<I", new_count)),
+            *[second_by_name[name][0] for name in kept_names],
+            *root_2519.items[2 * old_count + 2:],
+        ]
+
+        # The native state map is keyed by its UInt16 ID, not by the textual
+        # Audio name.  A deletion compacts its allowed ID domain to 0..N-1;
+        # the established block order is deliberately preserved.
+        root_2587 = exact_root(0x2587, "0x2587 track state")
+        state_containers = root_2587.get_all_blocks(0x258A)
+        if len(state_containers) != 1:
+            raise ValueError("Unsupported 0x258a track-state layout.")
+        state_container = state_containers[0]
+        if (
+            len(state_container.items) < 2
+            or not isinstance(state_container.items[1], (bytes, bytearray))
+            or bytes(state_container.items[1]) != struct.pack("<I", old_count)
+        ):
+            raise ValueError("Invalid 0x258a track-state counter.")
+        states = direct_blocks(state_container, 0x2589)
+        if len(states) != old_count:
+            raise ValueError("Unsupported 0x2589 track-state count.")
+        states_by_id = {}
+        for state in states:
+            if not state.items or not isinstance(state.items[0], (bytes, bytearray)):
+                raise ValueError("Invalid 0x2589 track-state payload.")
+            payload = bytes(state.items[0])
+            if len(payload) != 6 or payload[2:] != b"\x01\x00\x3d\x00":
+                raise ValueError("Unsupported 0x2589 track-state layout.")
+            state_id = struct.unpack_from("<H", payload, 0)[0]
+            if state_id in states_by_id:
+                raise ValueError("Duplicate 0x2589 track-state ID.")
+            states_by_id[state_id] = state
+        if set(states_by_id) != set(range(old_count)):
+            raise ValueError("Incomplete 0x2589 track-state IDs.")
+        for state_id in range(new_count, old_count):
+            collect_removed(states_by_id[state_id])
+        state_container.items[1] = bytearray(struct.pack("<I", new_count))
+        state_container.items = [
+            item for item in state_container.items
+            if not (
+                isinstance(item, PTBlock)
+                and item.content_type == 0x2589
+                and id(item) in {
+                    id(states_by_id[state_id])
+                    for state_id in range(new_count, old_count)
+                }
+            )
+        ]
+        # Pro Tools may serialize 0x2589 in different opaque orders after a
+        # deletion. The records are otherwise identical and keyed by UInt16
+        # ID, so writing the compact ascending order keeps the result
+        # independent of the deleted names and their original positions.
+        state_positions = [
+            index for index, item in enumerate(state_container.items)
+            if isinstance(item, PTBlock) and item.content_type == 0x2589
+        ]
+        if len(state_positions) != new_count:
+            raise ValueError("Invalid compacted 0x2589 track-state layout.")
+        for position, state_id in zip(state_positions, range(new_count)):
+            state_container.items[position] = states_by_id[state_id]
+
+        # The per-slot configuration root keeps its original opaque Audio-N
+        # identity.  Native deletion removes the slot at the playlist index;
+        # it does not rename the identities of remaining slots.
+        root_2624 = exact_root(0x2624, "0x2624 track configuration")
+        slots = direct_blocks(root_2624, 0x261C)
+        if len(slots) != old_count:
+            raise ValueError("Unsupported 0x261c track-slot count.")
+        replace_count(root_2624, 0, 0, old_count, new_count, "0x2624")
+
+        # ``Audio N`` is a stable legacy label, not the active playlist
+        # ordinal.  Native deletion retains that label but rewrites the two
+        # per-slot ordinal mirrors to the compact 0..N-1 domain.  Leaving the
+        # old values in place skips the next visible playlist and makes the
+        # final slot appear as its raw ``Audio N`` name in Pro Tools.
+        for new_index, (old_index, _, _) in enumerate(kept):
+            slot = slots[old_index]
+            raw_items = [
+                (item_index, bytearray(item))
+                for item_index, item in enumerate(slot.items)
+                if isinstance(item, (bytes, bytearray))
+            ]
+            compact_records = [
+                (item_index, payload)
+                for item_index, payload in raw_items
+                if len(payload) == 12
+            ]
+            extended_records = [
+                (item_index, payload)
+                for item_index, payload in raw_items
+                if len(payload) == 24
+            ]
+            if len(compact_records) != 1 or len(extended_records) != 1:
+                raise ValueError("Unsupported 0x261c track-slot ordinal layout.")
+            compact_index, compact = compact_records[0]
+            extended_index, extended = extended_records[0]
+            if (
+                struct.unpack_from("<I", compact, 0)[0] != old_index
+                or bytes(compact[4:6]) != b"\x01\x00"
+                or struct.unpack_from("<H", compact, 6)[0] != old_index
+                or bytes(compact[8:]) != b"\x00\x00\xff\xff"
+                or bytes(extended[:17]) != b"\x00\x00\x00\x00\x02\x00\x00\x00" + b"\x00" * 9
+                or struct.unpack_from("<I", extended, 17)[0] != old_index
+                or bytes(extended[21:]) != b"\x01\x00\x00"
+            ):
+                raise ValueError("Unsupported 0x261c track-slot ordinal layout.")
+            struct.pack_into("<I", compact, 0, new_index)
+            struct.pack_into("<H", compact, 6, new_index)
+            struct.pack_into("<I", extended, 17, new_index)
+            slot.items[compact_index] = compact
+            slot.items[extended_index] = extended
+        for index in removed_indices:
+            collect_removed(slots[index])
+        removed_slot_ids = {id(slots[index]) for index in removed_indices}
+        root_2624.items = [
+            item for item in root_2624.items
+            if not (
+                isinstance(item, PTBlock)
+                and item.content_type == 0x261C
+                and id(item) in removed_slot_ids
+            )
+        ]
+
+        # Two ``0x202a`` records under the native ``0x202b`` root mirror the
+        # Audio-track index domain as a compact UInt16 list.  Keeping a stale
+        # ``0..N-1`` list after the other mirrors have become ``0..N-2`` makes
+        # Pro Tools associate one remaining slot with its legacy ``Audio N``
+        # identity.  Native deletion compacts both lists; it does not preserve
+        # holes for the removed playlist positions.
+        root_202b = exact_root(0x202B, "0x202b track-index mirror")
+        index_mirrors = direct_blocks(root_202b, 0x202A)
+        if len(index_mirrors) != 2:
+            raise ValueError("Unsupported 0x202a track-index mirror layout.")
+        old_index_list = struct.pack(
+            "<" + "H" * old_count, *range(old_count)
+        )
+        new_index_list = struct.pack(
+            "<" + "H" * new_count, *range(new_count)
+        )
+        for mirror in index_mirrors:
+            if len(mirror.items) < 1 or not isinstance(
+                mirror.items[0], (bytes, bytearray)
+            ):
+                raise ValueError("Invalid 0x202a track-index mirror payload.")
+            payload = bytearray(mirror.items[0])
+            list_offset = bytes(payload).find(old_index_list)
+            if (
+                list_offset < 4
+                or bytes(payload).find(old_index_list, list_offset + 1) >= 0
+                or list_offset + len(old_index_list) + 12 != len(payload)
+                or struct.unpack_from("<I", payload, list_offset - 4)[0] != old_count
+                or bytes(payload[-12:]) != b"\xfe\xff\x10\x80\x01\x00\x00\x00\x00\x00\xff\xff"
+            ):
+                raise ValueError("Unsupported 0x202a track-index mirror layout.")
+            mirror.items[0] = bytearray(
+                payload[:list_offset - 4]
+                + struct.pack("<I", new_count)
+                + new_index_list
+                + payload[list_offset + len(old_index_list):]
+            )
+
+        logger.info("Deleted %d empty template track(s): %s", len(names_to_delete), names_to_delete)
+        return list(names_to_delete)
+
     def _validated_main_playlists(self):
         """Return direct main playlists as (block, name, events) tuples."""
         track_maps = self._root_blocks(0x1054)
@@ -1566,10 +2049,32 @@ class ProToolsSession:
 
         return result
 
-    def get_markers(self):
-        """Returns a list of dictionaries describing session markers.
-        Example: [{'index': 1, 'name': 'Intro', 'timecode': '00:00:10:00'}]
+    def get_markers(self, marker_track_name=None):
+        """Return validated point markers, optionally for one marker track.
+
+        ``marker_track_name`` is the visible Pro Tools marker-ruler name.  The
+        filter is read-only and uses the verified native marker-track catalogue;
+        it is intentionally not confused with an Audio playlist name.
+
+        Example: ``[{'index': 1, 'name': 'Intro',
+        'timecode': '00:00:10:00'}]``.
         """
+        if marker_track_name is not None:
+            if not isinstance(marker_track_name, str):
+                raise TypeError("Marker track name must be a string.")
+            if not marker_track_name or "\x00" in marker_track_name:
+                raise ValueError("Marker track name must be a non-empty string without NUL.")
+            marker_tracks = self._validated_marker_track_names()
+            try:
+                requested_track_id = next(
+                    track_id for track_id, name in marker_tracks.items()
+                    if name == marker_track_name
+                )
+            except StopIteration:
+                raise ValueError(f"Marker track '{marker_track_name}' not found.")
+        else:
+            requested_track_id = None
+
         engine = TimecodeEngine(self.sample_rate, self.frame_rate_enum)
         markers = []
         seen_indices = set()
@@ -1603,12 +2108,85 @@ class ProToolsSession:
                 if m_idx in seen_indices:
                     raise ValueError(f"Duplicate marker index: {m_idx}.")
                 seen_indices.add(m_idx)
+
+                if requested_track_id is not None:
+                    if (
+                        not child.items
+                        or not isinstance(child.items[-1], (bytes, bytearray))
+                        or len(child.items[-1]) != 8
+                    ):
+                        raise ValueError("Invalid marker-track assignment payload.")
+                    assignment = bytes(child.items[-1])
+                    reserved, track_id = struct.unpack("<II", assignment)
+                    if reserved != 0 or track_id not in marker_tracks:
+                        raise ValueError("Invalid marker-track assignment payload.")
+                    if track_id != requested_track_id:
+                        continue
                 markers.append({
                     'index': m_idx,
                     'name': name,
                     'timecode': engine.samples_to_timecode(tc_samples),
                 })
         return markers
+
+    def _validated_marker_track_names(self):
+        """Return the native marker-ruler ordinal-to-name catalogue.
+
+        The observed multi-ruler layout stores direct ``0x251c`` entries under
+        one ``0x251b`` in the unique ``0x2519`` root.  A marker's final
+        eight-byte payload then ends in the same UInt32 ordinal.  This helper
+        validates only that exact relationship; it is read-only.
+        """
+        roots_2519 = self._root_blocks(0x2519)
+        if len(roots_2519) != 1:
+            raise ValueError("No verified marker-track catalogue found.")
+
+        catalogues = [
+            item for item in roots_2519[0].items
+            if isinstance(item, PTBlock) and item.content_type == 0x251B
+        ]
+        if len(catalogues) != 1:
+            raise ValueError("No verified marker-track catalogue found.")
+
+        tracks = {}
+        names = set()
+        for entry in catalogues[0].items:
+            if not isinstance(entry, PTBlock) or entry.content_type != 0x251C:
+                continue
+            if (
+                len(entry.items) != 1
+                or not isinstance(entry.items[0], (bytes, bytearray))
+            ):
+                raise ValueError("Invalid marker-track catalogue entry.")
+            payload = bytes(entry.items[0])
+            if len(payload) < 11:
+                continue
+            track_id = struct.unpack_from("<H", payload, 0)[0]
+            name_length = struct.unpack_from("<I", payload, 2)[0]
+            name_end = 6 + name_length
+            if (
+                name_length == 0
+                or name_end + 5 != len(payload)
+                or payload[name_end] != 1
+                or struct.unpack_from("<I", payload, name_end + 1)[0] != track_id
+            ):
+                # ``0x251b`` also contains native non-ruler entries.  They do
+                # not carry the verified name/ordinal form and are ignored.
+                continue
+            try:
+                name = payload[6:name_end].decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("Invalid UTF-8 marker-track name.") from exc
+            if "\x00" in name:
+                raise ValueError("Invalid marker-track name.")
+            if track_id in tracks or name in names:
+                raise ValueError("Duplicate marker-track catalogue entry.")
+            tracks[track_id] = name
+            names.add(name)
+
+        if not tracks:
+            raise ValueError("No verified marker-track catalogue found.")
+        return tracks
 
     def _marker_container_layout(self, container):
         """Validate a root 0x2030 marker ruler and return its direct markers.
@@ -6830,16 +7408,260 @@ class ProToolsSession:
             payload.extend(item)
         return payload
 
-    def _purge_0002_records(self, b0002, removed_offsets, is_bigendian):
+    def _capture_0002_track_deletion_metadata(self, b0002, removed_block_types):
+        """Capture verified native 0x0002 mirrors removed by ``delete_tracks``.
+
+        Native empty Audio templates duplicate the track topology in three raw
+        0x0002 structures which the general block tree cannot represent:
+        a 0x251a pointer list, 45-byte 0x251a entries and 67-byte 0x261c
+        entries.  The entries contain normal pointer records, so their exact
+        source positions must be captured before relocation and then removed
+        as whole native records.  Any unfamiliar layout is rejected instead
+        of producing a PTX that Pro Tools could misread.
+        """
+        if self.is_bigendian:
+            raise ValueError("Track deletion requires a little-endian 0x0002 layout.")
+        tracked_types = {0x251A, 0x261C}
+        if not any(content_type in tracked_types for content_type in removed_block_types.values()):
+            return None
+
+        payload = self._raw_0002_payload(b0002)
+        records = dict(self._validate_0002_record_layout(bytes(payload)))
+        block_types = dict(removed_block_types)
+
+        def visit(node):
+            if not isinstance(node, PTBlock):
+                return
+            if node.original_offset:
+                previous = block_types.get(node.original_offset)
+                if previous is not None and previous != node.content_type:
+                    raise ValueError("Ambiguous original PTBlock offset while deleting tracks.")
+                block_types[node.original_offset] = node.content_type
+            for child in node.items:
+                visit(child)
+
+        for root in self.root_items:
+            visit(root)
+
+        roots_2519 = self._root_blocks(0x2519)
+        roots_2624 = self._root_blocks(0x2624)
+        if len(roots_2519) != 1 or len(roots_2624) != 1:
+            raise ValueError("Unsupported 0x0002 track-deletion root layout.")
+        root_2519 = roots_2519[0].original_offset
+        root_2624 = roots_2624[0].original_offset
+        if not root_2519 or not root_2624:
+            raise ValueError("Track deletion requires native original root offsets.")
+
+        def u32(position):
+            if position < 0 or position + 4 > len(payload):
+                raise ValueError("Truncated 0x0002 track-deletion metadata.")
+            return struct.unpack_from("<I", payload, position)[0]
+
+        def find_groups(child_type, parent_offset, record_offset, target_offset, size):
+            prefix = struct.pack("<H", child_type) + struct.pack("<I", parent_offset)
+            result = []
+            for start in range(0, len(payload) - size + 1):
+                if payload[start] != 1 or bytes(payload[start + 5:start + 11]) != prefix:
+                    continue
+                ordinal = u32(start + 1)
+                record_start = start + record_offset
+                pointer_position = records.get(record_start)
+                if pointer_position is None:
+                    raise ValueError("Unsupported 0x0002 track-deletion group record.")
+                target = u32(pointer_position)
+                if block_types.get(target) != target_offset:
+                    raise ValueError("Unsupported 0x0002 track-deletion group target.")
+                result.append((start, ordinal, target, record_start))
+            if not result:
+                raise ValueError("Missing 0x0002 track-deletion metadata groups.")
+            result.sort()
+            if [ordinal for _, ordinal, _, _ in result] != list(range(1, len(result) + 1)):
+                raise ValueError("Non-native 0x0002 track-deletion group ordinals.")
+            return result
+
+        # A second display entry carries its 0x251a target in the normal
+        # record at +17.  A configuration entry carries its 0x261c target in
+        # the direct raw pointer at +18 and its normal child record at +39.
+        display_groups = find_groups(0x251A, root_2519, 17, 0x251A, 45)
+        slot_groups = find_groups(0x261C, root_2624, 39, 0x2627, 67)
+        track_count = len(display_groups)
+        if len(slot_groups) != track_count:
+            raise ValueError("Inconsistent 0x0002 track-deletion group counts.")
+        for start, ordinal, _, record_start in slot_groups:
+            if block_types.get(u32(start + 18)) != 0x261C:
+                raise ValueError("Unsupported 0x261c raw metadata target.")
+            if block_types.get(u32(start + 29)) != 0x261B:
+                raise ValueError("Unsupported 0x261c child metadata target.")
+            if record_start not in records:
+                raise ValueError("Missing 0x261c child pointer record.")
+
+        # First display mirror: `01 1c <UInt16BE count> 00` followed by
+        # exactly one 32-bit pointer to each first 0x251a record.
+        pointer_lists = []
+        for start in range(5, len(payload) - 3):
+            if bytes(payload[start - 5:start - 3]) != b"\x01\x1c":
+                continue
+            if payload[start - 1] != 0:
+                continue
+            count = struct.unpack_from(">H", payload, start - 3)[0]
+            if count != track_count or start + count * 4 > len(payload):
+                continue
+            targets = [u32(start + index * 4) for index in range(count)]
+            if all(block_types.get(target) == 0x251A for target in targets):
+                pointer_lists.append((start, targets))
+        if len(pointer_lists) != 1:
+            raise ValueError("Unsupported 0x251a pointer-list layout.")
+        pointer_list_start, pointer_list_targets = pointer_lists[0]
+        pointer_list_length_position = pointer_list_start - 4
+        if payload[pointer_list_length_position] != track_count * 4:
+            raise ValueError("Unsupported 0x251a pointer-list byte length.")
+
+        removed_display_ordinals = {
+            ordinal
+            for _, ordinal, target, _ in display_groups
+            if target in removed_block_types
+        }
+        removed_slot_ordinals = {
+            ordinal
+            for start, ordinal, _, _ in slot_groups
+            if u32(start + 18) in removed_block_types
+        }
+        removed_list_ordinals = {
+            index + 1
+            for index, target in enumerate(pointer_list_targets)
+            if target in removed_block_types
+        }
+        if (
+            not removed_display_ordinals
+            or removed_display_ordinals != removed_slot_ordinals
+            or removed_display_ordinals != removed_list_ordinals
+        ):
+            raise ValueError("Inconsistent 0x0002 deleted-track mirrors.")
+        removed_count = len(removed_display_ordinals)
+
+        # Six 0x251b metadata counters retain their entries but compact their
+        # common count. This exact six-entry profile is what Pro Tools writes
+        # for the verified seven-track blank template.
+        count_positions = []
+        marker = struct.pack("<H", 0x251B) + struct.pack("<I", root_2519)
+        for start in range(0, len(payload) - 11):
+            if (
+                payload[start] == 1
+                and u32(start + 1) == track_count
+                and bytes(payload[start + 5:start + 11]) == marker
+            ):
+                count_positions.append(start + 1)
+        if len(count_positions) != track_count - 1:
+            raise ValueError("Unsupported 0x251b track-count mirror layout.")
+
+        # One adjacent 0x2716 record uses the same compact track count.
+        group_2716_marker = struct.pack("<H", 0x2716) + struct.pack("<I", root_2519)
+        count_2716_positions = [
+            start + 1
+            for start in range(0, len(payload) - 11)
+            if (
+                payload[start] == 1
+                and u32(start + 1) == track_count
+                and bytes(payload[start + 5:start + 11]) == group_2716_marker
+            )
+        ]
+        if len(count_2716_positions) != 1:
+            raise ValueError("Unsupported 0x2716 track-count mirror layout.")
+
+        declared_count = struct.unpack_from(">H", payload, 0)[0]
+        # This UInt16 is stored in the file's big-endian pointer-table
+        # framing, but the native track tally occupies its high byte: aa00
+        # becomes a800 for one deletion and a600 for two.
+        top_level_delta = 0x0200 * removed_count
+        if declared_count < top_level_delta:
+            raise ValueError("Invalid 0x0002 top-level track-deletion count.")
+
+        spans = []
+        record_starts = set()
+        for start, ordinal, _, record_start in display_groups:
+            if ordinal in removed_display_ordinals:
+                spans.append((start, start + 45))
+                record_starts.add(record_start)
+        for start, ordinal, _, record_start in slot_groups:
+            if ordinal in removed_display_ordinals:
+                spans.append((start, start + 67))
+                record_starts.add(record_start)
+        for ordinal in sorted(removed_display_ordinals, reverse=True):
+            start = pointer_list_start + (ordinal - 1) * 4
+            spans.append((start, start + 4))
+
+        ordinal_patches = []
+        for groups in (display_groups, slot_groups):
+            new_ordinal = 0
+            for start, ordinal, _, _ in groups:
+                if ordinal in removed_display_ordinals:
+                    continue
+                new_ordinal += 1
+                ordinal_patches.append((start + 1, new_ordinal))
+
+        last_slot_tail_position = None
+        if track_count in removed_display_ordinals:
+            last_kept_slot = next(
+                start
+                for start, ordinal, _, _ in reversed(slot_groups)
+                if ordinal not in removed_display_ordinals
+            )
+            tail = bytes(payload[last_kept_slot + 54:last_kept_slot + 67])
+            if tail != b"\x00\x00\x00\x04\x00\x00\x00\x24\x26\xff\xff\xff\xff":
+                raise ValueError("Unsupported final 0x261c track-deletion tail.")
+            last_slot_tail_position = last_kept_slot + 54
+
+        return {
+            "spans": spans,
+            "embedded_record_starts": record_starts,
+            "ordinal_patches": ordinal_patches,
+            "count_positions": count_positions,
+            "count_2716_positions": count_2716_positions,
+            "new_track_count": track_count - removed_count,
+            "top_level_count": declared_count - top_level_delta,
+            "pointer_list_count_position": pointer_list_start - 3,
+            "pointer_list_length_position": pointer_list_length_position,
+            "last_slot_tail_position": last_slot_tail_position,
+        }
+
+    def _apply_0002_track_deletion_metadata(self, b0002, metadata):
+        """Patch native raw 0x0002 counters before its captured spans shrink."""
+        if metadata is None:
+            return
+        payload = self._raw_0002_payload(b0002)
+        struct.pack_into(">H", payload, 0, metadata["top_level_count"])
+        struct.pack_into(">H", payload, metadata["pointer_list_count_position"], metadata["new_track_count"])
+        payload[metadata["pointer_list_length_position"]] = (
+            metadata["new_track_count"] * 4
+        )
+        for position in metadata["count_positions"]:
+            struct.pack_into("<I", payload, position, metadata["new_track_count"])
+        for position in metadata["count_2716_positions"]:
+            struct.pack_into("<I", payload, position, metadata["new_track_count"])
+        for position, ordinal in metadata["ordinal_patches"]:
+            struct.pack_into("<I", payload, position, ordinal)
+        if metadata["last_slot_tail_position"] is not None:
+            payload[
+                metadata["last_slot_tail_position"]:
+                metadata["last_slot_tail_position"] + 13
+            ] = b"\x00\x00\x00\x01\x00\x00\x00\x2a\x26\xff\xff\xff\xff"
+        b0002.items = [payload]
+
+    def _purge_0002_records(
+        self, b0002, removed_offsets, is_bigendian, record_starts=None,
+        metadata_spans=None,
+    ):
         """
         Strip 0x0002 records whose pointer targets a block that no longer
         exists in the tree (deleted via e.g. delete_clip_group()).
 
         _rebuild_0002() only ever *patches* pointer values for blocks still
         present in global_mapping; it never drops a record. If we pop() a
-        block without removing its record here first, the record keeps
-        pointing at whatever now lives at that stale offset -> "Magic ID
-        does not match" in Pro Tools. Must run BEFORE _rebuild_0002().
+        block without removing its record here, the record keeps pointing at
+        whatever now lives at that stale offset -> "Magic ID does not match"
+        in Pro Tools. ``record_starts`` can capture the exact record
+        identities before relocation; this avoids treating a relocated live
+        offset which happens to equal an old removed offset as stale.
         """
         if not removed_offsets:
             return 0
@@ -6852,27 +7674,58 @@ class ProToolsSession:
             return 0
 
         removed_set = set(removed_offsets)
+        requested_starts = None
+        if record_starts is not None:
+            requested_starts = set(record_starts)
+            if not requested_starts:
+                return 0
 
         # A pointer record is exactly 15 bytes. Bytes between records belong
         # to independent metadata and must not be removed with the preceding
         # record. Pro Tools' grouped/ungrouped files differ by exactly 15 bytes
         # for each removed pointer.
         record_size = 15
-        spans_to_remove = []
+        spans_to_remove = list(metadata_spans or [])
+        for start, end in spans_to_remove:
+            if (
+                not isinstance(start, int)
+                or not isinstance(end, int)
+                or start < 0
+                or end <= start
+                or end > len(payload)
+            ):
+                raise ValueError("Invalid captured 0x0002 metadata span.")
+        spans_to_remove.sort()
+        if any(
+            end > next_start
+            for (_, end), (next_start, _) in zip(spans_to_remove, spans_to_remove[1:])
+        ):
+            raise ValueError("Overlapping captured 0x0002 metadata spans.")
         removals_by_run = {}
         purged = 0
-        record_starts = [start for start, _ in records]
-        record_start_set = set(record_starts)
+        decoded_starts = [start for start, _ in records]
+        record_start_set = set(decoded_starts)
+        if requested_starts is not None and not requested_starts.issubset(record_start_set):
+            raise ValueError("Invalid captured 0x0002 pointer-record positions.")
         for start, ptr_pos in records:
             if ptr_pos + 4 > len(payload):
                 continue
-            ptr_val = struct.unpack_from(fmt, payload, ptr_pos)[0]
-            if ptr_val not in removed_set:
+            if requested_starts is None:
+                ptr_val = struct.unpack_from(fmt, payload, ptr_pos)[0]
+                should_remove = ptr_val in removed_set
+            else:
+                should_remove = start in requested_starts
+            if not should_remove:
                 continue
             end = start + record_size
             if end > len(payload) or payload[ptr_pos + 4:end] != b"\x00\x00\x00":
                 raise ValueError("Invalid 15-byte 0x0002 pointer record.")
-            spans_to_remove.append((start, end))
+            contained_by_metadata = any(
+                metadata_start <= start and end <= metadata_end
+                for metadata_start, metadata_end in spans_to_remove
+            )
+            if not contained_by_metadata:
+                spans_to_remove.append((start, end))
             run_start = start
             while run_start - record_size in record_start_set:
                 run_start -= record_size
@@ -6897,6 +7750,12 @@ class ProToolsSession:
                 )
             struct.pack_into(">H", payload, count_pos, declared_count - removed_count)
 
+        spans_to_remove.sort()
+        if any(
+            end > next_start
+            for (_, end), (next_start, _) in zip(spans_to_remove, spans_to_remove[1:])
+        ):
+            raise ValueError("Overlapping 0x0002 pointer-removal spans.")
         for start, end in reversed(spans_to_remove):
             del payload[start:end]
 
@@ -6939,9 +7798,36 @@ class ProToolsSession:
             if new_ptr is not None and new_ptr != old_ptr:
                 patches.append((pos, new_ptr))
 
-        for previous, current in zip(patches, patches[1:]):
-            if current[0] < previous[0] + 4:
+        # Metadata offsets are aligned in the source PTX file, but the raw
+        # ``0x0002`` payload itself can start at an unaligned address.  A
+        # neighbouring byte sequence may therefore imitate a second offset
+        # after an edit moves the referenced blocks.  Preserve the strict
+        # rejection unless one and only one candidate is source-file aligned;
+        # standard 15-byte pointer records are never resolved this way.
+        resolved_patches = []
+        patch_index = 0
+        payload_file_offset = b0002.original_offset + 7
+        while patch_index < len(patches):
+            overlap_group = [patches[patch_index]]
+            group_end = patches[patch_index][0] + 4
+            patch_index += 1
+            while patch_index < len(patches) and patches[patch_index][0] < group_end:
+                overlap_group.append(patches[patch_index])
+                group_end = max(group_end, patches[patch_index][0] + 4)
+                patch_index += 1
+            if len(overlap_group) == 1:
+                resolved_patches.extend(overlap_group)
+                continue
+            if any(position in pointer_positions for position, _ in overlap_group):
                 raise ValueError("Overlapping 0x0002 pointer relocations.")
+            aligned = [
+                patch for patch in overlap_group
+                if (payload_file_offset + patch[0]) % 4 == 0
+            ]
+            if len(aligned) != 1:
+                raise ValueError("Overlapping 0x0002 pointer relocations.")
+            resolved_patches.append(aligned[0])
+        patches = resolved_patches
 
         for pos, new_ptr in patches:
             struct.pack_into(fmt, payload, pos, new_ptr)
@@ -7015,12 +7901,16 @@ class ProToolsSession:
 
         original_root_items = copy.deepcopy(self.root_items)
         original_removed_offsets = list(getattr(self, '_removed_offsets', []))
+        original_removed_block_types = dict(
+            getattr(self, '_removed_block_types', {})
+        )
         original_file_path = getattr(self, 'file_path', None)
         try:
             return self._save_impl(out_path)
         except Exception:
             self.root_items = original_root_items
             self._removed_offsets = original_removed_offsets
+            self._removed_block_types = original_removed_block_types
             if original_file_path is not None:
                 self.file_path = original_file_path
             raise
@@ -7036,17 +7926,56 @@ class ProToolsSession:
 
         b0002, block_0002_idx = self._validate_save_structure()
 
-        # Pass 2: Rebuild the 0x0002 pointer table using the computed mapping.
-        # This is the ONLY place we modify pointers — targeted and safe.
+        # Capture stale standard-record positions *before* relocation. A live
+        # block can move onto an old removed absolute offset; deciding from
+        # relocated values would then purge a valid unrelated record.
         removed = getattr(self, '_removed_offsets', [])
+        stale_record_starts = None
+        track_deletion_metadata = None
         if removed:
-            purged = self._purge_0002_records(b0002, removed, self.is_bigendian)
+            original_0002_payload = self._raw_0002_payload(b0002)
+            pointer_format = ">I" if self.is_bigendian else "<I"
+            removed_set = set(removed)
+            stale_record_starts = {
+                start
+                for start, pointer_position in self._validate_0002_record_layout(
+                    bytes(original_0002_payload)
+                )
+                if struct.unpack_from(
+                    pointer_format, original_0002_payload, pointer_position
+                )[0] in removed_set
+            }
+            track_deletion_metadata = self._capture_0002_track_deletion_metadata(
+                b0002, getattr(self, '_removed_block_types', {})
+            )
+            if track_deletion_metadata is not None and not track_deletion_metadata[
+                "embedded_record_starts"
+            ].issubset(stale_record_starts):
+                raise ValueError("Inconsistent 0x0002 embedded track-deletion records.")
+
+        # Pass 2: Rebuild pointer values before shrinking ``0x0002``. Pointer
+        # records are removed only after relocation: otherwise newly adjacent
+        # metadata bytes can form a false overlapping UInt32 offset.
+        self._rebuild_0002(b0002, global_mapping, self.is_bigendian)
+        if removed:
+            self._apply_0002_track_deletion_metadata(
+                b0002, track_deletion_metadata
+            )
+            purged = self._purge_0002_records(
+                b0002,
+                removed,
+                self.is_bigendian,
+                record_starts=stale_record_starts,
+                metadata_spans=(
+                    track_deletion_metadata["spans"]
+                    if track_deletion_metadata is not None else None
+                ),
+            )
             if purged:
                 logger.info(
                     "Purged %d stale 0x0002 record(s) for deleted block(s).",
                     purged,
                 )
-        self._rebuild_0002(b0002, global_mapping, self.is_bigendian)
 
         # Pass 3: Fix the 0x0001 block's pointer to 0x0002.
         # 0x0001 is a special 11-byte block: unlike normal non-empty blocks it
@@ -7110,6 +8039,7 @@ class ProToolsSession:
             # refreshing fails, the destination still contains its old bytes.
             self._refresh_original_offsets()
             self._removed_offsets = []
+            self._removed_block_types = {}
             os.replace(temp_path, destination)
             temp_path = None
             self.data = out_data

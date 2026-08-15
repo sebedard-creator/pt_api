@@ -1,10 +1,10 @@
-# pt_api 1.5.1
+# pt_api 1.5.2
 
 *(Reverse-engineered and tested against **Pro Tools Ultimate 2024.3.1** on sessions at **23.98, 24, and 29.97df fps**)*
 
 A standalone, dependency-free Python API for parsing, manipulating, and re-encrypting Pro Tools (`.ptx`) session files in place. 
 
-Version 1.5.1 retains native empty Clip Group creation and adds lossless compatibility with native per-track visibility suffixes. A caller can rename prepared track slots, show only the slots it needs, and place and name empty groups at exact sample positions and durations. It retains the dedicated Clip Group reader, the audio-backed `create_clip_group()` writer, and the strict relink preflight that rejects unwritable geometries before media are created.
+Version 1.5.2 adds safe deletion of any requested combination of empty Audio tracks in the verified native template profile. A caller can inspect track names, delete unneeded empty slots, rename the retained slots, show only the slots it needs, and place/name Clip Groups at exact sample positions and durations. It retains the dedicated Clip Group reader, the audio-backed `create_clip_group()` writer, and the strict relink preflight that rejects unwritable geometries before media are created.
 
 > [!NOTE]
 > **Language Notice:** While this README is provided in English, please note that the underlying codebase, comments, and deep technical documentation (`architecture.md`, `pt_format_specs.md`, etc.) are written entirely in French.
@@ -31,7 +31,8 @@ The supported public surface is divided between the high-level `ProToolsSession`
 | **Inspection** | `get_tracks()` | Returns all validated main-timeline track names, including hidden template slots. |
 | **Template track slots** | `rename_track(old_name, new_name)` | Renames one verified pre-authored track, including its native name mirrors. |
 | | `set_visible_tracks(track_names)` | Shows exactly the selected pre-authored track slots, in the requested display order; other slots are hidden. |
-| | `get_markers()` | Returns validated markers with their index, name and timecode. |
+| | `delete_tracks(track_names)` | Deletes any non-empty unique selection of verified **empty** Audio-track slots while retaining at least one track. |
+| | `get_markers(marker_track_name=None)` | Returns validated markers with their index, name and timecode; an optional visible marker-ruler name filters the result. |
 | | `get_clips()` | Describes all supported audio clips and Clip Groups in the Clip Bin. |
 | | `get_timeline_clips(include_fades=True)` | Returns chronological audio/fade events with track, clip, sample range, source offset, mute/fade state and best-effort physical filename. Passing `False` returns audio only and deliberately skips fade-geometry validation. |
 | | `get_timeline_clip_groups()` | Returns every main-timeline Clip Group macro placement, including repeated placements of the same group, with its independent group ID, name, track, sample range and timecodes. |
@@ -131,7 +132,8 @@ The output directory must not already exist; its parent must exist. The function
 
 - **Exact names:** Clip and track operations use exact names. Duplicate matching names are treated as ambiguous and rejected.
 - **Audio focus:** Timeline editing supports audio clips and fades. MIDI regions/controllers, video tracks/clips, Inserts, Sends, I/O routing, Pan automation, Mute automation and plugin automation are not supported. `mute_clip()` changes the static event mute flag; it does not write Mute automation.
-- **Pre-authored track pools only:** `rename_track()` and `set_visible_tracks()` operate only on existing verified native track slots. They do not create, delete or reorder tracks. For programmatic sessions, create the maximum required pool in Pro Tools, save the template normally once after creating the pool, then show and rename only the slots required by the caller. A freshly authored ten-track pool carrying the observed pre-save UI layout is rejected for renaming rather than risk a Pro Tools session with a discarded track map. In a `0x251a` visibility mirror, only the visibility byte is interpreted; its final native per-track UInt16 is opaque and preserved, not required to be `FE FF`.
+- **Pre-authored track pools:** `rename_track()` and `set_visible_tracks()` operate only on existing verified native track slots; they never create or reorder tracks. For programmatic sessions, create the maximum required pool in Pro Tools, save the template normally once after creating the pool, then rename/show the slots required by the caller. A freshly authored ten-track pool carrying the observed pre-save UI layout is rejected for renaming rather than risk a Pro Tools session with a discarded track map. In a `0x251a` visibility mirror, only the visibility byte is interpreted; its final native per-track UInt16 is opaque and preserved, not required to be `FE FF`.
+- **Track deletion is template-only:** `delete_tracks(track_names)` supports any combination of requested names only when every main Audio playlist is empty and the complete verified native deletion profile is present. It updates the timeline, name/display/index mirrors, state map and raw `0x0002` metadata. At least one Audio track must remain. It deliberately rejects tracks containing audio/fade events and sessions with an unfamiliar or ambiguous mirror layout; it does not delete MIDI/video tracks, routing, automation, inserts, sends, playlists, Clip Groups or other populated-track state.
 - **Clip Group macros are not audio placements:** Group macros use a separate ID namespace and are ignored by ordinary audio read/mute/move/split/duplicate/trim/fade operations even when their numeric ID collides with a clip ID. `get_timeline_clip_groups()` is the dedicated read-only reader for their visible main-timeline occurrences; it reports every occurrence, including repeated placements.
 - **Attached fades:** `move_clip()`, `duplicate_clip()`, `split_clip()`, `trim_clip_start()` and `trim_clip_end()` reject a placement with attached fades. Duplication does not clone fade geometry.
 - **Ambiguous placements:** Move, duplicate and trim require exactly one visible placement of the named clip. Split also requires one placement on the named track spanning the cut. `mute_clip()` is the exception: it intentionally updates all visible audio placements of the uniquely named clip.
@@ -180,7 +182,7 @@ The native root, zero-offset virtual and nonzero-offset virtual relink paths wer
 
 ### Markers and automation
 
-- **Simple point markers only:** `add_marker()` requires at least one valid audio track and exactly one valid root marker ruler. Timestamps must fit signed Int64; explicit marker indexes must be unique and between 1 and 65,535. Existing markers cannot be edited or deleted, and selection ranges or custom Memory Location properties are not created.
+- **Marker-ruler reads and simple point writes:** `get_markers()` reads every supported point marker. On the verified native multi-ruler profile, `get_markers("MARKER 3")` resolves the visible marker-ruler name and returns only its markers; the returned dictionaries remain directly usable as `name`/`timecode` CSV rows. The filter is read-only and rejects an unknown or structurally unverified marker-ruler catalogue. `add_marker()` remains limited to one valid root marker ruler: timestamps must fit signed Int64; explicit marker indexes must be unique and between 1 and 65,535. Existing markers cannot be edited or deleted, and selection ranges or custom Memory Location properties are not created.
 - **Static Clip Gain only:** `set_clip_gain()` requires one uniquely named clip and one valid global `0x2637` dictionary. Values must fit Float32; `-inf` is represented by Pro Tools' verified finite sentinel. The value belongs to the clip definition and therefore affects all of its placements; Clip Gain breakpoints or envelopes are not supported.
 - **Volume nodes only:** `add_volume_node()` supports adding or replacing Track Volume nodes, but not deleting them. The timestamp must fit UInt32 and the value is stored as signed Int16 deci-dB. The visible track must map safely by ordinal to one `0x261c` definition with one unambiguous `0x260d` and a direct `0x260a` playlist.
 

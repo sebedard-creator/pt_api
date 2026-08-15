@@ -116,6 +116,102 @@ def make_native_visibility_profile(
     return session
 
 
+def make_native_deletion_profile(track_names=("MIX", "DIAL", "SFX")):
+    """Build the strict empty-track profile accepted by delete_tracks()."""
+    session = make_session([playlist(name) for name in track_names])
+    count = len(track_names)
+
+    descriptors = []
+    metadata = []
+    first_displays = []
+    second_displays = []
+    aggregate = bytearray(b"\x01" + b"\x00" * 13 + struct.pack("<I", count) + b"\x00\x00")
+    for index, name in enumerate(track_names):
+        encoded = name.encode("utf-8")
+        descriptor_payload = bytearray(
+            struct.pack("<I", len(encoded))
+            + encoded
+            + b"\x00" * 5
+            + struct.pack("<I", index)
+            + b"\x00" * 21
+            + struct.pack("<I", index)
+            + b"\x00" * 5
+        )
+        descriptors.append(block(8, 0x1014, [descriptor_payload]))
+        metadata.append(block(1, 0x210B, [bytearray(
+            b"\x00" * 4 + struct.pack("<I", len(encoded)) + encoded + b"\x00"
+        )]))
+
+        entry = bytearray(
+            struct.pack("<I", len(encoded))
+            + encoded
+            + b"\x00" * 8
+            + b"\x2a\x00\x00\x00"
+            + struct.pack("<Q", 0x1000 + index)
+            + bytes((index + 1,))
+            + b"\x00" * 4
+        )
+        aggregate.extend(entry)
+        for displays in (first_displays, second_displays):
+            displays.append(block(10, 0x251A, [bytearray(b"\x00\x00" + entry)]))
+
+    root_1015 = block(2, 0x1015, [
+        bytearray(struct.pack("<I", count)), *descriptors,
+    ])
+    root_2107 = block(5, 0x2107, [
+        bytearray(b"\x00" * 8 + b"\x01" + struct.pack("<I", count)),
+        *metadata,
+    ])
+    root_2519 = block(8, 0x2519, [
+        aggregate,
+        *first_displays,
+        bytearray(struct.pack("<I", count)),
+        *second_displays,
+    ])
+    states = [
+        block(9, 0x2589, [bytearray(struct.pack("<HH", index, 1) + b"\x3d\x00")])
+        for index in range(count)
+    ]
+    state_container = block(2, 0x258A, [
+        block(1, 0x2581, []), bytearray(struct.pack("<I", count)), *states,
+    ])
+    root_2587 = block(1, 0x2587, [state_container])
+    slots = [
+        block(4, 0x261C, [
+            bytearray(
+                struct.pack("<I", index)
+                + b"\x01\x00"
+                + struct.pack("<H", index)
+                + b"\x00\x00\xff\xff"
+            ),
+            bytearray(
+                b"\x00\x00\x00\x00\x02\x00\x00\x00" + b"\x00" * 9
+                + struct.pack("<I", index)
+                + b"\x01\x00\x00"
+            ),
+        ])
+        for index, _ in enumerate(track_names)
+    ]
+    root_2624 = block(1, 0x2624, [bytearray(struct.pack("<I", count)), *slots])
+    index_payload = bytearray(
+        b"\x05\x00\x00\x00<ALL>\x02\xff\xff\xff\xff\x00\x00"
+        + struct.pack("<I", count)
+        + struct.pack("<" + "H" * count, *range(count))
+        + b"\xfe\xff\x10\x80\x01\x00\x00\x00\x00\x00\xff\xff"
+    )
+    root_202b = block(4, 0x202B, [
+        bytearray(b"\x01\x00\x00\x00"),
+        block(5, 0x202A, [bytearray(index_payload)]),
+        bytearray(b"\x01\x00\x00\x00"),
+        block(5, 0x202A, [bytearray(index_payload)]),
+        bytearray(b"\x00\x00"),
+    ])
+    session.root_items.extend([
+        root_1015, root_2107, root_2519, root_2587, root_2624, root_202b,
+    ])
+    return session
+
+
 class GetTracksTests(unittest.TestCase):
     def test_returns_ordered_main_track_names_including_empty_tracks(self):
         session = make_session([playlist("PISTE É"), playlist("SECOND")])
@@ -255,6 +351,104 @@ class TrackVisibilityTests(unittest.TestCase):
             session.rename_track("AUDIO 1", "PLAYBACK NOTES")
 
         self.assertEqual(bytes(session._root_blocks(0x1054)[0].items[1].items[0]), before)
+
+
+class TrackDeletionTests(unittest.TestCase):
+    def test_deletes_empty_slots_and_compacts_verified_mirrors(self):
+        session = make_native_deletion_profile(
+            ("MIX", "DIAL", "SFX", "STEPS", "FOLEY", "ADR", "CONCEP")
+        )
+
+        self.assertEqual(session.delete_tracks(["DIAL", "CONCEP"]), ["DIAL", "CONCEP"])
+        self.assertEqual(
+            session.get_tracks(), ["MIX", "SFX", "STEPS", "FOLEY", "ADR"]
+        )
+        self.assertEqual(
+            struct.unpack("<I", session._root_blocks(0x1015)[0].items[0])[0], 5
+        )
+        descriptor_indices = []
+        for descriptor in session._root_blocks(0x1015)[0].get_all_blocks(0x1014):
+            payload = bytes(descriptor.items[0])
+            name_length = struct.unpack_from("<I", payload, 0)[0]
+            name_end = 4 + name_length
+            descriptor_indices.append((
+                struct.unpack_from("<I", payload, name_end + 5)[0],
+                struct.unpack_from("<I", payload, name_end + 30)[0],
+            ))
+        self.assertEqual(descriptor_indices, [(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)])
+        root_2519 = session._root_blocks(0x2519)[0]
+        self.assertEqual(len(root_2519.get_all_blocks(0x251A)), 10)
+        states = session._root_blocks(0x2587)[0].get_all_blocks(0x2589)
+        self.assertEqual(
+            {struct.unpack_from("<H", state.items[0], 0)[0] for state in states},
+            {0, 1, 2, 3, 4},
+        )
+        # The synthetic state sequence is not the separately verified
+        # seven-track native serializer profile, so no opaque reordering is
+        # inferred for it.
+        self.assertEqual(
+            [struct.unpack_from("<H", state.items[0], 0)[0] for state in states],
+            [0, 1, 2, 3, 4],
+        )
+        self.assertEqual(len(session._root_blocks(0x2624)[0].get_all_blocks(0x261C)), 5)
+        for index, slot in enumerate(
+            session._root_blocks(0x2624)[0].get_all_blocks(0x261C)
+        ):
+            compact = next(
+                bytes(item) for item in slot.items
+                if isinstance(item, (bytes, bytearray)) and len(item) == 12
+            )
+            extended = next(
+                bytes(item) for item in slot.items
+                if isinstance(item, (bytes, bytearray)) and len(item) == 24
+            )
+            self.assertEqual(struct.unpack_from("<I", compact, 0)[0], index)
+            self.assertEqual(struct.unpack_from("<H", compact, 6)[0], index)
+            self.assertEqual(struct.unpack_from("<I", extended, 17)[0], index)
+        for mirror in session._root_blocks(0x202B)[0].get_all_blocks(0x202A):
+            payload = bytes(mirror.items[0])
+            self.assertIn(struct.pack("<I", 5) + struct.pack("<5H", 0, 1, 2, 3, 4), payload)
+
+    def test_rejects_populated_track_templates_without_mutation(self):
+        session = make_native_deletion_profile()
+        target = session._validated_main_playlists()[1][0]
+        header = bytearray(target.items[0])
+        name_length = struct.unpack_from("<I", header, 0)[0]
+        struct.pack_into("<I", header, 4 + name_length, 1)
+        target.items[0] = header
+        target.items.append(block(3, 0x1050, []))
+
+        with self.assertRaisesRegex(NotImplementedError, "empty"):
+            session.delete_tracks(["DIAL"])
+        self.assertEqual(session.get_tracks(), ["MIX", "DIAL", "SFX"])
+
+    def test_canonicalizes_opaque_state_order_for_any_multi_track_selection(self):
+        session = make_native_deletion_profile(
+            ("MIX", "DIAL", "SFX", "STEPS", "FOLEY", "ADR", "CONCEP")
+        )
+        container = session._root_blocks(0x2587)[0].get_all_blocks(0x258A)[0]
+        states = [
+            item for item in container.items
+            if isinstance(item, PTBlock) and item.content_type == 0x2589
+        ]
+        by_id = {
+            struct.unpack_from("<H", state.items[0], 0)[0]: state
+            for state in states
+        }
+        positions = [
+            index for index, item in enumerate(container.items)
+            if isinstance(item, PTBlock) and item.content_type == 0x2589
+        ]
+        for position, state_id in zip(positions, (2, 1, 4, 0, 3, 5, 6)):
+            container.items[position] = by_id[state_id]
+
+        session.delete_tracks(["MIX", "FOLEY"])
+
+        states = session._root_blocks(0x2587)[0].get_all_blocks(0x2589)
+        self.assertEqual(
+            [struct.unpack_from("<H", state.items[0], 0)[0] for state in states],
+            [0, 1, 2, 3, 4],
+        )
 
 
 if __name__ == "__main__":

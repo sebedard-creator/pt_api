@@ -40,6 +40,36 @@ def marker_payload(marker_ruler):
     return marker, marker.items[0], marker.items[2]
 
 
+def marker_blocks(marker_ruler):
+    return [
+        item for item in marker_ruler.items
+        if isinstance(item, PTBlock) and item.content_type == 0x2077
+    ]
+
+
+def add_marker_track_catalogue(session, names):
+    """Add the verified read-only marker-ruler catalogue test profile."""
+    entries = []
+    for track_id, name in enumerate(names):
+        encoded_name = name.encode("utf-8")
+        entry = PTBlock(1, 0x251C, 1)
+        entry.items = [bytearray(
+            struct.pack("<HI", track_id, len(encoded_name))
+            + encoded_name
+            + b"\x01"
+            + struct.pack("<I", track_id)
+        )]
+        entries.append(entry)
+    # Native non-ruler entries share the same container and must be ignored.
+    other = PTBlock(1, 0x251C, 1)
+    other.items = [bytearray(b"\x03\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00")]
+    catalogue = PTBlock(2, 0x251B, 1)
+    catalogue.items = [bytearray(struct.pack("<I", len(entries) + 1)), *entries, other]
+    root = PTBlock(3, 0x2519, 1)
+    root.items = [catalogue]
+    session.root_items.append(root)
+
+
 class MarkerTests(unittest.TestCase):
     def test_add_marker_preserves_structure_and_wipes_template_offsets(self):
         session, ruler = make_session()
@@ -69,6 +99,37 @@ class MarkerTests(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertEqual(struct.unpack("<I", ruler.items[0])[0], 2)
         self.assertEqual([item["index"] for item in session.get_markers()], [1, 2])
+
+    def test_get_markers_filters_by_native_marker_track_name(self):
+        session, ruler = make_session()
+        session.add_marker("M1_A", 48_048)
+        session.add_marker("M2_A", 96_096)
+        session.add_marker("M3_A", 144_144)
+        for track_id, marker in enumerate(marker_blocks(ruler)):
+            marker.items[-1] = bytearray(struct.pack("<II", 0, track_id))
+        add_marker_track_catalogue(session, ["MARKER 1", "MARKER 2", "MARKER 3"])
+
+        self.assertEqual(
+            session.get_markers("MARKER 2"),
+            [{"index": 2, "name": "M2_A", "timecode": "00:00:02:00"}],
+        )
+        self.assertEqual(
+            [marker["name"] for marker in session.get_markers()],
+            ["M1_A", "M2_A", "M3_A"],
+        )
+
+    def test_marker_track_filter_rejects_unknown_or_invalid_native_assignment(self):
+        session, ruler = make_session()
+        session.add_marker("M1_A", 48_048)
+        marker_blocks(ruler)[0].items[-1] = bytearray(struct.pack("<II", 0, 9))
+        add_marker_track_catalogue(session, ["MARKER 1"])
+
+        with self.assertRaisesRegex(ValueError, "assignment"):
+            session.get_markers("MARKER 1")
+        with self.assertRaisesRegex(ValueError, "not found"):
+            session.get_markers("UNKNOWN")
+        with self.assertRaisesRegex(TypeError, "must be a string"):
+            session.get_markers(1)
 
     def test_duplicate_index_is_rejected_without_mutation(self):
         session, ruler = make_session()
