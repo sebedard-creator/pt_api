@@ -680,26 +680,41 @@ class TimecodeEngine:
         self.sample_rate = sample_rate
         self.frame_rate_enum = frame_rate_enum
 
+    # Exact frame-rate table — all 19 enums validated at 0x204d+42
+    _EXACT_RATES = {
+        0x01: (24.0,                  False),
+        0x02: (25.0,                  False),
+        0x03: (30000.0 / 1001.0,      False),
+        0x05: (30000.0 / 1001.0,      True),
+        0x07: (30.0,                  False),
+        0x08: (30.0,                  True),
+        0x09: (24000.0 / 1001.0,      False),
+        0x0a: (50.0,                  False),
+        0x0b: (60000.0 / 1001.0,      False),
+        0x0c: (60000.0 / 1001.0,      True),
+        0x0d: (60.0,                  False),
+        0x0e: (60.0,                  True),
+        0x0f: (48000.0 / 1001.0,      False),
+        0x10: (48.0,                  False),
+        0x11: (100.0,                 False),
+        0x12: (120000.0 / 1001.0,     False),
+        0x13: (120000.0 / 1001.0,     True),
+        0x14: (120.0,                 False),
+        0x15: (120.0,                 True),
+    }
+
     def get_frame_rate(self):
-        # Enum mapping based on block 0x204d payload offset 0
-        # 0x01 = 24 fps
-        # 0x09 = 23.976 fps
-        # 0x05 = 29.97 DF fps
-        if self.frame_rate_enum == 0x01:
-            return 24.0, False # fps, is_drop_frame
-        elif self.frame_rate_enum == 0x09:
-            return 24000 / 1001, False
-        elif self.frame_rate_enum == 0x05:
-            return 30000 / 1001, True
-        else:
-            raise ValueError(f"Unsupported frame rate enum: {hex(self.frame_rate_enum)}. The API cannot accurately calculate timecodes for this frame rate yet.")
+        entry = self._EXACT_RATES.get(self.frame_rate_enum)
+        if entry is None:
+            raise ValueError(
+                f"Unsupported frame rate enum: {hex(self.frame_rate_enum)}. "
+                f"Known enums: {', '.join(hex(e) for e in sorted(self._EXACT_RATES))}."
+            )
+        return entry  # (fps, is_drop_frame)
 
     def _nominal_fps(self):
-        if self.frame_rate_enum in (0x01, 0x09):
-            return 24
-        if self.frame_rate_enum == 0x05:
-            return 30
-        self.get_frame_rate()  # Raises the public unsupported-rate error.
+        fps, _ = self.get_frame_rate()
+        return int(math.ceil(fps - 1e-9))  # 23.976→24, 29.97→30, 59.94→60, etc.
 
     def _validate_components(self, hh, mm, ss, ff, *, position):
         components = (hh, mm, ss, ff)
@@ -748,18 +763,24 @@ class TimecodeEngine:
                 mm = (total_frames // (nominal_fps * 60)) % 60
                 hh = total_frames // (nominal_fps * 3600)
             else:
-                # Drop frame logic (29.97)
+                # Drop frame logic — generalised for any nominal fps N.
+                # Within each decade (10 min): drop 2 labels/min except
+                # minute 0 of each decade.  Real-frames per decade =
+                # 600*N - 18; per minute = 60*N - 2.
+                N = nominal_fps
+                decade = 600 * N - 18
+                minute  = 60  * N - 2
                 frames = self._round_nonnegative(total_seconds * actual_fps)
-                d = frames // 17982
-                m = frames % 17982
+                d = frames // decade
+                m = frames % decade
                 frames += 18 * d
                 if m >= 2:
-                    frames += 2 * ((m - 2) // 1798)
+                    frames += 2 * ((m - 2) // minute)
 
-                ff = frames % 30
-                ss = (frames // 30) % 60
-                mm = (frames // 1800) % 60
-                hh = frames // 108000
+                ff = frames % N
+                ss = (frames // N) % 60
+                mm = (frames // (N * 60)) % 60
+                hh = frames // (N * 3600)
         except OverflowError as exc:
             raise ValueError("Sample position exceeds the timecode conversion range.") from exc
             
@@ -776,19 +797,13 @@ class TimecodeEngine:
                 return self._round_nonnegative(total_seconds * self.sample_rate)
             else:
                 # Drop frame logic
-                # For 29.97 DF, frame rate is exactly 30000/1001
-                # 2 frames are dropped every minute, except every 10th minute
+                # The nominal frame count at nominal fps N
                 total_minutes = hh * 60 + mm
-
-                # The nominal frame count if it were exactly 30 fps
-                nominal_frames = (total_minutes * 60 + ss) * 30 + ff
-
+                nominal_frames = (total_minutes * 60 + ss) * nominal_fps + ff
                 # Subtract dropped frames
                 dropped = 2 * total_minutes - 2 * (total_minutes // 10)
-
                 actual_frames = nominal_frames - dropped
-
-                total_seconds = actual_frames / (30000 / 1001)
+                total_seconds = actual_frames / actual_fps
                 return self._round_nonnegative(total_seconds * self.sample_rate)
         except OverflowError as exc:
             raise ValueError("Timecode position exceeds the sample conversion range.") from exc
@@ -3453,12 +3468,14 @@ class ProToolsSession:
         if (
             not frame_block.items
             or not isinstance(frame_block.items[0], (bytes, bytearray))
-            or len(frame_block.items[0]) < 1
+            or len(frame_block.items[0]) < 44
         ):
             raise ValueError("Invalid root 0x204d frame-rate payload.")
 
         self.sample_rate = sample_rate
-        self.frame_rate_enum = frame_block.items[0][0]
+        # Exact rate enum at content-data +42 (payload offset 40),
+        # NOT the ambiguous family enum at payload offset 0.
+        self.frame_rate_enum = frame_block.items[0][40]
 
     def _resolve_unique_clip_id(self, clip_name):
         if not isinstance(clip_name, str) or not clip_name:

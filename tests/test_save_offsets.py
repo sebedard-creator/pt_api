@@ -47,8 +47,10 @@ class RepeatedSaveOffsetTests(unittest.TestCase):
 
         sample_rate = PTBlock(1, 0x1028, 8)
         sample_rate.items = [bytearray(b"\x00\x00" + struct.pack("<I", 48_000))]
-        frame_rate = PTBlock(1, 0x204D, 3)
-        frame_rate.items = [bytearray(b"\x09")]
+        frame_rate = PTBlock(1, 0x204D, 46)
+        payload = bytearray(44)
+        payload[40] = 0x09
+        frame_rate.items = [payload]
 
         pointer_table = PTBlock(1, 0x0002, 2)
         pointer_table.items = []

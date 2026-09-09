@@ -21,9 +21,16 @@ def generic_block(block_type, content_type, payload=b""):
     )
 
 
+def _frame_rate_payload(exact_enum=0x09):
+    """Minimal 0x204d payload: 44 bytes, exact enum at offset 40."""
+    payload = bytearray(44)
+    payload[40] = exact_enum
+    return bytes(payload)
+
+
 SESSION_METADATA = (
     generic_block(1, 0x1028, b"\x00\x00" + struct.pack("<I", 48_000))
-    + generic_block(1, 0x204D, b"\x09")
+    + generic_block(1, 0x204D, _frame_rate_payload())
 )
 
 
@@ -401,7 +408,7 @@ class LoadingValidationTests(unittest.TestCase):
             self.load_bytes(minimal_ptx(middle=duplicate_sample_rate))
 
     def test_invalid_or_zero_sample_rate_is_rejected(self):
-        frame_rate = generic_block(1, 0x204D, b"\x09")
+        frame_rate = generic_block(1, 0x204D, _frame_rate_payload())
         malformed = generic_block(1, 0x1028, b"\x00") + frame_rate
         with self.assertRaisesRegex(ValueError, "sample-rate payload"):
             self.load_bytes(
