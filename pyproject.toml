@@ -8,10 +8,13 @@ version = "1.5.2"
 description = "API autonome pour manipuler les sessions Pro Tools (.ptx)"
 readme = "README.md"
 requires-python = ">=3.8"
+# Retain the PEP 621 table form for setuptools >=61 / Python 3.8 compatibility.
+license = {text = "LGPL-2.1-or-later"}
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: GNU Lesser General Public License v2 or later (LGPLv2+)",
 ]
 
 [tool.setuptools]
 py-modules = ["pt_api"]
+license-files = ["LICENSE", "COPYING", "NOTICE.md"]

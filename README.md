@@ -1,10 +1,10 @@
-## Attribution and licensing review
+## Attribution and license
 
-[ptformat](https://github.com/zamaudio/ptformat), whose source credits Damien Zammit and Robin Gareus, was consulted during the initial development of pt_api. We acknowledge its foundational work on reading and understanding the Pro Tools session format.
+[ptformat](https://github.com/zamaudio/ptformat), whose source credits Damien Zammit and Robin Gareus, was used as a reference and inspiration during the initial development of pt_api. We acknowledge its foundational work on understanding the Pro Tools session format and its decryption. pt_api provides a Python API, session-editing capabilities and additional format research built since its initial development; these additions do not override any applicable upstream rights or licensing obligations.
 
-ptformat is licensed under LGPL-2.1-or-later. This repository currently contains an [MIT license](LICENSE), but the provenance of the initial implementation and the applicable licensing obligations are under review. The MIT notice does not override the license or copyright of any material derived from ptformat.
+The current source distribution of **pt_api is licensed under GNU LGPL version 2.1 or, at your option, any later version (SPDX: `LGPL-2.1-or-later`)**, matching the license stated in ptformat's source. See [LICENSE](LICENSE) for the full LGPL text, [COPYING](COPYING) for the accompanying GPL version 2 text referenced by the LGPL, and [NOTICE.md](NOTICE.md) for attribution and modification notices.
 
-Appropriate attribution, copyright notices and licensing corrections will be made based on that review.
+The project's previous MIT-only licensing statement has been replaced for this source distribution on 2026-10-07. Earlier tags and distributed releases have not been rewritten. The detailed provenance review remains ongoing; this change does not assert that a line-by-line copy has been established, certify complete legal compliance, or by itself resolve a pending copyright complaint.
 
 pt_api is an unofficial interoperability project and is not affiliated with or endorsed by Avid Technology.
 

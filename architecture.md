@@ -9,6 +9,7 @@ Ce document donne un survol global du logiciel. Les structures binaires, offsets
 - Langage : Python 3.8 ou plus récent.
 - Dépendances d'exécution : bibliothèque standard uniquement.
 - Distribution : module unique `pt_api.py`, empaqueté par `pyproject.toml`.
+- Licence de la distribution source courante : **LGPL-2.1-or-later**; LICENSE/COPYING contiennent les textes, NOTICE.md les crédits et la notice de modification. ptformat a servi de référence/inspiration initiale; ce changement de licence ne modifie pas l'architecture ou les profils binaires et ne remplace pas la revue de provenance en cours.
 - Interface : API Python; le petit point d'entrée CLI sert seulement au test load/save.
 
 ## Organisation du dépôt

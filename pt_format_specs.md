@@ -4,6 +4,8 @@
 
 Ce document décrit exactement les structures que le code courant lit, valide, modifie et sérialise. Une structure dite « observée » provient des sessions de référence; une structure dite « prise en charge » possède un chemin explicite dans `pt_api.py`. Les zones non interprétées sont conservées telles quelles et ne doivent pas être déduites par heuristique.
 
+**Provenance et licence** : ptformat (https://github.com/zamaudio/ptformat), dont la source crédite Damien Zammit et Robin Gareus, a servi de référence et d'inspiration initiale pour comprendre le format et son déchiffrement. La distribution source courante de pt_api est sous **LGPL-2.1-or-later** depuis la correction de notices du 7 octobre 2026; voir LICENSE, COPYING et NOTICE.md. Cette mention n'attribue pas chaque offset ou découverte documentée à ptformat, ne prétend pas établir une copie ligne par ligne et ne remplace pas la revue détaillée de provenance. Aucun comportement, champ binaire ou contrat d'erreur ne change avec cette correction de licence.
+
 ## 1. Enveloppe du fichier, chiffrement et parsing
 
 ### 1.1 Organisation générale
