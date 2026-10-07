@@ -16,6 +16,7 @@ def audio_definition(name, flags, length, source_offset=0):
     source_width = {
         0x0000: 0,
         0x0001: 0,
+        0x1001: 1,
         0x2000: 2,
         0x2001: 2,
         0x3000: 3,
@@ -63,6 +64,46 @@ def make_session(audio=(), groups=()):
 
 
 class GetClipsTests(unittest.TestCase):
+    def test_uint8_virtual_source_offset_and_independent_length_widths(self):
+        for offset in (1, 100, 255):
+            for length in (255, 256, 65536, 16777216):
+                with self.subTest(offset=offset, length=length):
+                    definition = audio_definition('COMPACT', 0x1001, length, offset)
+                    payload = definition.items[0].items[0]
+                    # Preserve the opaque 0x44 marker observed in the native pair.
+                    a = 4 + len('COMPACT')
+                    payload[a + 3] = 0x44
+                    original = bytes(payload)
+                    session = make_session(audio=[definition])
+                    decoded = session._decode_audio_clip_payload(payload)
+                    self.assertEqual(decoded['src_offset'], offset)
+                    self.assertEqual(decoded['length'], length)
+                    self.assertEqual(decoded['flags'], 0x1001)
+                    self.assertEqual(session.get_clips()[0]['type'], 'virtual')
+                    self.assertEqual(bytes(payload), original)
+
+    def test_uint8_source_offset_truncated_fields_are_rejected(self):
+        definition = audio_definition('COMPACT', 0x1001, 8680572, 100)
+        payload = definition.items[0].items[0]
+        a = 4 + len('COMPACT')
+        session = make_session()
+        for size in range(a + 5, a + 9):
+            with self.subTest(size=size):
+                with self.assertRaisesRegex(ValueError, 'Truncated source-offset/length'):
+                    session._decode_audio_clip_payload(payload[:size])
+
+    def test_unverified_source_flag_families_still_rejected(self):
+        definition = audio_definition('CLIP', 0x1001, 1000, 100)
+        payload = definition.items[0].items[0]
+        a = 4 + len('CLIP')
+        session = make_session()
+        for flags in (0x1000, 0x4000, 0x1002, 0x1fff, 0x5001):
+            with self.subTest(flags=flags):
+                raw = bytearray(payload)
+                struct.pack_into('<H', raw, a, flags)
+                with self.assertRaisesRegex(ValueError, 'Unsupported 0x2628 clip flags'):
+                    session._decode_audio_clip_payload(raw)
+
     def test_parent_uint32_and_virtual_selected_widths_are_decoded_exactly(self):
         session = make_session(
             audio=[

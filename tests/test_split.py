@@ -113,6 +113,34 @@ def timeline_info(playlist):
 
 
 class SplitClipTests(unittest.TestCase):
+    def test_user_timestamp_sentinel_does_not_overflow_existing_split(self):
+        session, clip_list, playlist = make_session()
+        payload = next(
+            item.items[0] for item in clip_list.items[1].items
+            if isinstance(item, PTBlock) and item.content_type == 0x2628
+        )
+        offset = 4 + struct.unpack_from("<I", payload, 0)[0]
+        struct.pack_into("<I", payload, offset + 13, 0xFFFFFFFF)
+        original = bytes(payload)
+        self.assertEqual(session.split_clip("AUDIO TRACK", "CLIP", 0, 0, 5, 0), (0, 1, 2, 240_000))
+        self.assertEqual(bytes(payload), original)
+        self.assertEqual(timeline_info(playlist), [(1, 0, 500), (2, 240_000, -1)])
+
+    def test_user_timestamp_sentinel_does_not_overflow_existing_subclip(self):
+        session, clip_list, _ = make_session()
+        payload = next(
+            item.items[0] for item in clip_list.items[1].items
+            if isinstance(item, PTBlock) and item.content_type == 0x2628
+        )
+        offset = 4 + struct.unpack_from("<I", payload, 0)[0]
+        struct.pack_into("<I", payload, offset + 13, 0xFFFFFFFF)
+        original = bytes(payload)
+        self.assertEqual(session.create_subclip(0, "SENTINEL_SUBCLIP", 48_000, 48_000), 1)
+        self.assertEqual(bytes(payload), original)
+        info = session._audio_clip_info_by_id(1)
+        self.assertEqual(info["src_offset"], 48_000)
+        self.assertEqual(info["length"], 48_000)
+
     def test_split_creates_two_contiguous_subclips_and_preserves_original_event(self):
         session, clip_list, playlist = make_session()
 

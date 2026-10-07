@@ -77,6 +77,17 @@ def event_info(timeline_event):
 
 
 class MoveClipTests(unittest.TestCase):
+    def test_move_at_25fps_accepts_frame24_and_rejects_frame25_without_mutation(self):
+        session, playlist = make_session()
+        session.frame_rate_enum = 0x02
+        self.assertEqual(session.move_clip("TARGET", 0, 0, 0, 24), 1)
+        events = [item for item in playlist.items if isinstance(item, PTBlock)]
+        self.assertEqual([event_info(item) for item in events], [(0, 46_080), (1, 96_000)])
+        before = [root.to_bytes()[0] for root in session.root_items]
+        with self.assertRaisesRegex(ValueError, "below 25"):
+            session.move_clip("TARGET", 0, 0, 0, 25)
+        self.assertEqual([root.to_bytes()[0] for root in session.root_items], before)
+
     def test_move_updates_only_target_and_resorts_playlist(self):
         session, playlist = make_session()
 

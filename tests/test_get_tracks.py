@@ -213,6 +213,21 @@ def make_native_deletion_profile(track_names=("MIX", "DIAL", "SFX")):
 
 
 class GetTracksTests(unittest.TestCase):
+    def test_unverified_anonymous_playlists_are_not_silently_omitted(self):
+        cases = (
+            ([playlist('')], 'Track name cannot be empty'),
+            ([playlist('NAMED'), playlist('')], 'Mixed named and anonymous'),
+            ([playlist('NAMED'), playlist('', event_count=1)], 'event count'),
+        )
+        for playlists, error in cases:
+            with self.subTest(playlists=len(playlists),
+                              anonymous_header=bytes(playlists[-1].items[0])):
+                session = make_session(playlists)
+                original = [b.to_bytes()[0] for b in session.root_items]
+                with self.assertRaisesRegex(ValueError, error):
+                    session.get_tracks()
+                self.assertEqual([b.to_bytes()[0] for b in session.root_items], original)
+
     def test_returns_ordered_main_track_names_including_empty_tracks(self):
         session = make_session([playlist("PISTE É"), playlist("SECOND")])
 

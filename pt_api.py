@@ -683,10 +683,13 @@ class TimecodeEngine:
     def get_frame_rate(self):
         # Enum mapping based on block 0x204d payload offset 0
         # 0x01 = 24 fps
+        # 0x02 = 25 fps (verified native Pro Tools 2024.3.1 session)
         # 0x09 = 23.976 fps
         # 0x05 = 29.97 DF fps
         if self.frame_rate_enum == 0x01:
             return 24.0, False # fps, is_drop_frame
+        elif self.frame_rate_enum == 0x02:
+            return 25.0, False
         elif self.frame_rate_enum == 0x09:
             return 24000 / 1001, False
         elif self.frame_rate_enum == 0x05:
@@ -697,6 +700,8 @@ class TimecodeEngine:
     def _nominal_fps(self):
         if self.frame_rate_enum in (0x01, 0x09):
             return 24
+        if self.frame_rate_enum == 0x02:
+            return 25
         if self.frame_rate_enum == 0x05:
             return 30
         self.get_frame_rate()  # Raises the public unsupported-rate error.
@@ -819,6 +824,10 @@ FLAT_PTX_CONTENT_TYPES = frozenset({
     0x262F,  # Fade geometry.
     0x2637,  # Clip Gain point dictionary.
 })
+# The leading UInt32 in a track map is a playlist count, never a child
+# header. Counts such as 90 (5A 00 00 00) otherwise form plausible false
+# blocks when combined with the following playlist header.
+RAW_PREFIX_PTX_CONTENT_TYPES = {0x1054: 4}
 
 def u_endian_read2(buf, offset, is_bigendian):
     fmt = ">H" if is_bigendian else "<H"
@@ -1112,8 +1121,338 @@ class ProToolsSession:
                 ProToolsSession._collect_offset_types_recursive(child, out)
 
     def get_tracks(self):
-        """Returns a list of all track names in the session."""
-        return [name for _, name, _ in self._validated_main_playlists()]
+        """Read main-playlist names, including the verified anonymous mono profile.
+
+        Catalog-derived names are returned without changing playlist headers.
+        This read-only resolution does not extend track/timeline writers.
+        """
+        return [name for _, name, _ in self._validated_main_playlists(allow_anonymous=True)]
+
+    def get_track_outputs(self):
+        """Read [(track_name, [output_name])] for verified mono Audio bus outputs.
+
+        All tracks must have the corroborated mono Audio identities and one
+        principal output, matching one autonomous mono or stereo bus in live 0x2603
+        catalog. Unsupported/ambiguous profiles raise ValueError, never return
+        a partial list. This method never mutates routing or searches cached data.
+        """
+        return [(name, [output]) for name, output, _ in self._validated_bus_track_outputs()]
+
+    def _validated_bus_track_outputs(self):
+        """Return verified (track_name, output_name, descriptor) from the live tree."""
+        def fail(reason):
+            raise ValueError("Unsupported mono bus track-output profile (%s)." % reason)
+
+        def direct(parent, kind):
+            return [b for b in parent.items if isinstance(b, PTBlock) and b.content_type == kind]
+
+        def first_raw(block):
+            if not block.items or not isinstance(block.items[0], (bytes, bytearray)):
+                fail("missing raw payload")
+            return bytes(block.items[0])
+
+        def name_at(payload, offset):
+            if len(payload) < offset + 4:
+                fail("truncated name length")
+            size = struct.unpack_from("<I", payload, offset)[0]
+            end = offset + 4 + size
+            if not size or end > len(payload):
+                fail("invalid name length")
+            try:
+                name = payload[offset + 4:end].decode("utf-8")
+            except UnicodeDecodeError:
+                fail("invalid UTF-8 name")
+            if "\x00" in name:
+                fail("NUL in name")
+            return name, payload[end:]
+
+        playlists = self._validated_main_playlists(allow_anonymous=True)
+        if not playlists:
+            return []
+        try:
+            names = self._validated_anonymous_mono_track_names(len(playlists))
+        except ValueError as exc:
+            raise ValueError("Unsupported mono bus track-output profile "
+                             "(unverified Audio track identities).") from exc
+        if names != [name for _, name, _ in playlists]:
+            fail("playlist and catalog names disagree")
+
+        # This identity validator reads the current tree and verifies both UI
+        # mirror families against every slot. It also gates folders/stereo.
+        slots = direct(self._root_blocks(0x2624)[0], 0x261c)
+        roots = self._root_blocks(0x2603)
+        if len(roots) != 1:
+            fail("missing or ambiguous live I/O catalog")
+        catalog = roots[0]
+        prefix = first_raw(catalog)
+        entries = direct(catalog, 0x2602)
+        if len(prefix) != 4 or struct.unpack_from("<I", prefix)[0] != len(entries):
+            fail("live I/O path count")
+        if len(catalog.get_all_blocks(0x2602)) != len(entries):
+            fail("nested live I/O paths")
+        by_name = {}
+        bus_identity_names = {}
+        for entry in entries:
+            payload = first_raw(entry)
+            name, tail = name_at(payload, 2)
+            by_name.setdefault(name, []).append((payload, tail))
+            # Fixed mono and stereo geometries only; other widths stay opaque.
+            if (payload[:2] == b"\x02\x00" and len(tail) == 42
+                    and tail[14:18] == b"\x2a\x00\x00\x00"):
+                bus_identity_names.setdefault(tail[18:26], []).append(name)
+            elif (payload[:2] == b"\x02\x01" and len(tail) == 44
+                  and tail[16:20] == b"\x2a\x00\x00\x00"):
+                bus_identity_names.setdefault(tail[20:28], []).append(name)
+
+        result = []
+        for name, slot in zip(names, slots):
+            definitions = direct(slot, 0x261b)
+            states = direct(definitions[0], 0x260d)
+            if len(states) != 1:
+                fail("principal output container")
+            outputs = direct(states[0], 0x260e)
+            if len(outputs) != 1 or len(slot.get_all_blocks(0x260e)) != 1:
+                fail("single principal output required")
+            route = outputs[0]
+            payload = first_raw(route)
+            if (len(route.items) != 1 or len(payload) < 40
+                    or payload[1:8] != b"\x00\x01\x01\x00\x00\x00\x00"
+                    or payload[8:12] != b"\x2a\x00\x00\x00"
+                    or payload[20:36] != b"\x00" * 16):
+                fail("principal output descriptor")
+            output, trailer = name_at(payload, 36)
+            if trailer not in (self._BUS_OUTPUT_TRAILERS[1], self._BUS_OUTPUT_TRAILERS[2]):
+                fail("unverified output trailer")
+            identity = payload[12:20]
+            candidates = by_name.get(output, [])
+            if len(candidates) != 1:
+                fail("missing or ambiguous selected bus")
+            entry, tail = candidates[0]
+            width, catalog_identity = self._validated_bus_path_identity(entry, tail)
+            if catalog_identity != identity or trailer != self._BUS_OUTPUT_TRAILERS[width]:
+                fail("selected bus identity or width disagrees with descriptor")
+            if len(bus_identity_names.get(identity, [])) != 1:
+                fail("ambiguous selected bus identity")
+            result.append((name, output, route))
+        return result
+
+    _BUS_OUTPUT_TRAILERS = {
+        1: bytes.fromhex("0000ffffffffffffffff00ffffffff000c0000"),
+        2: bytes.fromhex("0101ffffffffffffffff00ffffffff000c0100"),
+    }
+    _BUS_CENTER_PAN = bytes.fromhex(
+        "014601001400000000000100000002000000000000000000000000000000")
+
+    @staticmethod
+    def _validated_bus_path_identity(payload, tail):
+        """Return (width, identity) only for corroborated autonomous bus layouts."""
+        if payload[:2] == b"\x02\x00":
+            return 1, ProToolsSession._validated_mono_bus_path_identity(payload, tail)
+        if (payload[:2] != b"\x02\x01" or len(tail) != 44
+                or tail[:4] != b"\x02\x00\x00\x00"
+                or tail[8:16] != b"\xff\xff\x01\x00\x00\x00\x00\x00"
+                or tail[16:20] != b"\x2a\x00\x00\x00"
+                or tail[20:28] == b"\x00" * 8 or tail[28:] != b"\x00" * 16):
+            raise ValueError("Unsupported bus track-output profile "
+                             "(selected path is not a verified autonomous stereo bus).")
+        return 2, tail[20:28]
+
+    @staticmethod
+    def _validated_mono_bus_path_identity(payload, tail):
+        """Validate the selected autonomous mono bus geometry, not other widths."""
+        if (payload[:2] != b"\x02\x00" or len(tail) != 42
+                or tail[:4] != b"\x01\x00\x00\x00"
+                or tail[6:14] != b"\xff\xff\x01\x00\x00\x00\x00\x00"
+                or tail[14:18] != b"\x2a\x00\x00\x00"
+                or tail[18:26] == b"\x00" * 8 or tail[26:] != b"\x00" * 16):
+            raise ValueError("Unsupported mono bus track-output profile "
+                             "(selected path is not a verified autonomous mono bus).")
+        return tail[18:26]
+
+    def set_track_output(self, track_name, output_name):
+        """Assign a named mono Audio track to a verified autonomous bus.
+
+        Reuse a currently assigned destination's descriptor. Otherwise require
+        at least two distinct assigned buses agreeing on code minus live path
+        ordinal; validate the target geometry and UInt8 range without wrapping.
+        Mono-to-stereo also requires the native empty-pan container and installs
+        the corroborated centered static lane. Stereo-to-mono accepts only this
+        exact centered lane, with no verified pointer references, and removes it.
+        Stereo-to-stereo preserves this exact centered lane and changes only
+        the descriptor. Native comparisons and manual Pro Tools round trips
+        are verified (identical calls are no-ops).
+        No general pan authoring is provided.
+        All checks precede replacement of the routing and optional pan. Return 1 if changed,
+        0 if already identical. Call save() separately. Both mono branches are
+        verified against native references and manual Pro Tools round trips;
+        mono-to-stereo is also validated by a manual Pro Tools round trip.
+        Stereo-to-mono opening/saving/reopening is confirmed in Pro Tools.
+        """
+        for label, value in (("track_name", track_name), ("output_name", output_name)):
+            if not isinstance(value, str):
+                raise TypeError("%s must be a string." % label)
+            if not value or "\x00" in value:
+                raise ValueError("%s must be non-empty and contain no NUL." % label)
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValueError("%s must be valid UTF-8." % label) from exc
+
+        # Anonymous playlists are verified for reading, not for this native
+        # named-track writer profile. Existing writer guards stay strict.
+        self._validated_main_playlists()
+        outputs = self._validated_bus_track_outputs()
+        target = None
+        used = {}
+        codes = {}
+        for name, output, route in outputs:
+            if route.block_type != 0x09:
+                raise ValueError("Unsupported mono bus output descriptor block type.")
+            payload = bytes(route.items[0])
+            if output in used and used[output] != payload:
+                raise ValueError("Conflicting descriptors for an already-used mono bus.")
+            code = payload[0]
+            if code in codes and codes[code] != output:
+                raise ValueError("Ambiguous code shared by different mono bus outputs.")
+            used[output] = payload
+            codes[code] = output
+            if name == track_name:
+                target = route
+        if target is None:
+            raise ValueError("Track not found in verified mono Audio outputs: %r." % track_name)
+        current = bytes(target.items[0])
+        if output_name in used:
+            donor = used[output_name]
+        else:
+            # The preceding reader has validated this unique live root, raw
+            # names, count and direct-only paths. Count ALL paths, including
+            # opaque/unselected widths; filtering them changes the ordinals.
+            catalog = self._root_blocks(0x2603)[0]
+            entries = [b for b in catalog.items
+                       if isinstance(b, PTBlock) and b.content_type == 0x2602]
+            if catalog.block_type != 0x02 or any(b.block_type != 0x0e for b in entries):
+                raise ValueError("Unsupported unused mono bus output catalog block types.")
+            paths = {}
+            bus_identities = {}
+            for index, entry in enumerate(entries):
+                payload = bytes(entry.items[0])
+                size = struct.unpack_from("<I", payload, 2)[0]
+                name = payload[6:6 + size].decode("utf-8")
+                tail = payload[6 + size:]
+                paths.setdefault(name, []).append((index, payload, tail))
+                if (payload[:2] == b"\x02\x00" and len(tail) == 42
+                        and tail[14:18] == b"\x2a\x00\x00\x00"):
+                    bus_identities.setdefault(tail[18:26], []).append(name)
+                elif (payload[:2] == b"\x02\x01" and len(tail) == 44
+                      and tail[16:20] == b"\x2a\x00\x00\x00"):
+                    bus_identities.setdefault(tail[20:28], []).append(name)
+            selected = paths.get(output_name, [])
+            if len(selected) != 1:
+                raise ValueError("Target mono bus is missing or ambiguous in the live catalog: %r."
+                                 % output_name)
+            index, payload, tail = selected[0]
+            width, identity = self._validated_bus_path_identity(payload, tail)
+            if len(bus_identities.get(identity, [])) != 1:
+                raise ValueError("Ambiguous identity for the unused mono bus target.")
+            if len(used) < 2:
+                raise ValueError("Unused mono bus code calibration requires at least "
+                                 "two distinct assigned buses.")
+            bases = {descriptor[0] - paths[name][0][0] for name, descriptor in used.items()}
+            if len(bases) != 1 or min(bases) < 0:
+                raise ValueError("Inconsistent or negative mono bus code calibration.")
+            code = next(iter(bases)) + index
+            if not 0 <= code <= 0xff:
+                raise ValueError("Calibrated mono bus output code is outside UInt8 range.")
+            encoded = output_name.encode("utf-8")
+            donor = (bytes((code,)) + current[1:12] + identity + current[20:36]
+                     + struct.pack("<I", len(encoded)) + encoded + self._BUS_OUTPUT_TRAILERS[width])
+        # The bus width belongs to the destination, not the source track.
+        replacement = bytearray(current[:36])
+        replacement[0] = donor[0]
+        replacement[12:20] = donor[12:20]
+        replacement.extend(donor[36:-19])
+        replacement.extend(donor[-19:])
+        replacement = bytes(replacement)
+        if replacement == current:
+            return 0
+        current_width = 1 if current[-19:] == self._BUS_OUTPUT_TRAILERS[1] else 2
+        new_width = 1 if donor[-19:] == self._BUS_OUTPUT_TRAILERS[1] else 2
+        pan = None
+        pan_items = None
+        removed_offsets = None
+        removed_types = None
+        if current_width != new_width or current_width == 2:
+            # Route ownership/path were established by the shared validator.
+            slots = [b for b in self._root_blocks(0x2624)[0].items
+                     if isinstance(b, PTBlock) and b.content_type == 0x261c]
+            slot = slots[[name for name, _, _ in outputs].index(track_name)]
+            definition = next(b for b in slot.items
+                              if isinstance(b, PTBlock) and b.content_type == 0x261b)
+            state = next(b for b in definition.items
+                         if isinstance(b, PTBlock) and b.content_type == 0x260d)
+            containers = [b for b in state.items
+                          if isinstance(b, PTBlock) and b.content_type == 0x260c]
+            if (len(containers) != 2 or len(slot.get_all_blocks(0x260c)) != 2
+                    or any(b.block_type != 0x02 for b in containers)):
+                raise ValueError("Bus routing requires two verified direct pan containers.")
+            pan = containers[0]
+            def empty(container):
+                return (len(container.items) == 1
+                        and isinstance(container.items[0], (bytes, bytearray))
+                        and bytes(container.items[0]) == bytes(14))
+            if current_width == 1:
+                # First empty container becomes a centered pan; second untouched.
+                if not all(empty(b) for b in containers):
+                    raise ValueError("Mono-to-stereo requires the verified empty pan containers.")
+                lane = PTBlock(0x01, 0x260a)
+                lane.items = [self._BUS_CENTER_PAN]
+                # Native comparison adds no 0x0002 pointer to this new lane.
+                pan_items = [b"\x01", lane, bytes(13)]
+            else:
+                # Do not silently discard a noncentered pan or automation.
+                if (not empty(containers[1]) or len(pan.items) != 3
+                        or not isinstance(pan.items[0], (bytes, bytearray))
+                        or bytes(pan.items[0]) != b"\x01"
+                        or not isinstance(pan.items[2], (bytes, bytearray))
+                        or bytes(pan.items[2]) != bytes(13)
+                        or not isinstance(pan.items[1], PTBlock)
+                        or pan.items[1].content_type != 0x260a
+                        or pan.items[1].block_type != 0x01
+                        or len(pan.items[1].items) != 1
+                        or not isinstance(pan.items[1].items[0], (bytes, bytearray))
+                        or bytes(pan.items[1].items[0]) != self._BUS_CENTER_PAN):
+                    raise ValueError("Stereo-to-%s requires the verified centered static pan lane."
+                                     % ("mono" if new_width == 1 else "stereo"))
+                if new_width == 2:
+                    # Same width: preserve both native pan containers, lane,
+                    # offsets and deletion metadata; only the route changes.
+                    pan = None
+                else:
+                    lane = pan.items[1]
+                    if lane.original_offset:
+                        tables = self._root_blocks(0x0002)
+                        if len(tables) != 1:
+                            raise ValueError("Stereo-to-mono requires an unambiguous pan pointer table.")
+                        table = bytes(self._raw_0002_payload(tables[0]))
+                        positions = self._validate_0002_record_layout(table)
+                        if not positions:
+                            raise ValueError("Stereo-to-mono requires a nonempty standard pan pointer table.")
+                        if any(struct.unpack_from("<I", table, pos)[0] == lane.original_offset
+                               for _, pos in positions):
+                            raise ValueError("Stereo-to-mono pan lane has unverified pointer references.")
+                    # Prepare deletion bookkeeping without touching live metadata.
+                    removed_offsets = list(getattr(self, '_removed_offsets', []))
+                    removed_types = dict(getattr(self, '_removed_block_types', {}))
+                    self._collect_offsets_recursive(lane, removed_offsets)
+                    self._collect_offset_types_recursive(lane, removed_types)
+                    pan_items = [bytes(14)]
+        target.items[0] = replacement
+        if pan is not None:
+            pan.items = pan_items
+        if removed_offsets is not None:
+            self._removed_offsets = removed_offsets
+            self._removed_block_types = removed_types
+        return 1
 
     def rename_track(self, old_name, new_name):
         """Rename one visible main-timeline track in a verified native layout.
@@ -1989,7 +2328,157 @@ class ProToolsSession:
         logger.info("Deleted %d empty template track(s): %s", len(names_to_delete), names_to_delete)
         return list(names_to_delete)
 
-    def _validated_main_playlists(self):
+    def _validated_anonymous_mono_track_names(self, count):
+        """Resolve only the native all-anonymous mono profile, without mutation.
+
+        Playlist ordinals are corroborated by indexed 0x1014 descriptors,
+        ordered 0x210b names/identities, two 0x251a mirror families and 0x261c
+        identities. A count-only or best-effort fallback is never accepted.
+        """
+        return [name for name, _ in self._validated_audio_track_identities(count)]
+
+    def _validated_audio_track_identities(self, count, allow_stereo=False):
+        """Corroborate native Audio identities/widths for named Volume profiles.
+
+        The default retains the existing mono/anonymous resolver's contract.
+        Stereo descriptor indexes address channel playlists, not track slots.
+        Unknown descriptor fields remain opaque; no cached names or offsets.
+        """
+        def fail(reason):
+            raise ValueError("Track name cannot be empty: unverified anonymous "
+                             "mono track catalog (%s)." % reason)
+
+        def root(kind):
+            found = self._root_blocks(kind)
+            if len(found) != 1:
+                fail("missing or ambiguous 0x%04x" % kind)
+            return found[0]
+
+        def children(parent, kind):
+            return [i for i in parent.items if isinstance(i, PTBlock) and i.content_type == kind]
+
+        def raw(item):
+            if not isinstance(item, (bytes, bytearray)):
+                fail("non-raw field")
+            return bytes(item)
+
+        def name_and_tail(payload, offset):
+            if len(payload) < offset + 4:
+                fail("truncated name length")
+            n = struct.unpack_from("<I", payload, offset)[0]
+            end = offset + 4 + n
+            if not n or end > len(payload):
+                fail("invalid name length")
+            try:
+                name = payload[offset + 4:end].decode("utf-8")
+            except UnicodeDecodeError:
+                fail("invalid UTF-8 name")
+            if "\x00" in name:
+                fail("NUL in name")
+            return name, payload[end:]
+
+        descriptor_root = root(0x1015)
+        descriptors = children(descriptor_root, 0x1014)
+        prefix = raw(descriptor_root.items[0]) if descriptor_root.items else b""
+        if len(prefix) != 4 or struct.unpack_from("<I", prefix)[0] != count or len(descriptors) != count:
+            fail("descriptor count")
+        names, widths = [], []
+        playlist_index = 0
+        for descriptor in descriptors:
+            if len(descriptor.items) != 1:
+                fail("descriptor structure")
+            name, tail = name_and_tail(raw(descriptor.items[0]), 0)
+            mono = (len(tail) == 39 and tail[:5] == b"\x00\x01\x00\x00\x00"
+                    and struct.unpack_from("<I", tail, 5)[0] == playlist_index
+                    and struct.unpack_from("<I", tail, 30)[0] == playlist_index
+                    and tail[11:15] == b"\x2a\x00\x00\x00")
+            stereo = (allow_stereo and len(tail) == 45
+                      and tail[:5] == b"\x01\x02\x00\x00\x00"
+                      and struct.unpack_from("<HH", tail, 5) == (playlist_index, playlist_index + 1)
+                      and tail[9:13] == bytes(4)
+                      and tail[13:17] == b"\x2a\x00\x00\x00"
+                      and struct.unpack_from("<II", tail, 32) == (playlist_index, playlist_index + 1))
+            if not (mono or stereo):
+                fail("unsupported mono descriptor or ordinal")
+            names.append(name)
+            widths.append(2 if stereo else 1)
+            playlist_index += widths[-1]
+        if len(set(names)) != count:
+            fail("duplicate descriptor name")
+
+        metadata_root = root(0x2107)
+        metadata = children(metadata_root, 0x210b)
+        prefix = raw(metadata_root.items[0]) if metadata_root.items else b""
+        if (len(prefix) != 13 or prefix[8] != 1
+                or struct.unpack_from("<I", prefix, 9)[0] != count or len(metadata) != count):
+            fail("metadata count")
+        identities = []
+        for name, entry in zip(names, metadata):
+            if len(entry.items) != 1:
+                fail("metadata structure")
+            actual, tail = name_and_tail(raw(entry.items[0]), 4)
+            if actual != name or len(tail) != 32 or tail[4:8] != b"\x2a\x00\x00\x00":
+                fail("metadata name or identity")
+            identities.append(tail[8:16])
+        if len(set(identities)) != count or any(identity == b"\x00" * 8 for identity in identities):
+            fail("duplicate or empty identity")
+
+        catalog = root(0x2519)
+        mirrors = children(catalog, 0x251a)
+        if (len(mirrors) != 2 * count or len(catalog.items) < 2 * count + 2
+                or catalog.items[1:count + 1] != mirrors[:count]
+                or catalog.items[count + 2:2 * count + 2] != mirrors[count:]):
+            fail("catalog mirror families")
+        middle = raw(catalog.items[count + 1])
+        if len(middle) != 4 or struct.unpack_from("<I", middle)[0] != count:
+            fail("catalog mirror count")
+        for family in (mirrors[:count], mirrors[count:]):
+            for index, (name, identity, width, mirror) in enumerate(zip(names, identities, widths, family)):
+                if not mirror.items:
+                    fail("empty catalog mirror")
+                payload = raw(mirror.items[0])
+                actual, tail = name_and_tail(payload, 2)
+                if (payload[:2] != b"\x00\x00" or actual != name or len(tail) != 42
+                        or tail[:6] != bytes([width - 1]) + bytes(5)
+                        or tail[6:10] != b"\x2a\x00\x00\x00"
+                        or tail[10:18] != identity
+                        or struct.unpack_from("<I", tail, 18)[0] != index + 1
+                        or tail[28:32] != b"\x2a\x00\x00\x00"
+                        or tail[32:40] != identity
+                        or (allow_stereo and tail[40:42] != bytes([width - 1, 0]))):
+                    fail("unsupported mono mirror, name, identity or order")
+
+        slots_root = root(0x2624)
+        slots = children(slots_root, 0x261c)
+        prefix = raw(slots_root.items[0]) if slots_root.items else b""
+        if len(prefix) != 4 or struct.unpack_from("<I", prefix)[0] != count or len(slots) != count:
+            fail("track slot count")
+        for index, (identity, slot) in enumerate(zip(identities, slots)):
+            if allow_stereo and 2 in widths:
+                ordinals = [raw(item) for item in slot.items
+                            if isinstance(item, (bytes, bytearray)) and len(item) == 12
+                            and bytes(item[4:6]) == b"\x01\x00"
+                            and bytes(item[8:]) == b"\x00\x00\xff\xff"]
+                if (len(ordinals) != 1 or struct.unpack_from("<I", ordinals[0])[0] != index
+                        or struct.unpack_from("<H", ordinals[0], 6)[0] != index):
+                    fail("mixed Audio track slot ordinal")
+            # Native path: 0x261c -> 0x261b -> 0x102d -> 0x2619.
+            # Reject alternative/duplicate identity records, not just a
+            # matching record somewhere in the slot's descendants.
+            config = slot
+            for kind in (0x261b, 0x102d, 0x2619):
+                found = children(config, kind)
+                if len(found) != 1:
+                    fail("track slot identity structure")
+                config = found[0]
+            if len(slot.get_all_blocks(0x2619)) != 1 or not config.items:
+                fail("track slot identity structure")
+            suffix = raw(config.items[-1])
+            if len(suffix) != 18 or suffix[4:8] != b"\x2a\x00\x00\x00" or suffix[8:16] != identity:
+                fail("track slot identity or order")
+        return list(zip(names, widths))
+
+    def _validated_main_playlists(self, allow_anonymous=False):
         """Return direct main playlists as (block, name, events) tuples."""
         track_maps = self._root_blocks(0x1054)
         if not track_maps:
@@ -2032,9 +2521,6 @@ class ProToolsSession:
                 name = header[4:count_offset].decode("utf-8").strip("\x00")
             except UnicodeDecodeError as exc:
                 raise ValueError("Invalid UTF-8 track name.") from exc
-            if not name:
-                raise ValueError("Track name cannot be empty.")
-
             events = [
                 child for child in playlist.items
                 if isinstance(child, PTBlock) and child.content_type == 0x1050
@@ -2047,6 +2533,16 @@ class ProToolsSession:
                 )
             result.append((playlist, name, events))
 
+        if any(not name for _, name, _ in result):
+            if not allow_anonymous:
+                raise ValueError("Track name cannot be empty.")
+            if any(name for _, name, _ in result):
+                raise ValueError("Mixed named and anonymous main playlists are not supported.")
+            if any(len(playlist.items[0]) != 8 for playlist, _, _ in result):
+                raise ValueError("Unsupported anonymous main playlist header.")
+            names = self._validated_anonymous_mono_track_names(len(result))
+            result = [(playlist, name, events)
+                      for (playlist, _, events), name in zip(result, names)]
         return result
 
     def get_markers(self, marker_track_name=None):
@@ -2268,6 +2764,9 @@ class ProToolsSession:
         source_width_by_flags = {
             0x0000: 0,
             0x0001: 0,
+            # Native 100-sample head trim: virtual source offset UInt8.
+            # This reader extension does not authorize a new relink layout.
+            0x1001: 1,
             0x2000: 2,
             0x2001: 2,
             0x3000: 3,
@@ -2711,7 +3210,7 @@ class ProToolsSession:
 
         engine = TimecodeEngine(self.sample_rate, self.frame_rate_enum)
         placements = []
-        for _, track_name, events in self._validated_main_playlists():
+        for _, track_name, events in self._validated_main_playlists(allow_anonymous=True):
             for event in events:
                 payload_blocks = [
                     child for child in event.items
@@ -2804,7 +3303,7 @@ class ProToolsSession:
             )
             definition_by_clip[clip_id] = definition
 
-        events = self._validated_main_timeline_events()
+        events = self._validated_main_timeline_events(allow_anonymous=True)
         if include_fades:
             _, _, fade_bindings = self._validated_fade_geometry_bindings(events)
             geometry_by_event = {
@@ -2839,7 +3338,7 @@ class ProToolsSession:
 
         track_names = {
             id(playlist): name
-            for playlist, name, _ in self._validated_main_playlists()
+            for playlist, name, _ in self._validated_main_playlists(allow_anonymous=True)
         }
         audio_placements = []
         for playlist, event, _, payload in events:
@@ -2910,8 +3409,8 @@ class ProToolsSession:
                         if placement["playlist"] is playlist
                         and placement["start"] == anchor_timestamp
                     ]
-                elif geometry_length in (26, 27):
-                    length_samples = struct.unpack_from("<H", geometry_payload, 8)[0]
+                elif geometry_length in (26, 27, 29):
+                    length_samples = self._decode_fade_out_length(geometry_payload)
                     if length_samples > anchor_timestamp:
                         raise ValueError("Fade Out starts before sample zero.")
                     start_samples = anchor_timestamp - length_samples
@@ -3306,6 +3805,13 @@ class ProToolsSession:
         # types whose nesting is not fully reverse-engineered yet.
         allow_children = content_type not in FLAT_PTX_CONTENT_TYPES
 
+        prefix_end = min(
+            payload_end,
+            payload_start + RAW_PREFIX_PTX_CONTENT_TYPES.get(content_type, 0),
+        )
+        current_bytes.extend(self.data[i:prefix_end])
+        i = prefix_end
+
         while i < payload_end:
             if allow_children and self.data[i] == ZMARK:
                 child, jump = self._parse_block(i, payload_end, depth + 1)
@@ -3553,10 +4059,10 @@ class ProToolsSession:
             raise ValueError("Invalid 0x2629 clip definition.")
         return self._decode_audio_clip_payload(payload_blocks[0].items[0])
 
-    def _validated_main_timeline_events(self):
+    def _validated_main_timeline_events(self, allow_anonymous=False):
         """Return validated direct events from the visible 0x1054 playlists."""
         timeline_events = []
-        playlists = self._validated_main_playlists()
+        playlists = self._validated_main_playlists(allow_anonymous=allow_anonymous)
         if not playlists:
             raise ValueError("No main track map (0x1054) found.")
         for playlist, _, events in playlists:
@@ -3699,6 +4205,21 @@ class ProToolsSession:
 
         return geometry_root, geometries, bindings
 
+    @staticmethod
+    def _decode_fade_out_length(payload):
+        """Read legacy UInt16 or verified native repeated-UInt24 fade-outs."""
+        if len(payload) in (26, 27):
+            return struct.unpack_from("<H", payload, 8)[0]
+        if len(payload) != 29 or payload[5] != 0x33 or payload[14] != 0x02:
+            raise ValueError("Unsupported 0x262f UInt24 Fade Out layout.")
+        length = int.from_bytes(payload[8:11], "little")
+        repeated_length = int.from_bytes(payload[11:14], "little")
+        if length != repeated_length:
+            raise ValueError("Inconsistent 0x262f Fade Out durations.")
+        if length == 0:
+            raise ValueError("Fade Out duration must be positive.")
+        return length
+
     def _fade_bindings_for_audio_placement(
         self, start_samples, length_samples, playlist, timeline_events=None
     ):
@@ -3718,7 +4239,7 @@ class ProToolsSession:
             anchor = struct.unpack_from("<Q", entry[3], 7)[0]
             is_related = (
                 (geometry_length == 22 and anchor == start_samples)
-                or (geometry_length in (26, 27) and anchor == end_samples)
+                or (geometry_length in (26, 27, 29) and anchor == end_samples)
                 or (geometry_length == 34 and anchor in (start_samples, end_samples))
             )
             if is_related:
@@ -6914,7 +7435,7 @@ class ProToolsSession:
         _, _, existing_fade_bindings = self._validated_fade_geometry_bindings(
             timeline_events
         )
-        expected_geometry_lengths = (22,) if fade_type == "in" else (26, 27)
+        expected_geometry_lengths = (22,) if fade_type == "in" else (26, 27, 29)
         if any(
             entry[0] is b1052
             and struct.unpack_from("<Q", entry[3], 7)[0] == target_samples
@@ -7012,8 +7533,64 @@ class ProToolsSession:
 
         return new_geometry_id
 
+    def _validated_clip_gain_dictionary(self):
+        """Read bounded static/observed four-node records, never scan for magic.
+
+        Return the live block, raw payload and record offsets/bytes. Envelope
+        records are validated solely for preservation, not editing. Unknown
+        record profiles are refused, including unverified three-node records.
+        """
+        roots = self._root_blocks(0x2637)
+        if not roots:
+            raise ValueError("No Clip Gain dictionary (0x2637) found in session.")
+        if len(roots) != 1:
+            raise ValueError("Ambiguous session: multiple root 0x2637 Clip Gain dictionaries.")
+        block = roots[0]
+        if (len(block.items) != 1 or not isinstance(block.items[0], (bytes, bytearray))
+                or len(block.items[0]) < 4):
+            raise ValueError("Invalid 0x2637 Clip Gain payload.")
+        raw = bytes(block.items[0])
+        count = struct.unpack_from("<I", raw, 0)[0]
+        if count > (len(raw) - 4) // 30:
+            raise ValueError("Inconsistent 0x2637 point count or truncated records.")
+        records = []
+        offset = 4
+        static_header = bytes.fromhex("0146010016000000000001000000040000000000000000000000")
+        envelope_header = bytes.fromhex("014601002e0000000000040000000400030000000000")
+        for index in range(count):
+            if len(raw) - offset < 8 or raw[offset:offset + 4] != b"\x01\x46\x01\x00":
+                raise ValueError("Invalid 0x2637 record header at index %d." % index)
+            size = struct.unpack_from("<I", raw, offset + 4)[0]
+            end = offset + 8 + size
+            if end > len(raw):
+                raise ValueError("Truncated 0x2637 record at index %d." % index)
+            record = raw[offset:end]
+            if size == 0x16:
+                if record[:26] != static_header or not math.isfinite(struct.unpack_from("<f", record, 26)[0]):
+                    raise ValueError("Invalid static Clip Gain record at index %d." % index)
+            elif size == 0x2e:
+                if record[:22] != envelope_header:
+                    raise ValueError("Invalid four-node Clip Gain envelope at index %d." % index)
+                nodes = [struct.unpack_from("<If", record, 22 + 8 * i) for i in range(4)]
+                if (nodes[0][0] != 0 or any(not math.isfinite(value) for _, value in nodes)
+                        or any(nodes[i][0] <= nodes[i - 1][0] for i in range(1, 4))):
+                    raise ValueError("Invalid four-node Clip Gain nodes at index %d." % index)
+            else:
+                raise NotImplementedError("Unsupported Clip Gain record size 0x%x." % size)
+            records.append((offset, record))
+            offset = end
+        if offset != len(raw):
+            raise ValueError("Inconsistent 0x2637 point count or trailing bytes.")
+        return block, raw, records
+
     def set_clip_gain(self, clip_name, float_gain_db):
-        """Set one uniquely identified clip's static gain without shared writes."""
+        """Set one uniquely identified clip's static gain without shared writes.
+
+        Unreleased mixed dictionaries: existing unshared/shared static targets
+        are Pro Tools-validated; a first gain is appended (its manual validation
+        is pending). The observed four-node envelope is preserved, never edited.
+        Modern UUID index tails are not supported in this profile.
+        """
         negative_infinity_value = struct.unpack(
             "<f", bytes.fromhex("f41a91c3")
         )[0]
@@ -7058,26 +7635,9 @@ class ProToolsSession:
             automation_index = struct.unpack_from("<i", payload, len(payload) - 6)[0]
             clip_gain_entries.append((b2628, payload, automation_index))
 
-        roots_2637 = self._root_blocks(0x2637)
-        if not roots_2637:
-            raise ValueError("No Clip Gain dictionary (0x2637) found in session.")
-        if len(roots_2637) != 1:
-            raise ValueError("Ambiguous session: multiple root 0x2637 Clip Gain dictionaries.")
-        b2637 = roots_2637[0]
-        if (
-            len(b2637.items) != 1
-            or not isinstance(b2637.items[0], (bytes, bytearray))
-            or len(b2637.items[0]) < 4
-        ):
-            raise ValueError("Invalid 0x2637 Clip Gain payload.")
-
-        current_payload = bytearray(b2637.items[0])
-        num_points = struct.unpack_from("<I", current_payload, 0)[0]
-        expected_length = 4 + (num_points * 30)
-        if len(current_payload) != expected_length:
-            raise ValueError(
-                f"Inconsistent 0x2637 point count: declared={num_points}, payload_length={len(current_payload)}."
-            )
+        b2637, raw_gain, records = self._validated_clip_gain_dictionary()
+        current_payload = bytearray(raw_gain)
+        num_points = len(records)
 
         for clip_id, (_, _, automation_index) in enumerate(clip_gain_entries):
             if automation_index != -1 and not 0 <= automation_index < num_points:
@@ -7091,6 +7651,9 @@ class ProToolsSession:
         ]
         clip_payload = bytearray(target_payload)
 
+        shared = sum(index == automation_index for _, _, index in clip_gain_entries) > 1
+        if automation_index != -1 and len(records[automation_index][1]) != 30:
+            raise NotImplementedError("Editing a Clip Gain envelope is not supported.")
         if automation_index == -1:
             point_meta = bytes.fromhex("0146010016000000000001000000040000000000000000000000")
             if num_points > 0x7FFFFFFF:
@@ -7099,15 +7662,13 @@ class ProToolsSession:
             current_payload.extend(point_meta + float_bytes)
             struct.pack_into("<I", current_payload, 0, num_points + 1)
             struct.pack_into("<i", clip_payload, len(clip_payload) - 6, automation_index)
-        elif sum(
-            index == automation_index for _, _, index in clip_gain_entries
-        ) > 1:
+        elif shared:
             # Different clip definitions must not change together merely because
             # they share one global point index. Clone the complete 30-byte point
             # and relink only the requested clip.
             if num_points > 0x7FFFFFFF:
                 raise OverflowError("Clip Gain point index exceeds signed Int32.")
-            point_offset = 4 + (automation_index * 30)
+            point_offset = records[automation_index][0]
             cloned_point = bytearray(current_payload[point_offset:point_offset + 30])
             cloned_point[26:30] = float_bytes
             automation_index = num_points
@@ -7115,7 +7676,7 @@ class ProToolsSession:
             struct.pack_into("<I", current_payload, 0, num_points + 1)
             struct.pack_into("<i", clip_payload, len(clip_payload) - 6, automation_index)
         else:
-            value_offset = 4 + (automation_index * 30) + 26
+            value_offset = records[automation_index][0] + 26
             current_payload[value_offset:value_offset + 4] = float_bytes
 
         b2637.items[0] = current_payload
@@ -7126,6 +7687,241 @@ class ProToolsSession:
             val, clip_name, automation_index,
         )
         return automation_index
+
+    def get_volume_automation(self, track_name=None):
+        """Read the verified named mono/stereo Audio volume-envelope profiles.
+
+        Return fresh entries with track, ordinal, ok, reason, node_count,
+        payload_len and nodes (sample, timecode, db). An optional exact track
+        name filters the result after complete validation; invalid profiles
+        raise rather than return partial/guessed data. Read the live tree only.
+        A stereo track has one Volume entry, not one per channel playlist.
+        Anonymous/hidden/reordered tracks and alternative state layouts are not
+        covered. Writer validation status is documented separately.
+        """
+        if track_name is not None:
+            if not isinstance(track_name, str):
+                raise TypeError("track_name must be a string or None.")
+            if not track_name or "\x00" in track_name:
+                raise ValueError("track_name must be non-empty and contain no NUL.")
+            try:
+                track_name.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValueError("track_name must be valid UTF-8.") from exc
+        lanes = self._validated_named_audio_volume_lanes()
+        if track_name is not None and track_name not in [name for name, _, _ in lanes]:
+            raise ValueError("Track not found in verified Audio volume lanes: %r." % track_name)
+        engine = TimecodeEngine(self.sample_rate, self.frame_rate_enum)
+        result = []
+        for ordinal, (name, lane, nodes) in enumerate(lanes):
+            if track_name is not None and name != track_name:
+                continue
+            result.append({"track": name, "ordinal": ordinal, "ok": True, "reason": "",
+                           "node_count": len(nodes), "payload_len": len(lane.items[0]),
+                           "nodes": [{"sample": timestamp,
+                                      "timecode": engine.samples_to_timecode(timestamp),
+                                      "db": value / 10.0} for timestamp, value in nodes]})
+        return result
+
+    def _validated_named_audio_volume_lanes(self):
+        """Resolve one native Volume lane per corroborated Audio track slot."""
+        playlists = self._validated_main_playlists()
+        if not playlists:
+            return []
+        roots = self._root_blocks(0x1015)
+        if len(roots) != 1:
+            raise ValueError("Unsupported Audio volume profile (track descriptor root).")
+        count = len([b for b in roots[0].items if isinstance(b, PTBlock) and b.content_type == 0x1014])
+        try:
+            tracks = self._validated_audio_track_identities(count, allow_stereo=True)
+        except ValueError as exc:
+            raise ValueError("Unsupported Audio volume profile (unverified track identities or widths).") from exc
+        expanded = [name for name, width in tracks for _ in range(width)]
+        if expanded != [name for _, name, _ in playlists]:
+            raise ValueError("Unsupported Audio volume profile (channel playlist names or order).")
+        if all(width == 1 for _, width in tracks):
+            return self._validated_mono_volume_lanes()
+        return self._validated_volume_state_lanes([name for name, _ in tracks])
+
+    def _validated_mono_volume_lanes(self):
+        """Resolve only the corroborated named mono state, not all 0x260a lanes."""
+        def fail(reason):
+            raise ValueError("Unsupported mono volume profile (%s)." % reason)
+
+        playlists = self._validated_main_playlists()
+        if not playlists:
+            return []
+        try:
+            names = self._validated_anonymous_mono_track_names(len(playlists))
+        except ValueError as exc:
+            raise ValueError("Unsupported mono volume profile (unverified Audio track identities).") from exc
+        if names != [name for _, name, _ in playlists]:
+            fail("playlist and catalog names disagree")
+        return self._validated_volume_state_lanes(names)
+
+    def _validated_volume_state_lanes(self, names):
+        """Common verified 13-item state; identities are validated by the caller."""
+        def fail(reason):
+            raise ValueError("Unsupported mono volume profile (%s)." % reason)
+
+        def direct(parent, kind):
+            return [b for b in parent.items if isinstance(b, PTBlock) and b.content_type == kind]
+
+        root = self._root_blocks(0x2624)[0]
+        slots = direct(root, 0x261c)
+        if len(root.get_all_blocks(0x261c)) != len(slots):
+            fail("nested track slots")
+        kinds = {0: (0x1029, 0x0d), 2: (0x260e, 0x09), 4: (0x260a, 0x01),
+                 6: (0x260a, 0x01), 8: (0x260c, 0x02), 9: (0x260c, 0x02),
+                 11: (0x260a, 0x01)}
+        raw = {1: b"\x01\x00", 3: b"\x01", 5: b"\x01", 7: b"\x00",
+               10: b"\x01", 12: bytes(8)}
+        result = []
+        for name, slot in zip(names, slots):
+            definitions = direct(slot, 0x261b)
+            states = direct(definitions[0], 0x260d)
+            if (slot.block_type != 0x04 or definitions[0].block_type != 0x0d
+                    or len(states) != 1 or len(slot.get_all_blocks(0x260d)) != 1
+                    or states[0].block_type != 0x05):
+                fail("principal state ownership or type")
+            state = states[0]
+            if len(state.items) != 13:
+                fail("principal state geometry")
+            for index, (kind, block_type) in kinds.items():
+                item = state.items[index]
+                if (not isinstance(item, PTBlock) or item.content_type != kind
+                        or item.block_type != block_type):
+                    fail("principal state lane order or type")
+            for index, value in raw.items():
+                item = state.items[index]
+                if not isinstance(item, (bytes, bytearray)) or bytes(item) != value:
+                    fail("principal state raw selectors")
+            # Native edit changes only the first DIRECT lane, not the two
+            # other direct 0x260a siblings or a pan lane nested in 0x260c.
+            lane = state.items[4]
+            if len(lane.items) != 1 or not isinstance(lane.items[0], (bytes, bytearray)):
+                fail("volume lane is not a single raw payload")
+            payload = bytes(lane.items[0])
+            nodes = self._decode_verified_mono_volume_payload(payload)
+            result.append((name, lane, nodes))
+        return result
+
+    @staticmethod
+    def _decode_verified_mono_volume_payload(payload):
+        """Decode the observed envelope; no signature search or partial nodes."""
+        def fail(reason):
+            raise ValueError("Invalid verified mono volume envelope (%s)." % reason)
+        if (len(payload) < 30 or payload[:4] != b"\x01\x46\x01\x00"
+                or payload[8:10] != bytes(2) or payload[-2:] != bytes(2)):
+            fail("identifier, minimum size, padding or terminator")
+        count = struct.unpack_from("<I", payload, 10)[0]
+        if (count == 0 or len(payload) != 24 + count * 6
+                or struct.unpack_from("<I", payload, 4)[0] != len(payload) - 10):
+            fail("size or node count")
+        if (payload[14:16] != b"\x02\x00" or payload[20:22] != bytes(2)
+                or struct.unpack_from("<I", payload, 16)[0] != count - 1):
+            fail("flags or segment count")
+        nodes = [struct.unpack_from("<Ih", payload, 22 + i * 6) for i in range(count)]
+        if any(nodes[i][0] <= nodes[i - 1][0] for i in range(1, count)):
+            fail("timestamps must be unique and increasing")
+        return nodes
+
+    def set_volume_automation(self, track_name, nodes, replace=True, ordinal=None):
+        """Replace or merge one verified named mono/stereo Audio Volume envelope.
+
+        nodes is an iterable of (UInt32 sample, finite dB value) pairs. Duplicate
+        incoming timestamps are rejected; input order need not be sorted.
+        replace=True replaces all points and requires at least one. False merges
+        by timestamp (incoming points win); an empty merge leaves it unchanged.
+        Optional ordinal must match this track's zero-based live slot index.
+        Return [(ordinal, point_count)], including for an identical envelope.
+
+        Validate every existing Volume lane, parameters and all incoming points,
+        then prepare the complete payload/result before the single replacement.
+        Keep the lane/offset, sibling automation, pan, opaque 0x1029 fields and
+        deletion metadata intact. One lane per track, not per L/R playlist;
+        no multi-target writer or implicit save.
+        Native envelope equality and authored-output opening/saving/reopening in
+        Pro Tools are verified for the named mono/stereo profiles. Pro Tools-
+        resaved files pass exact API cycles and replacement/merge compositions.
+        Call save() separately.
+        """
+        if not isinstance(track_name, str):
+            raise TypeError("track_name must be a string.")
+        if not track_name or "\x00" in track_name:
+            raise ValueError("track_name must be non-empty and contain no NUL.")
+        try:
+            track_name.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("track_name must be valid UTF-8.") from exc
+        if not isinstance(replace, bool):
+            raise TypeError("replace must be a bool.")
+        if ordinal is not None:
+            if isinstance(ordinal, bool) or not isinstance(ordinal, int):
+                raise TypeError("ordinal must be an integer or None.")
+            if ordinal < 0:
+                raise ValueError("ordinal must be non-negative.")
+        # Do not bypass malformed existing envelopes even when replacing them.
+        lanes = self._validated_named_audio_volume_lanes()
+        matches = [(index, lane, old_nodes) for index, (name, lane, old_nodes) in enumerate(lanes)
+                   if name == track_name]
+        if len(matches) != 1:
+            raise ValueError("Track not found in verified Audio volume lanes: %r." % track_name)
+        index, lane, old_nodes = matches[0]
+        if ordinal is not None and ordinal != index:
+            raise ValueError("ordinal does not match the verified Audio track index.")
+        try:
+            iterator = iter(nodes)
+        except TypeError as exc:
+            raise TypeError("nodes must be an iterable of (sample, db) pairs.") from exc
+        incoming = {}
+        for item in iterator:
+            if isinstance(item, (str, bytes, bytearray)):
+                raise TypeError("Each volume node must be a (sample, db) pair.")
+            try:
+                sample, value = item
+            except (TypeError, ValueError) as exc:
+                raise TypeError("Each volume node must be a (sample, db) pair.") from exc
+            if isinstance(sample, bool) or not isinstance(sample, int):
+                raise TypeError("Volume node sample must be an integer.")
+            if not 0 <= sample <= 0xffffffff:
+                raise ValueError("Volume node sample must be within UInt32.")
+            if sample in incoming:
+                raise ValueError("Incoming volume node timestamps must be unique.")
+            if isinstance(value, bool):
+                raise TypeError("Volume node dB must be a real number.")
+            try:
+                value = float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise TypeError("Volume node dB must be a real number.") from exc
+            if not math.isfinite(value):
+                raise ValueError("Volume node dB must be finite.")
+            scaled = value * 10
+            if not math.isfinite(scaled):
+                raise ValueError("Volume node dB exceeds signed Int16 deci-dB.")
+            encoded = int(round(scaled))
+            if not -32768 <= encoded <= 32767:
+                raise ValueError("Volume node dB exceeds signed Int16 deci-dB.")
+            incoming[sample] = encoded
+        merged = {} if replace else dict(old_nodes)
+        merged.update(incoming)
+        if not merged:
+            raise ValueError("At least one volume node is required for replacement.")
+        ordered = sorted(merged.items())
+        count = len(ordered)
+        if count > (0xffffffff - 26) // 6:
+            raise OverflowError("Volume envelope exceeds the PTX UInt32 block size.")
+        current = bytes(lane.items[0])
+        # Preserve verified fixed flags and padding rather than borrow another lane.
+        header = (current[:4] + struct.pack("<I", 14 + count * 6) + current[8:10]
+                  + struct.pack("<I", count) + current[14:16]
+                  + struct.pack("<I", count - 1) + current[20:22])
+        body = header + b"".join(struct.pack("<Ih", sample, value) for sample, value in ordered) + current[-2:]
+        self._decode_verified_mono_volume_payload(body)
+        result = [(index, count)]
+        if body != current:
+            lane.items[0] = body
+        return result
 
     def add_volume_node(self, track_name, hh, mm, ss, ff, db_value):
         if not isinstance(track_name, str):

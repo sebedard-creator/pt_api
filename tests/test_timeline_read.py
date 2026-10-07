@@ -100,6 +100,118 @@ def make_session(definitions, playlists, geometries=(), extra_clip_items=()):
 
 
 class TimelineReadTests(unittest.TestCase):
+    def test_uint24_fade_out_native_extents_at_25_and_23976(self):
+        for rate, start, duration in (
+            (0x02, 1_728_000_000, 96_192),
+            (0x09, 1_729_728_000, 96_096),
+        ):
+            with self.subTest(rate=rate):
+                payload = bytearray.fromhex(
+                    "0000000000330000c07701c07701020200000000000000000000000000"
+                )
+                payload[8:11] = payload[11:14] = duration.to_bytes(3, "little")
+                session = make_session(
+                    [definition("TAKE", length=192_192)],
+                    [playlist("TRACK", [event(0, start), event(0, start + 192_192, event_type=1)])],
+                    [geometry(payload)],
+                )
+                session.frame_rate_enum = rate
+                before = [root.to_bytes()[0] for root in session.root_items]
+                result = session.get_timeline_clips()
+                fade = next(item for item in result if item["is_fade"])
+                self.assertEqual(fade["start_samples"], start + 192_192 - duration)
+                self.assertEqual(fade["length_samples"], duration)
+                self.assertEqual(fade["end_samples"], start + 192_192)
+                self.assertEqual(fade["clip_name"], "TAKE")
+                self.assertEqual([root.to_bytes()[0] for root in session.root_items], before)
+
+    def test_uint24_fade_out_requires_observed_width_marker_and_repeated_duration(self):
+        original = bytes.fromhex(
+            "0000000000330000c07701c07701020200000000000000000000000000"
+        )
+        variants = []
+        for offset, value in ((5, 0), (5, 0x32), (5, 0x23), (14, 1), (11, 0)):
+            payload = bytearray(original)
+            payload[offset] = value
+            variants.append(payload)
+        zero = bytearray(original)
+        zero[8:14] = bytes(6)
+        variants.append(zero)
+        for payload in variants:
+            with self.subTest(payload=payload.hex()):
+                session = make_session(
+                    [definition("TAKE", length=192_192)],
+                    [playlist("TRACK", [event(0, 0), event(0, 192_192, event_type=1)])],
+                    [geometry(payload)],
+                )
+                before = [root.to_bytes()[0] for root in session.root_items]
+                with self.assertRaises(ValueError):
+                    session.get_timeline_clips()
+                self.assertEqual([root.to_bytes()[0] for root in session.root_items], before)
+                self.assertEqual(len(session.get_timeline_clips(False)), 1)
+
+    def test_uint24_fade_out_underflow_is_rejected(self):
+        payload = bytes.fromhex(
+            "0000000000330000c07701c07701020200000000000000000000000000"
+        )
+        session = make_session(
+            [definition("TAKE", length=100)],
+            [playlist("TRACK", [event(0, 0), event(0, 100, event_type=1)])],
+            [geometry(payload)],
+        )
+        with self.assertRaisesRegex(ValueError, "before sample zero"):
+            session.get_timeline_clips()
+
+    def test_uint24_fade_out_keeps_move_duplicate_and_trim_guards(self):
+        payload = bytes.fromhex(
+            "0000000000330000c07701c07701020200000000000000000000000000"
+        )
+        operations = (
+            lambda s: s.move_clip("TAKE", 0, 0, 5, 0),
+            lambda s: s.duplicate_clip("TAKE", 0, 0, 5, 0),
+            lambda s: s.trim_clip_start("TAKE", 100),
+            lambda s: s.trim_clip_end("TAKE", 100),
+        )
+        for operation in operations:
+            session = make_session(
+                [definition("TAKE", length=192_192)],
+                [playlist("TRACK", [event(0, 0), event(0, 192_192, event_type=1)])],
+                [geometry(payload)],
+            )
+            session._removed_offsets = []
+            before = [root.to_bytes()[0] for root in session.root_items]
+            with self.assertRaisesRegex(NotImplementedError, "attached fades"):
+                operation(session)
+            self.assertEqual([root.to_bytes()[0] for root in session.root_items], before)
+            self.assertEqual(session._removed_offsets, [])
+
+    def test_unverified_compact_fade_out_and_other_lengths_stay_rejected(self):
+        for length in (23, 25, 28, 30, 32, 35):
+            with self.subTest(length=length):
+                session = make_session(
+                    [definition("TAKE", length=192_192)],
+                    [playlist("TRACK", [event(0, 0), event(0, 192_192, event_type=1)])],
+                    [geometry(bytes(length))],
+                )
+                with self.assertRaisesRegex(ValueError, "Unsupported 0x262f"):
+                    session.get_timeline_clips()
+
+    def test_existing_uint24_fade_out_prevents_duplicate_fade_without_mutation(self):
+        payload = bytes.fromhex(
+            "0000000000330000c07701c07701020200000000000000000000000000"
+        )
+        session = make_session(
+            [definition("TAKE", length=240_000)],
+            [playlist("TRACK", [event(0, 0), event(0, 240_000, event_type=1)])],
+            [geometry(payload)],
+        )
+        session._removed_offsets = []
+        before = [root.to_bytes()[0] for root in session.root_items]
+        with self.assertRaisesRegex(ValueError, "fade already exists"):
+            session.add_fade("TRACK", "TAKE", 0, 0, 5, 0, fade_type="out", duration_ff=1)
+        self.assertEqual([root.to_bytes()[0] for root in session.root_items], before)
+        self.assertEqual(session._removed_offsets, [])
+
     def test_clip_ids_are_ordinal_even_with_raw_items_between_definitions(self):
         session = make_session(
             [definition("FIRST"), definition("SECOND")],

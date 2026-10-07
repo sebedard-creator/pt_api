@@ -336,6 +336,29 @@ def read_chunk(path, wanted):
 
 
 class RelinkTests(unittest.TestCase):
+    def test_uint8_reader_extension_does_not_authorize_relink(self):
+        session, umid = make_session(virtual_source_offset=100)
+        raw = session._root_blocks(0x262a)[0].get_all_blocks(0x2628)[0].items[0]
+        a = 4 + struct.unpack_from('<I', raw)[0]
+        struct.pack_into('<H', raw, a, 0x1001)
+        raw[a + 3] = 0x44
+        del raw[a + 6]  # Convert the fixture's UInt16 offset 100 to UInt8.
+        original_tree = [item.to_bytes()[0] for item in session.root_items]
+        status = session.get_relink_write_status('Audio 1', 'Audio 1_01', 1000)
+        self.assertFalse(status['supported'])
+        self.assertEqual(status['code'], 'unsupported_clip_layout')
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'Audio 1_01.wav'
+            destination = Path(directory) / 'Audio 1_02.wav'
+            write_pro_tools_wave(source, source.stem, umid)
+            source_bytes = source.read_bytes()
+            with self.assertRaisesRegex(ValueError, 'verified root or production-virtual'):
+                session.relink_clip('Audio 1', 'Audio 1_01', 1000,
+                                   'Audio 1_02', source, destination)
+            self.assertFalse(destination.exists())
+            self.assertEqual(source.read_bytes(), source_bytes)
+        self.assertEqual([item.to_bytes()[0] for item in session.root_items], original_tree)
+
     def test_relink_reassembles_false_block_inside_1001_identity(self):
         session, source_umid = make_session()
         _, media_entries, _, _, _ = session._validated_physical_audio_catalog()
