@@ -953,6 +953,7 @@ FLAT_PTX_CONTENT_TYPES = frozenset({
     0x1028,  # Session sample rate.
     0x104F,  # Timeline event payload.
     0x204D,  # Session frame rate.
+    0x2028,  # Tempo-map records (timestamps incidentally form 0x5A false blocks).
     0x260A,  # Volume automation envelope.
     0x262F,  # Fade geometry.
     0x2637,  # Clip Gain point dictionary.
@@ -961,6 +962,19 @@ FLAT_PTX_CONTENT_TYPES = frozenset({
 # header. Counts such as 90 (5A 00 00 00) otherwise form plausible false
 # blocks when combined with the following playlist header.
 RAW_PREFIX_PTX_CONTENT_TYPES = {0x1054: 4}
+
+# Tempo map: ``0x2028`` lives under the unique ``0x2718`` container. Its
+# payload is a flat byte record (a ``"Tempo"`` header declaring the byte size
+# and count, then 61-byte tempo-change records), not a nested block stream.
+_TEMPO_MAP_CONTAINER = 0x2718
+_TEMPO_MAP = 0x2028
+_TEMPO_RECORD_SIZE = 61
+_TEMPO_FIRST_RECORD_OFFSET = 49
+_TEMPO_BPM_OFFSET = 10
+#: Musical timebase (shared with the MIDI domain): 960000 ticks per beat and
+#: a zero offset added to every 5-byte musical timestamp.
+_TICKS_PER_BEAT = 960_000
+_MUSICAL_ZERO_TICKS = 0xE8D4A51000
 
 def u_endian_read2(buf, offset, is_bigendian):
     fmt = ">H" if is_bigendian else "<H"
@@ -2993,6 +3007,128 @@ class ProToolsSession:
                 f"found {len(marker_blocks)}."
             )
         return count, marker_blocks
+
+    def get_tempo_map(self):
+        """Read the session tempo map (read-only).
+
+        Returns a list of ``{"position_ticks", "beats", "bpm"}`` dictionaries
+        ordered by musical position; ``position_ticks`` is relative to the
+        session start (beat 0 == session start). One entry is a constant tempo;
+        several entries are tempo automation.
+
+        The tempo map lives in ``0x2028`` under the unique ``0x2718`` container.
+        Each 61-byte record stores a 5-byte ``ZERO_TICKS``-based tick timestamp
+        at ``+0`` and a float64 BPM at ``+10``; the block header declares the
+        byte size and the record count. Unknown geometry is refused rather than
+        interpreted. A session with no tempo-map container returns ``[]``.
+        """
+        containers = self._root_blocks(_TEMPO_MAP_CONTAINER)
+        if not containers:
+            return []
+        if len(containers) != 1:
+            raise ValueError("Multiple 0x2718 tempo-map containers are ambiguous.")
+        blocks = [
+            child for child in containers[0].items
+            if isinstance(child, PTBlock) and child.content_type == _TEMPO_MAP
+        ]
+        if len(blocks) != 1:
+            raise ValueError("A unique 0x2028 tempo-map block is required.")
+        items = blocks[0].items
+        if len(items) != 1 or not isinstance(items[0], (bytes, bytearray)):
+            raise ValueError("Invalid 0x2028 tempo-map payload.")
+        payload = bytes(items[0])
+
+        if len(payload) < _TEMPO_FIRST_RECORD_OFFSET or payload[0:5] != b"Tempo":
+            raise ValueError("Unsupported 0x2028 tempo-map header.")
+        declared_bytes = struct.unpack_from("<I", payload, 7)[0]
+        count = struct.unpack_from("<I", payload, 11)[0]
+        if count == 0 or declared_bytes != count * _TEMPO_RECORD_SIZE + 4:
+            raise ValueError("Invalid 0x2028 tempo-map counters.")
+        last_record_end = (
+            _TEMPO_FIRST_RECORD_OFFSET
+            + (count - 1) * _TEMPO_RECORD_SIZE
+            + _TEMPO_BPM_OFFSET + 8
+        )
+        if last_record_end > len(payload):
+            raise ValueError("Truncated 0x2028 tempo-map payload.")
+
+        changes = []
+        previous_ticks = None
+        for index in range(count):
+            base = _TEMPO_FIRST_RECORD_OFFSET + index * _TEMPO_RECORD_SIZE
+            raw = int.from_bytes(payload[base:base + 5], "little")
+            if raw < _MUSICAL_ZERO_TICKS:
+                raise ValueError("Invalid tempo-change timestamp.")
+            position_ticks = raw - _MUSICAL_ZERO_TICKS
+            bpm = struct.unpack_from("<d", payload, base + _TEMPO_BPM_OFFSET)[0]
+            if not (0.0 < bpm < 1_000_000.0):
+                raise ValueError("Invalid tempo-change BPM.")
+            if previous_ticks is not None and position_ticks <= previous_ticks:
+                raise ValueError("Tempo changes are not strictly ordered.")
+            previous_ticks = position_ticks
+            changes.append({
+                "position_ticks": position_ticks,
+                "beats": position_ticks / _TICKS_PER_BEAT,
+                "bpm": bpm,
+            })
+        if changes[0]["position_ticks"] != 0:
+            raise ValueError("The tempo map must start at position 0.")
+        return changes
+
+    def _tempo_sample_anchors(self, changes):
+        """Cumulative sample position at each tempo change (beat 0 -> 0)."""
+        rate = self.sample_rate
+        anchors = [0.0]
+        for previous, current in zip(changes, changes[1:]):
+            beats = current["beats"] - previous["beats"]
+            anchors.append(anchors[-1] + beats * 60.0 / previous["bpm"] * rate)
+        return anchors
+
+    def beats_to_samples(self, beats):
+        """Convert a musical position (beats from the session start) to samples.
+
+        Uses the session tempo map, so the result follows the session's own
+        tempo automation rather than a fixed 120 BPM.
+        """
+        if isinstance(beats, bool) or not isinstance(beats, (int, float)):
+            raise TypeError("beats must be a number.")
+        if beats < 0:
+            raise ValueError("beats must be non-negative.")
+        changes = self.get_tempo_map()
+        if not changes:
+            raise ValueError("The session has no tempo map.")
+        anchors = self._tempo_sample_anchors(changes)
+        index = 0
+        for position, change in enumerate(changes):
+            if change["beats"] <= beats:
+                index = position
+            else:
+                break
+        anchor = changes[index]
+        return anchors[index] + (
+            (beats - anchor["beats"]) * 60.0 / anchor["bpm"] * self.sample_rate
+        )
+
+    def samples_to_beats(self, samples):
+        """Convert an absolute sample position to beats from the session start."""
+        if isinstance(samples, bool) or not isinstance(samples, (int, float)):
+            raise TypeError("samples must be a number.")
+        if samples < 0:
+            raise ValueError("samples must be non-negative.")
+        changes = self.get_tempo_map()
+        if not changes:
+            raise ValueError("The session has no tempo map.")
+        anchors = self._tempo_sample_anchors(changes)
+        index = 0
+        for position, value in enumerate(anchors):
+            if value <= samples:
+                index = position
+            else:
+                break
+        anchor = changes[index]
+        return anchor["beats"] + (
+            (samples - anchors[index]) * anchor["bpm"] / 60.0 / self.sample_rate
+        )
 
     def _decode_audio_clip_payload(self, payload):
         """Decode the name, length and source offset of one 0x2628 payload."""
